@@ -5,6 +5,8 @@ npm-debug.log*
 .env.*
 !.env.example
 *.log
+captures/
+run-logs/
 coverage
 .tmp
 dist
