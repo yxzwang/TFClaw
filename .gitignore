@@ -1,0 +1,13 @@
+﻿node_modules
+npm-debug.log*
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+coverage
+.tmp
+dist
+build
+.expo
+apps/mobile/.git_mobile_template_backup
