@@ -1,0 +1,73 @@
+{
+  "relay": {
+    "token": "demo-token",
+    "url": "ws://127.0.0.1:8787"
+  },
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "appId": "cli_xxx",
+      "appSecret": "xxx",
+      "encryptKey": "",
+      "verificationToken": "",
+      "disableProxy": true,
+      "noProxyHosts": ["open.feishu.cn", ".feishu.cn", "open.larksuite.com", ".larksuite.com"],
+      "allowFrom": []
+    },
+    "telegram": {
+      "enabled": false,
+      "token": "",
+      "proxy": "",
+      "replyToMessage": false,
+      "allowFrom": []
+    },
+    "whatsapp": {
+      "enabled": false,
+      "bridgeUrl": "ws://localhost:3001",
+      "bridgeToken": "",
+      "allowFrom": []
+    },
+    "discord": {
+      "enabled": false,
+      "token": "",
+      "gatewayUrl": "wss://gateway.discord.gg/?v=10&encoding=json",
+      "intents": 37377,
+      "allowFrom": []
+    },
+    "mochat": {
+      "enabled": false,
+      "baseUrl": "https://mochat.io",
+      "clawToken": "",
+      "allowFrom": []
+    },
+    "dingtalk": {
+      "enabled": false,
+      "clientId": "",
+      "clientSecret": "",
+      "allowFrom": []
+    },
+    "email": {
+      "enabled": false,
+      "imapHost": "",
+      "imapUsername": "",
+      "imapPassword": "",
+      "smtpHost": "",
+      "smtpUsername": "",
+      "smtpPassword": "",
+      "allowFrom": []
+    },
+    "slack": {
+      "enabled": false,
+      "botToken": "",
+      "appToken": "",
+      "groupPolicy": "mention",
+      "allowFrom": []
+    },
+    "qq": {
+      "enabled": false,
+      "appId": "",
+      "secret": "",
+      "allowFrom": []
+    }
+  }
+}

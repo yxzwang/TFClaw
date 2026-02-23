@@ -5,7 +5,7 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP：
 1. `server` 只做转发与状态缓存（按 token 组织会话）。
 2. `terminal-agent` 运行在用户电脑/服务器上，管理多个 terminal 并上报输出。
 3. `mobile`（Android 优先）查看 terminal 列表、输出，并发送命令（含 Ctrl+D 等控制键）。
-4. `feishu-gateway` 用飞书长连接机器人把消息映射为 terminal 指令。
+4. `gateway`（位于 `apps/feishu-gateway`）统一管理 Chat Apps，并将消息映射为 terminal 指令。
 
 ## 当前已实现能力
 
@@ -27,7 +27,7 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP：
   - 查看输出、输入命令、快捷键
   - 新建/关闭 terminal
   - 触发截图并显示最新图片
-- feishu-gateway 支持：
+- gateway（Feishu 通道）支持：
   - `/list` `/new` `/use` `/close` `/ctrlc` `/ctrld`
   - `terminalId: command` 形式
   - 选中 terminal 后直接发送命令
@@ -91,22 +91,20 @@ npm run dev:mobile
 
 Android 模拟器请用 `ws://10.0.2.2:8787`，真机请填你的局域网 IP。
 
-## 飞书网关启动
+## TFClaw Gateway 启动
 
 1. 在飞书开放平台创建应用并启用 Bot。
 2. 权限添加 `im:message`，事件添加 `im.message.receive_v1`。
 3. 事件订阅选择 **长连接（Long Connection）**。
-4. 配置环境变量（见 `apps/feishu-gateway/.env.example`）。
+4. 从 `config.example.json` 复制一份到 `config.json` 并填入 token/app 凭证。
 
-Windows PowerShell：
+启动：
 
-```powershell
-$env:FEISHU_APP_ID='cli_xxx'
-$env:FEISHU_APP_SECRET='xxx'
-$env:TFCLAW_TOKEN='demo-token'
-$env:TFCLAW_RELAY_URL='ws://127.0.0.1:8787'
-npm run dev:feishu
+```bash
+npm run dev:gateway
 ```
+
+说明：`gateway` 会优先读取 `config.json`，若不存在则回退到旧环境变量模式（兼容历史脚本）。
 
 ## Android APK 构建
 
@@ -118,6 +116,9 @@ npm run dev:feishu
 - `apps/terminal-agent/.env.example`
 - `apps/mobile/.env.example`
 - `apps/feishu-gateway/.env.example`
+- `config.example.json`
+
+gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
 
 ## 已知限制（MVP）
 
@@ -130,4 +131,4 @@ npm run dev:feishu
 1. 增加 terminal resize 协议，适配手机端横竖屏和不同字号。
 2. server 增加持久化存储（终端元数据、会话历史、用户体系）。
 3. mobile 增加平台-会话分组与滚动历史加载。
-4. feishu-gateway 增加输出节流与多图/文件回传能力。
+4. gateway 继续补齐 Telegram/Discord/Slack 等通道的 connect/send 实现（当前已提供 connect 生命周期骨架）。
