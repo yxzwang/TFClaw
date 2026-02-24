@@ -47,6 +47,10 @@ let pendingEnterPassthrough = false;
 let pendingEnterRawPassthrough = false;
 let pendingPassthroughLines = [];
 let pendingAttachNewTitle = undefined;
+let tmuxCommandMode = false;
+let tmuxCommandTarget = "tmux";
+const tfclawSessionKey = "local-cli";
+const pendingTfclawCommands = new Map();
 
 let agentInfo = undefined;
 let terminals = [];
@@ -141,8 +145,66 @@ function sendCommand(payload) {
   return requestId;
 }
 
+function sendTfclawCommand(text, sessionKey = "local-cli") {
+  const requestId = sendCommand({
+    command: "tfclaw.command",
+    text,
+    sessionKey,
+  });
+  if (requestId) {
+    pendingTfclawCommands.set(requestId, text);
+  }
+  return requestId;
+}
+
+function extractTmuxTargetFromOutput(output) {
+  const source = String(output || "");
+  const headerMatch = source.match(/\[tmux ([^\]\r\n]+)\]/i);
+  if (headerMatch && headerMatch[1]) {
+    return headerMatch[1].trim();
+  }
+  const targetMatch = source.match(/tmux target `([^`]+)`/i);
+  if (targetMatch && targetMatch[1]) {
+    return targetMatch[1].trim();
+  }
+  return undefined;
+}
+
+function updateTmuxCommandModeFromResult(commandText, output) {
+  const normalized = String(commandText || "").trim().toLowerCase().replace(/\s+/g, " ");
+  const resultText = String(output || "");
+  const target = extractTmuxTargetFromOutput(resultText);
+
+  if (target) {
+    tmuxCommandTarget = target;
+  }
+
+  if (normalized === "/passthrough on" || normalized === "/passthrough enable" || normalized === "/pt on") {
+    if (/passthrough enabled\./i.test(resultText)) {
+      tmuxCommandMode = true;
+      updatePrompt();
+    }
+    return;
+  }
+
+  if (normalized === "/passthrough off" || normalized === "/passthrough disable" || normalized === "/pt off") {
+    if (/passthrough disabled\./i.test(resultText)) {
+      tmuxCommandMode = false;
+      tmuxCommandTarget = "tmux";
+      updatePrompt();
+    }
+    return;
+  }
+
+  if (tmuxCommandMode && target) {
+    updatePrompt();
+  }
+}
+
 function printHelp() {
   console.log(`Commands:
+/help /tmux ... /passthrough ...  # forwarded to terminal-agent nanobot-style parser
+                                   # /passthrough on => enter tmux command mode (prompt switches to tmux)
 help
 state
 list
@@ -603,12 +665,17 @@ function updatePrompt() {
   if (!rl) {
     return;
   }
-  if (!passthroughMode) {
-    rl.setPrompt(`${blue("tfclaw")}> `);
-    return;
-  }
   if (rawPassthroughMode) {
     rl.setPrompt("");
+    return;
+  }
+  if (tmuxCommandMode && !passthroughMode) {
+    const marker = blue(tmuxCommandTarget || "tmux");
+    rl.setPrompt(`${blue("tmux")}:${marker}> `);
+    return;
+  }
+  if (!passthroughMode) {
+    rl.setPrompt(`${blue("tfclaw")}> `);
     return;
   }
   const t = currentSelectedTerminal();
@@ -908,6 +975,27 @@ ws.on("message", (raw) => {
       console.log(`[agent-error] ${msg.payload.code}${req}: ${msg.payload.message}`);
       break;
     }
+    case "agent.command_result": {
+      const req = msg.payload.requestId ? ` requestId=${msg.payload.requestId}` : "";
+      const isProgress = Boolean(msg.payload.progress);
+      if (msg.payload.requestId && !isProgress) {
+        const commandText = pendingTfclawCommands.get(msg.payload.requestId);
+        if (commandText) {
+          pendingTfclawCommands.delete(msg.payload.requestId);
+          updateTmuxCommandModeFromResult(commandText, msg.payload.output || "");
+        }
+      }
+      if (isProgress) {
+        const source = String(msg.payload.progressSource || "").trim();
+        const sourceTag = source ? ` source=${source}` : "";
+        console.log(`[command-progress]${req}${sourceTag}`);
+      } else {
+        console.log(`[command-result]${req}`);
+      }
+      const text = String(msg.payload.output || "").trim();
+      console.log(text || "(no output)");
+      break;
+    }
     default: {
       break;
     }
@@ -961,6 +1049,16 @@ rl.on("line", (line) => {
     }
     pendingPassthroughLines.push(line);
     console.log("terminal is preparing. queued input (type .cancel to cancel attach).");
+    rl.prompt();
+    return;
+  }
+  if (tmuxCommandMode && !passthroughMode) {
+    if (line.length === 0) {
+      sendTfclawCommand("/tmux key Enter", tfclawSessionKey);
+      rl.prompt();
+      return;
+    }
+    sendTfclawCommand(line, tfclawSessionKey);
     rl.prompt();
     return;
   }
@@ -1026,6 +1124,12 @@ rl.on("line", (line) => {
   }
 
   if (!trimmed) {
+    rl.prompt();
+    return;
+  }
+
+  if (trimmed.startsWith("/")) {
+    sendTfclawCommand(trimmed, tfclawSessionKey);
     rl.prompt();
     return;
   }

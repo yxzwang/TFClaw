@@ -11,6 +11,7 @@ export interface TerminalSummary {
   terminalId: string;
   title: string;
   cwd?: string;
+  foregroundCommand?: string;
   isActive: boolean;
   updatedAt: string;
 }
@@ -43,6 +44,7 @@ export type RelayMessage =
   | AgentTerminalOutput
   | AgentScreenCapture
   | AgentCaptureSources
+  | AgentCommandResult
   | AgentError
   | ClientHello
   | ClientCommand
@@ -80,6 +82,16 @@ export interface AgentCaptureSources {
   payload: {
     requestId?: string;
     sources: CaptureSource[];
+  };
+}
+
+export interface AgentCommandResult {
+  type: "agent.command_result";
+  payload: {
+    requestId?: string;
+    output: string;
+    progress?: boolean;
+    progressSource?: string;
   };
 }
 
@@ -128,6 +140,11 @@ export interface ClientCommand {
         source: "screen" | "window";
         terminalId?: string;
         sourceId?: string;
+      }
+    | {
+        command: "tfclaw.command";
+        text: string;
+        sessionKey?: string;
       };
   requestId?: string;
 }

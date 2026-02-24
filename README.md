@@ -28,10 +28,14 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP：
   - 新建/关闭 terminal
   - 触发截图并显示最新图片
 - gateway（Feishu 通道）支持：
-  - `/list` `/new` `/use` `/close` `/ctrlc` `/ctrld`
-  - `terminalId: command` 形式
-  - 选中 terminal 后直接发送命令
+  - 已切换为 nanobot 对齐命令集（飞书端与 terminal 本地测试端一致）：
+    - `/tmux status|sessions|panes|new|target|close|socket|lines|wait|stream|capture|key|send`
+    - `/t<subcommand>` 别名（例如 `/tkey` `/ttarget` `/tcapture`）
+    - `/passthrough on|off|status` 与 `/pt on|off|status`
+  - passthrough 开启后，普通消息持续直通 tmux（直到 `/pt off`）
   - `/capture` 返回“屏幕/窗口编号列表”，回复数字后回传对应图片
+  - tmux 流式输出会实时回推 progress，并在飞书端新消息发出后自动撤回上一条 progress（防堆叠）
+  - 收到用户消息后会先给原消息添加 reaction（默认 `OnIt`）
 
 ## 目录结构
 
@@ -66,6 +70,18 @@ npm run dev:server
 ```
 
 默认监听：`ws://0.0.0.0:8787`
+
+也可以一键启动整套（build + server + agent + gateway）：
+
+```bash
+npm run start:stack
+```
+
+开发模式一键启动：
+
+```bash
+npm run dev:stack
+```
 
 ### 4. 启动 terminal agent（另一个终端）
 
@@ -120,11 +136,27 @@ npm run dev:gateway
 
 gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
 
+常用新增参数：
+
+- gateway
+  - `TFCLAW_COMMAND_RESULT_TIMEOUT_MS`（默认 `86400000`，24h）
+  - `TFCLAW_PROGRESS_RECALL_DELAY_MS`（默认 `350`ms）
+  - `TFCLAW_FEISHU_ACK_REACTION_ENABLED`（默认 `1`）
+  - `TFCLAW_FEISHU_ACK_REACTION`（默认 `OnIt`）
+- terminal-agent
+  - `TFCLAW_TMUX_SUBMIT_DELAY_MS`（默认 `60`）
+  - `TFCLAW_TMUX_STREAM_POLL_MS`（默认 `350`）
+  - `TFCLAW_TMUX_STREAM_IDLE_MS`（默认 `3000`）
+  - `TFCLAW_TMUX_STREAM_INITIAL_SILENCE_MS`（默认 `12000`）
+  - `TFCLAW_TMUX_STREAM_WINDOW_MS`（默认 `86400000`，24h）
+
 ## 已知限制（MVP）
 
 - `terminal-agent` 已切到 `tmux` 渲染/会话模型，仍未支持移动端驱动的动态 resize。
 - 窗口枚举/窗口截图当前仅在 Windows agent 上实现；Linux/macOS 暂仅屏幕截图。
 - 未实现用户注册；身份依赖共享 token。
+- `/tmux send` 这类“需要读取 tmux 内容”的命令会比纯文本命令（如 `/tmux help`）慢，这是预期行为：
+  需要经过 tmux 执行、等待窗口和捕获输出（并可能进入流式收敛）。
 
 ## 后续建议
 

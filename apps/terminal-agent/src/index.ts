@@ -18,10 +18,12 @@ interface TerminalSession {
   terminalId: string;
   title: string;
   cwd?: string;
+  foregroundCommand?: string;
   tmuxWindowId: string;
   tmuxPaneId: string;
   outputBuffer: string;
   lastCapture: string;
+  lastCommandSyncAt: number;
   updatedAt: string;
   isActive: boolean;
 }
@@ -52,6 +54,26 @@ interface SyncOptions {
 }
 
 type InputAction = { kind: "literal"; text: string } | { kind: "key"; key: string };
+
+type TmuxStreamMode = "auto" | "on" | "off";
+type TmuxProgressCallback = (content: string) => Promise<void>;
+
+interface TmuxControlState {
+  enabled: boolean;
+  target: string;
+  socket: string;
+  captureLines: number;
+  waitMs: number;
+  streamMode: TmuxStreamMode;
+  paneIndexMap: Record<string, string>;
+}
+
+interface TmuxPaneRow {
+  target: string;
+  window: string;
+  command: string;
+  activity: string;
+}
 
 function sanitizeTmuxName(name: string): string {
   return name
@@ -93,7 +115,13 @@ const TMUX_SESSION =
   ) || "tfclaw";
 const TMUX_CAPTURE_LINES = Number.parseInt(process.env.TFCLAW_TMUX_CAPTURE_LINES ?? "300", 10);
 const TMUX_POLL_MS = Number.parseInt(process.env.TFCLAW_TMUX_POLL_MS ?? "250", 10);
+const TMUX_FOREGROUND_COMMAND_POLL_MS = Number.parseInt(process.env.TFCLAW_TMUX_FOREGROUND_COMMAND_POLL_MS ?? "800", 10);
 const TMUX_MAX_DELTA_CHARS = Number.parseInt(process.env.TFCLAW_TMUX_MAX_DELTA_CHARS ?? "4000", 10);
+const TMUX_SUBMIT_DELAY_MS = Number.parseInt(process.env.TFCLAW_TMUX_SUBMIT_DELAY_MS ?? "60", 10);
+const TMUX_STREAM_POLL_MS = Number.parseInt(process.env.TFCLAW_TMUX_STREAM_POLL_MS ?? "350", 10);
+const TMUX_STREAM_IDLE_MS = Number.parseInt(process.env.TFCLAW_TMUX_STREAM_IDLE_MS ?? "3000", 10);
+const TMUX_STREAM_INITIAL_SILENCE_MS = Number.parseInt(process.env.TFCLAW_TMUX_STREAM_INITIAL_SILENCE_MS ?? "12000", 10);
+const TMUX_STREAM_WINDOW_MS = Number.parseInt(process.env.TFCLAW_TMUX_STREAM_WINDOW_MS ?? "86400000", 10);
 const TMUX_BOOTSTRAP_WINDOW = sanitizeTmuxName(process.env.TFCLAW_TMUX_BOOTSTRAP_WINDOW ?? "__tfclaw_bootstrap__");
 const TMUX_RESET_ON_BOOT = parseBoolean(process.env.TFCLAW_TMUX_RESET_ON_BOOT, true);
 const TMUX_PERSIST_SESSION_ON_SHUTDOWN = parseBoolean(process.env.TFCLAW_TMUX_PERSIST_SESSION_ON_SHUTDOWN, false);
@@ -110,6 +138,45 @@ let closing = false;
 let syncLoopBusy = false;
 let syncTimer: NodeJS.Timeout | undefined;
 const captureErrorAt = new Map<string, number>();
+const tmuxControlStateBySession = new Map<string, TmuxControlState>();
+
+const TMUX_STREAM_COMMANDS = new Set([
+  "bun",
+  "deno",
+  "node",
+  "npm",
+  "npx",
+  "nuxt",
+  "pnpm",
+  "tsx",
+  "vite",
+  "yarn",
+]);
+
+const TMUX_SHORT_SUBCOMMANDS = new Set([
+  "status",
+  "sessions",
+  "ls",
+  "panes",
+  "targets",
+  "new",
+  "target",
+  "close",
+  "kill",
+  "socket",
+  "lines",
+  "wait",
+  "stream",
+  "capture",
+  "key",
+  "keys",
+  "sendkey",
+  "sendkeys",
+  "send-keys",
+  "send",
+  "help",
+  "?",
+]);
 
 const LIST_WINDOWS_PS_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -156,7 +223,9 @@ $callback = [TfclawWinApi+EnumWindowsProc]{
   return $true
 }
 [void][TfclawWinApi]::EnumWindows($callback, [IntPtr]::Zero)
-$results | Sort-Object label | ConvertTo-Json -Compress -Depth 4
+$json = $results | Sort-Object label | ConvertTo-Json -Compress -Depth 4
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+[Convert]::ToBase64String($bytes)
 `;
 
 function captureWindowScript(sourceIdBase64: string): string {
@@ -263,6 +332,7 @@ function publishTerminalList(): void {
         terminalId: terminal.terminalId,
         title: terminal.title,
         cwd: terminal.cwd,
+        foregroundCommand: terminal.foregroundCommand,
         isActive: terminal.isActive,
         updatedAt: terminal.updatedAt,
       })),
@@ -393,6 +463,25 @@ async function runTmuxRaw(args: string[], options: CommandOptions = {}): Promise
   });
 }
 
+function tmuxArgsWithSocket(args: string[], socketPath?: string): string[] {
+  const socket = (socketPath ?? "").trim();
+  if (!socket) {
+    return tmuxArgs(args);
+  }
+  return [...TMUX_BASE_ARGS, "-S", socket, ...args];
+}
+
+async function runTmuxRawWithSocket(
+  args: string[],
+  socketPath?: string,
+  options: CommandOptions = {},
+): Promise<CommandResult> {
+  return runCommand(TMUX_COMMAND, tmuxArgsWithSocket(args, socketPath), {
+    ...options,
+    windowsHide: true,
+  });
+}
+
 async function runTmuxOrThrow(
   args: string[],
   options: {
@@ -507,6 +596,25 @@ async function capturePaneText(terminal: TerminalSession): Promise<string | null
   return result.stdout;
 }
 
+async function capturePaneForegroundCommand(terminal: TerminalSession): Promise<string | undefined | null> {
+  const args = ["display-message", "-p", "-t", terminal.tmuxPaneId, "#{pane_current_command}"];
+  const result = await runTmuxRaw(args);
+
+  if (result.spawnError) {
+    throw new Error(commandDetail(result, TMUX_COMMAND, tmuxArgs(args)));
+  }
+  if (result.code !== 0) {
+    const detail = `${result.stderr}\n${result.stdout}`.toLowerCase();
+    if (detail.includes("can't find pane") || detail.includes("can't find window")) {
+      return null;
+    }
+    throw new Error(commandDetail(result, TMUX_COMMAND, tmuxArgs(args)));
+  }
+
+  const next = result.stdout.trim();
+  return next.length > 0 ? next : undefined;
+}
+
 function markTerminalClosed(terminalId: string, reason: string): void {
   const terminal = terminals.get(terminalId);
   if (!terminal || !terminal.isActive) {
@@ -531,9 +639,28 @@ async function syncTerminalOutput(terminal: TerminalSession, options: SyncOption
     return;
   }
 
+  let commandChanged = false;
+  const now = Date.now();
+  if (now - terminal.lastCommandSyncAt >= Math.max(200, TMUX_FOREGROUND_COMMAND_POLL_MS)) {
+    terminal.lastCommandSyncAt = now;
+    const foreground = await capturePaneForegroundCommand(terminal);
+    if (foreground === null) {
+      markTerminalClosed(terminal.terminalId, "pane not found");
+      return;
+    }
+    if (foreground !== terminal.foregroundCommand) {
+      terminal.foregroundCommand = foreground;
+      commandChanged = true;
+    }
+  }
+
   const delta = computeTmuxDelta(terminal.lastCapture, capture);
   terminal.lastCapture = capture;
   setTerminalSnapshot(terminal, capture);
+
+  if (commandChanged) {
+    publishTerminalList();
+  }
 
   if (options.emitDelta !== false && delta.length > 0) {
     emitTerminalChunk(terminal, delta);
@@ -624,10 +751,12 @@ async function createTerminal(title?: string, cwd?: string): Promise<string> {
     terminalId,
     title: displayTitle,
     cwd: requestedCwd,
+    foregroundCommand: undefined,
     tmuxWindowId: windowId,
     tmuxPaneId: paneId,
     outputBuffer: "",
     lastCapture: "",
+    lastCommandSyncAt: 0,
     updatedAt: nowIso(),
     isActive: true,
   };
@@ -797,6 +926,24 @@ function parseJsonArray<T>(raw: string): T[] {
   return [];
 }
 
+function decodeUtf8Base64OrRaw(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const decoded = Buffer.from(trimmed, "base64").toString("utf8").trim();
+    if (decoded.startsWith("{") || decoded.startsWith("[")) {
+      return decoded;
+    }
+  } catch {
+    // fallback to raw text
+  }
+
+  return trimmed;
+}
+
 async function listScreenSources(): Promise<CaptureSource[]> {
   try {
     const displays = await screenshot.listDisplays();
@@ -830,7 +977,8 @@ async function listWindowSourcesWindows(): Promise<CaptureSource[]> {
 
   try {
     const raw = await runPowerShell(LIST_WINDOWS_PS_SCRIPT);
-    const windows = parseJsonArray<ListedWindow>(raw)
+    const decodedRaw = decodeUtf8Base64OrRaw(raw);
+    const windows = parseJsonArray<ListedWindow>(decodedRaw)
       .map((item) => ({
         source: "window" as const,
         sourceId: String(item.sourceId ?? ""),
@@ -946,6 +1094,904 @@ async function handleTerminalSnapshot(terminalId: string): Promise<void> {
   });
 }
 
+function sendCommandResult(
+  output: string,
+  requestId?: string,
+  meta?: {
+    progress?: boolean;
+    progressSource?: string;
+  },
+): void {
+  send({
+    type: "agent.command_result",
+    payload: {
+      requestId,
+      output,
+      progress: meta?.progress,
+      progressSource: meta?.progressSource,
+    },
+  });
+}
+
+function normalizeControlSessionKey(input: string | undefined): string {
+  const trimmed = (input ?? "").trim();
+  return trimmed || "default";
+}
+
+function getTmuxControlState(sessionKeyRaw: string | undefined): TmuxControlState {
+  const sessionKey = normalizeControlSessionKey(sessionKeyRaw);
+  const existing = tmuxControlStateBySession.get(sessionKey);
+  if (existing) {
+    return existing;
+  }
+
+  const state: TmuxControlState = {
+    enabled: false,
+    target: "",
+    socket: "",
+    captureLines: 120,
+    waitMs: 250,
+    streamMode: "auto",
+    paneIndexMap: {},
+  };
+  tmuxControlStateBySession.set(sessionKey, state);
+  return state;
+}
+
+function updateTmuxControlState(sessionKeyRaw: string | undefined, state: TmuxControlState): void {
+  const sessionKey = normalizeControlSessionKey(sessionKeyRaw);
+  tmuxControlStateBySession.set(sessionKey, state);
+}
+
+function formatTmuxStatus(state: TmuxControlState): string {
+  const enabled = state.enabled ? "on" : "off";
+  const target = state.target || "(not set)";
+  const socket = state.socket || "(default)";
+  return (
+    "tmux status:\n"
+    + `- passthrough: ${enabled}\n`
+    + `- target: ${target}\n`
+    + `- socket: ${socket}\n`
+    + `- capture_lines: ${state.captureLines}\n`
+    + `- wait_ms: ${state.waitMs}\n`
+    + `- stream_mode: ${state.streamMode}`
+  );
+}
+
+function tmuxWindowFromTarget(target: string): string {
+  const cleaned = target.trim();
+  if (cleaned.includes(".")) {
+    const [window] = cleaned.split(/\.(?=[^.]+$)/);
+    return window;
+  }
+  return cleaned;
+}
+
+function resolveTmuxTargetToken(state: TmuxControlState, token: string): { target?: string; error?: string } {
+  const value = token.trim();
+  if (!value) {
+    return { error: "Error: empty target." };
+  }
+  if (/^\d+$/.test(value)) {
+    const resolved = state.paneIndexMap[value];
+    if (resolved) {
+      return { target: resolved };
+    }
+    return { error: `Error: unknown pane id \`${value}\`. Run \`/tmux panes\` to refresh ids.` };
+  }
+  return { target: value };
+}
+
+function normalizeTmuxStreamMode(mode: string | undefined): TmuxStreamMode {
+  const value = (mode ?? "auto").trim().toLowerCase();
+  if (value === "on" || value === "enable" || value === "enabled" || value === "force" || value === "true") {
+    return "on";
+  }
+  if (value === "off" || value === "disable" || value === "disabled" || value === "false" || value === "none") {
+    return "off";
+  }
+  return "auto";
+}
+
+function expandTmuxShortAliasCommand(rawCommand: string): string | undefined {
+  const stripped = rawCommand.trim();
+  const lowered = stripped.toLowerCase();
+  if (!lowered.startsWith("/t") || lowered.startsWith("/tmux") || lowered.startsWith("/pt")) {
+    return undefined;
+  }
+  if (lowered === "/t") {
+    return "/tmux help";
+  }
+
+  const tokens = stripped.split(/\s+/, 2);
+  const head = tokens[0];
+  const sub = head.slice(2).toLowerCase();
+  if (!TMUX_SHORT_SUBCOMMANDS.has(sub)) {
+    return undefined;
+  }
+
+  const suffix = tokens.length > 1 ? tokens[1] : "";
+  return suffix ? `/tmux ${sub} ${suffix}` : `/tmux ${sub}`;
+}
+
+function isLocalPassthroughControlCommand(stripped: string): boolean {
+  const lowered = stripped.toLowerCase();
+  if (expandTmuxShortAliasCommand(stripped)) {
+    return true;
+  }
+  return lowered.startsWith("/tmux") || lowered.startsWith("/passthrough") || lowered.startsWith("/pt");
+}
+
+function isPassthroughEscape(stripped: string): boolean {
+  return stripped.startsWith("//");
+}
+
+function decodePassthroughEscape(rawText: string): string {
+  const leading = rawText.length - rawText.trimStart().length;
+  if (rawText.slice(leading, leading + 2) === "//") {
+    return `${rawText.slice(0, leading)}${rawText.slice(leading + 1)}`;
+  }
+  return rawText;
+}
+
+function trimCommandOutput(text: string, maxChars = 12000): string {
+  return text.length > maxChars ? text.slice(-maxChars) : text;
+}
+
+function toTmuxError(result: CommandResult, args: string[], socketPath?: string): string {
+  const stderr = result.stderr.trim();
+  const stdout = result.stdout.trim();
+  if (result.spawnError) {
+    return `Error: ${result.spawnError.message}`;
+  }
+  if (stderr) {
+    return `Error: ${stderr}`;
+  }
+  if (stdout) {
+    return `Error: ${stdout}`;
+  }
+  const full = [TMUX_COMMAND, ...tmuxArgsWithSocket(args, socketPath)].join(" ");
+  return `Error: ${full} exited with code ${result.code}`;
+}
+
+async function runTmuxControl(
+  args: string[],
+  socketPath?: string,
+  options: CommandOptions = {},
+): Promise<{ ok: boolean; output: string }> {
+  const result = await runTmuxRawWithSocket(args, socketPath, options);
+  if (result.spawnError) {
+    return { ok: false, output: toTmuxError(result, args, socketPath) };
+  }
+  if (result.code !== 0) {
+    const detail = `${result.stderr}\n${result.stdout}`.toLowerCase();
+    if ((args[0] === "list-sessions" || args[0] === "list-panes") && detail.includes("no server running")) {
+      return { ok: true, output: "" };
+    }
+    return { ok: false, output: toTmuxError(result, args, socketPath) };
+  }
+  return { ok: true, output: result.stdout.trimEnd() };
+}
+
+async function listTmuxSessions(socketPath?: string): Promise<string> {
+  const result = await runTmuxControl(
+    ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}"],
+    socketPath,
+  );
+  if (!result.ok) {
+    return result.output;
+  }
+
+  const rows = result.output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (rows.length === 0) {
+    return "No tmux sessions found.";
+  }
+
+  const lines = ["tmux sessions:"];
+  for (const row of rows) {
+    const parts = row.split("\t");
+    const name = parts[0] || "?";
+    const attached = parts[1] === "1" ? "attached" : "detached";
+    const windows = parts[2] || "?";
+    lines.push(`- ${name} (${attached}, windows=${windows})`);
+  }
+  return lines.join("\n");
+}
+
+async function listTmuxPanesData(
+  socketPath?: string,
+  sessionName?: string,
+): Promise<{ panes: TmuxPaneRow[]; error?: string }> {
+  const args = [
+    "list-panes",
+    "-a",
+    "-F",
+    "#{session_name}:#{window_index}.#{pane_index}\t#{window_name}\t#{pane_current_command}\t#{?pane_active,active,idle}",
+  ];
+  if (sessionName) {
+    args.push("-t", sessionName);
+  }
+
+  const result = await runTmuxControl(args, socketPath);
+  if (!result.ok) {
+    return { panes: [], error: result.output };
+  }
+
+  const panes = result.output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((row): TmuxPaneRow => {
+      const parts = row.split("\t");
+      return {
+        target: parts[0] || "?",
+        window: parts[1] || "?",
+        command: parts[2] || "?",
+        activity: parts[3] || "idle",
+      };
+    });
+  return { panes };
+}
+
+async function closeTmuxWindow(target: string, socketPath?: string): Promise<string> {
+  const windowTarget = tmuxWindowFromTarget(target);
+  if (!windowTarget) {
+    return "Error: empty target.";
+  }
+  const result = await runTmuxControl(["kill-window", "-t", windowTarget], socketPath);
+  if (!result.ok) {
+    return result.output;
+  }
+  return `Closed tmux window \`${windowTarget}\`.`;
+}
+
+async function createTmuxSessionForControl(sessionName: string, socketPath?: string): Promise<string> {
+  const result = await runTmuxControl(["new-session", "-d", "-s", sessionName, "-n", "shell"], socketPath);
+  if (!result.ok) {
+    if (result.output.toLowerCase().includes("duplicate session")) {
+      return `Session '${sessionName}' already exists.`;
+    }
+    return result.output;
+  }
+  return `Created tmux session '${sessionName}'.`;
+}
+
+async function captureTmuxTarget(target: string, lines = 120, socketPath?: string): Promise<string> {
+  const clampedLines = Math.max(20, Math.min(lines, 5000));
+  const result = await runTmuxControl(
+    ["capture-pane", "-p", "-J", "-t", target, "-S", `-${clampedLines}`],
+    socketPath,
+  );
+  if (!result.ok) {
+    return result.output;
+  }
+  const out = result.output.trimEnd();
+  return out || "(pane has no output)";
+}
+
+async function tmuxPaneCurrentCommand(target: string, socketPath?: string): Promise<string> {
+  const result = await runTmuxControl(
+    ["display-message", "-p", "-t", target, "#{pane_current_command}"],
+    socketPath,
+  );
+  if (!result.ok) {
+    return "";
+  }
+  return result.output.trim().toLowerCase();
+}
+
+async function shouldStreamTmuxUpdates(target: string, socketPath?: string): Promise<boolean> {
+  const command = await tmuxPaneCurrentCommand(target, socketPath);
+  return TMUX_STREAM_COMMANDS.has(command);
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function captureDelta(previous: string, current: string): string {
+  if (previous === current) {
+    return "";
+  }
+
+  const prevLines = previous.split("\n");
+  const currLines = current.split("\n");
+  let idx = 0;
+  const limit = Math.min(prevLines.length, currLines.length);
+  while (idx < limit && prevLines[idx] === currLines[idx]) {
+    idx += 1;
+  }
+
+  if (idx < currLines.length) {
+    return currLines.slice(idx).join("\n").trim();
+  }
+
+  const tail = currLines.slice(-20);
+  return tail.join("\n").trim();
+}
+
+function formatTmuxUpdateMessage(target: string, content: string): string {
+  const body = (content.trim() || "(pane updated)");
+  return `[tmux ${target} update]\n${trimCommandOutput(body)}`;
+}
+
+async function streamCaptureUpdates(
+  target: string,
+  initialCapture: string,
+  captureLines: number,
+  socketPath: string | undefined,
+  onUpdate: ((content: string) => Promise<void>) | undefined,
+): Promise<string> {
+  const windowMs = Math.max(0, TMUX_STREAM_WINDOW_MS);
+  if (windowMs <= 0) {
+    return initialCapture;
+  }
+
+  const pollMs = Math.max(50, TMUX_STREAM_POLL_MS);
+  const idleMs = Math.max(pollMs, TMUX_STREAM_IDLE_MS);
+  const initialSilenceMs = Math.max(pollMs, TMUX_STREAM_INITIAL_SILENCE_MS);
+
+  let latest = initialCapture;
+  const startedAt = Date.now();
+  let lastChangeAt = startedAt;
+  let seenChange = false;
+
+  while (Date.now() - startedAt < windowMs) {
+    await sleepMs(pollMs);
+    const current = await captureTmuxTarget(target, captureLines, socketPath);
+    if (current.startsWith("Error:")) {
+      return current;
+    }
+
+    const now = Date.now();
+    if (current !== latest) {
+      const delta = captureDelta(latest, current);
+      const chunk = delta || current;
+      if (onUpdate) {
+        try {
+          await onUpdate(formatTmuxUpdateMessage(target, chunk));
+        } catch {
+          // Ignore progress callback failures.
+        }
+      }
+      latest = current;
+      lastChangeAt = now;
+      seenChange = true;
+    }
+
+    if (seenChange) {
+      if (now - lastChangeAt >= idleMs) {
+        break;
+      }
+    } else if (now - startedAt >= initialSilenceMs) {
+      break;
+    }
+  }
+
+  return latest;
+}
+
+async function sendLiteralToTmux(
+  target: string,
+  text: string,
+  socketPath?: string,
+  pressEnter = true,
+): Promise<string | undefined> {
+  const sendResult = await runTmuxControl(["send-keys", "-t", target, "-l", "--", text], socketPath);
+  if (!sendResult.ok) {
+    return sendResult.output;
+  }
+
+  if (!pressEnter) {
+    return undefined;
+  }
+
+  await sleepMs(Math.max(0, TMUX_SUBMIT_DELAY_MS));
+  const enterResult = await runTmuxControl(["send-keys", "-t", target, "Enter"], socketPath);
+  if (!enterResult.ok) {
+    return enterResult.output;
+  }
+  return undefined;
+}
+
+function normalizeKeyToken(raw: string): string {
+  const key = raw.trim();
+  if (!key) {
+    return "";
+  }
+
+  const lowered = key.toLowerCase();
+  const aliases: Record<string, string> = {
+    enter: "Enter",
+    return: "Enter",
+    esc: "Escape",
+    escape: "Escape",
+    tab: "Tab",
+    space: "Space",
+    backspace: "BSpace",
+    delete: "Delete",
+    del: "Delete",
+  };
+  if (aliases[lowered]) {
+    return aliases[lowered];
+  }
+
+  const ctrlMatch = lowered.match(/^(?:ctrl|control|c)[+\-]([a-z])$/);
+  if (ctrlMatch) {
+    return `C-${ctrlMatch[1]}`;
+  }
+  const caretMatch = lowered.match(/^\^([a-z])$/);
+  if (caretMatch) {
+    return `C-${caretMatch[1]}`;
+  }
+
+  return key;
+}
+
+async function sendKeysToTmux(
+  target: string,
+  keys: string[],
+  socketPath?: string,
+): Promise<string | undefined> {
+  if (keys.length === 0) {
+    return "Error: empty key sequence.";
+  }
+
+  const normalized: string[] = [];
+  for (const token of keys) {
+    const key = normalizeKeyToken(token);
+    if (!key) {
+      return "Error: key sequence contains an empty token.";
+    }
+    normalized.push(key);
+  }
+
+  const result = await runTmuxControl(["send-keys", "-t", target, ...normalized], socketPath);
+  if (!result.ok) {
+    return result.output;
+  }
+  return undefined;
+}
+
+async function tmuxPassthrough(
+  target: string,
+  text: string,
+  socketPath: string | undefined,
+  captureLines: number,
+  waitMs: number,
+  streamMode: TmuxStreamMode,
+  onUpdate?: TmuxProgressCallback,
+): Promise<string> {
+  if (!text) {
+    return "Error: empty command";
+  }
+
+  const sendError = await sendLiteralToTmux(target, text, socketPath, true);
+  if (sendError) {
+    return sendError;
+  }
+
+  const clampedWaitMs = Math.max(0, Math.min(waitMs, 5000));
+  if (clampedWaitMs > 0) {
+    await sleepMs(clampedWaitMs);
+  }
+
+  let capture = await captureTmuxTarget(target, captureLines, socketPath);
+  if (streamMode !== "off") {
+    const streamEnabled = streamMode === "on" || await shouldStreamTmuxUpdates(target, socketPath);
+    if (streamEnabled) {
+      capture = await streamCaptureUpdates(target, capture, captureLines, socketPath, onUpdate);
+    }
+  }
+
+  return `[tmux ${target}]\n${trimCommandOutput(capture)}`;
+}
+
+async function tmuxKeyPassthrough(
+  target: string,
+  keys: string[],
+  socketPath: string | undefined,
+  captureLines: number,
+  waitMs: number,
+  streamMode: TmuxStreamMode,
+  onUpdate?: TmuxProgressCallback,
+): Promise<string> {
+  const sendError = await sendKeysToTmux(target, keys, socketPath);
+  if (sendError) {
+    return sendError;
+  }
+
+  const clampedWaitMs = Math.max(0, Math.min(waitMs, 5000));
+  if (clampedWaitMs > 0) {
+    await sleepMs(clampedWaitMs);
+  }
+
+  let capture = await captureTmuxTarget(target, captureLines, socketPath);
+  if (streamMode !== "off") {
+    const streamEnabled = streamMode === "on" || await shouldStreamTmuxUpdates(target, socketPath);
+    if (streamEnabled) {
+      capture = await streamCaptureUpdates(target, capture, captureLines, socketPath, onUpdate);
+    }
+  }
+
+  return `[tmux ${target}]\n${trimCommandOutput(capture)}`;
+}
+
+async function handlePassthroughCommand(sessionKey: string, rawCommand: string): Promise<string> {
+  const state = getTmuxControlState(sessionKey);
+  const tokens = rawCommand.trim().split(/\s+/);
+  const action = (tokens[1] || "status").toLowerCase();
+
+  if (action === "status" || action === "show") {
+    return formatTmuxStatus(state);
+  }
+
+  if (action === "on" || action === "enable") {
+    if (!state.target) {
+      state.target = "tfclaw:0.0";
+    }
+    state.enabled = true;
+    updateTmuxControlState(sessionKey, state);
+    const socketPath = state.socket || undefined;
+    const target = state.target.trim();
+    const capture = await captureTmuxTarget(target, state.captureLines, socketPath);
+    return (
+      "Passthrough enabled.\n"
+      + `Commands will be sent literally to tmux target \`${target}\`.\n`
+      + "Use `/tmux panes` to inspect panes or `/tmux target <session:window.pane|id>` to switch.\n"
+      + "In passthrough mode, slash commands are also forwarded by default.\n"
+      + "TFClaw control commands stay local (for example `/tmux ...`, `/passthrough ...`, `/pt ...`).\n"
+      + "Prefix `//` to force-send local-looking slash commands to tmux.\n\n"
+      + `[tmux ${target}]\n${capture}`
+    );
+  }
+
+  if (action === "off" || action === "disable") {
+    state.enabled = false;
+    updateTmuxControlState(sessionKey, state);
+    return "Passthrough disabled.";
+  }
+
+  return (
+    "Usage:\n"
+    + "- /passthrough on\n"
+    + "- /passthrough off\n"
+    + "- /passthrough status\n"
+    + "- /pt on|off|status"
+  );
+}
+
+async function handleTmuxCommand(
+  sessionKey: string,
+  rawCommand: string,
+  onProgress?: TmuxProgressCallback,
+): Promise<string> {
+  const state = getTmuxControlState(sessionKey);
+  const stripped = rawCommand.trim();
+  const tokens = stripped.split(/\s+/);
+  if (tokens.length === 1 || (tokens[1] && (tokens[1].toLowerCase() === "help" || tokens[1] === "?"))) {
+    return (
+      "tmux commands:\n"
+      + "- /tmux status\n"
+      + "- /tmux sessions\n"
+      + "- /tmux panes [session]\n"
+      + "- /tmux new [session]\n"
+      + "- /tmux target <session:window.pane|id>\n"
+      + "- /tmux close <id|session:window.pane>\n"
+      + "- /tmux socket <path|default>\n"
+      + "- /tmux lines <20-5000>\n"
+      + "- /tmux wait <0-5000>\n"
+      + "- /tmux stream <auto|on|off>\n"
+      + "- /tmux capture [lines]\n"
+      + "- /tmux key <key...>\n"
+      + "- /tmux send <literal command>\n"
+      + "- /passthrough on|off|status\n"
+      + "- /pt on|off|status\n"
+      + "- /t<subcommand> aliases for /tmux (e.g. /tkey, /ttarget, /tcapture)"
+    );
+  }
+
+  const sub = tokens[1].toLowerCase();
+  const socketPath = state.socket || undefined;
+
+  if (sub === "status") {
+    return formatTmuxStatus(state);
+  }
+
+  if (sub === "sessions" || sub === "ls") {
+    return listTmuxSessions(socketPath);
+  }
+
+  if (sub === "panes" || sub === "targets") {
+    const sessionName = tokens[2];
+    const listed = await listTmuxPanesData(socketPath, sessionName);
+    if (listed.error) {
+      return listed.error;
+    }
+    if (listed.panes.length === 0) {
+      state.paneIndexMap = {};
+      updateTmuxControlState(sessionKey, state);
+      return "No tmux panes found.";
+    }
+
+    const lines = ["tmux panes:"];
+    const nextMap: Record<string, string> = {};
+    listed.panes.forEach((pane, index) => {
+      const key = String(index + 1);
+      nextMap[key] = pane.target;
+      lines.push(`- [${key}] ${pane.target} | window=${pane.window} | cmd=${pane.command} | ${pane.activity}`);
+    });
+    state.paneIndexMap = nextMap;
+    updateTmuxControlState(sessionKey, state);
+    lines.push("Use `/tmux target <id>` or `/tmux close <id>`.");
+    return lines.join("\n");
+  }
+
+  if (sub === "new") {
+    const sessionName = tokens[2] || "tfclaw";
+    const created = await createTmuxSessionForControl(sessionName, socketPath);
+    if (created.startsWith("Error:")) {
+      return created;
+    }
+    state.target = `${sessionName}:0.0`;
+    updateTmuxControlState(sessionKey, state);
+    return `${created}\nTarget set to \`${state.target}\`.`;
+  }
+
+  if (sub === "target") {
+    if (tokens.length < 3) {
+      return "Usage: /tmux target <session:window.pane|id>";
+    }
+    const resolved = resolveTmuxTargetToken(state, tokens[2]);
+    if (resolved.error) {
+      return resolved.error;
+    }
+    state.target = resolved.target!;
+    updateTmuxControlState(sessionKey, state);
+    const target = state.target.trim();
+    const capture = await captureTmuxTarget(target, state.captureLines, socketPath);
+    return `Target set to \`${target}\`.\n\n[tmux ${target}]\n${capture}`;
+  }
+
+  if (sub === "close" || sub === "kill") {
+    if (tokens.length < 3) {
+      return "Usage: /tmux close <id|session:window.pane>";
+    }
+    const resolved = resolveTmuxTargetToken(state, tokens[2]);
+    if (resolved.error) {
+      return resolved.error;
+    }
+    const target = resolved.target!;
+    let result = await closeTmuxWindow(target, socketPath);
+    if (result.startsWith("Error:")) {
+      return result;
+    }
+
+    const closedWindow = tmuxWindowFromTarget(target);
+    const currentTarget = state.target.trim();
+    if (currentTarget && tmuxWindowFromTarget(currentTarget) === closedWindow) {
+      state.target = "";
+      result += "\nCurrent target cleared because it was in the closed window.";
+    }
+
+    const nextPaneMap: Record<string, string> = {};
+    for (const [key, value] of Object.entries(state.paneIndexMap)) {
+      if (tmuxWindowFromTarget(value) !== closedWindow) {
+        nextPaneMap[key] = value;
+      }
+    }
+    state.paneIndexMap = nextPaneMap;
+    updateTmuxControlState(sessionKey, state);
+    return result;
+  }
+
+  if (sub === "socket") {
+    if (tokens.length < 3) {
+      return `Current socket: \`${state.socket || "(default)"}\``;
+    }
+    const value = tokens[2].trim().toLowerCase();
+    state.socket = (value === "default" || value === "none" || value === "off") ? "" : tokens[2].trim();
+    updateTmuxControlState(sessionKey, state);
+    return `Socket set to \`${state.socket || "(default)"}\`.`;
+  }
+
+  if (sub === "lines") {
+    if (tokens.length < 3) {
+      return `Current capture_lines: ${state.captureLines}`;
+    }
+    const parsed = Number.parseInt(tokens[2], 10);
+    if (!Number.isFinite(parsed)) {
+      return "Error: lines must be an integer.";
+    }
+    state.captureLines = Math.max(20, Math.min(parsed, 5000));
+    updateTmuxControlState(sessionKey, state);
+    return `capture_lines set to ${state.captureLines}.`;
+  }
+
+  if (sub === "wait") {
+    if (tokens.length < 3) {
+      return `Current wait_ms: ${state.waitMs}`;
+    }
+    const parsed = Number.parseInt(tokens[2], 10);
+    if (!Number.isFinite(parsed)) {
+      return "Error: wait must be an integer milliseconds value.";
+    }
+    state.waitMs = Math.max(0, Math.min(parsed, 5000));
+    updateTmuxControlState(sessionKey, state);
+    return `wait_ms set to ${state.waitMs}.`;
+  }
+
+  if (sub === "stream") {
+    if (tokens.length < 3) {
+      return `Current stream_mode: ${state.streamMode} (auto|on|off)`;
+    }
+    const modeRaw = tokens[2].trim().toLowerCase();
+    const aliases: Record<string, TmuxStreamMode> = {
+      auto: "auto",
+      default: "auto",
+      on: "on",
+      enable: "on",
+      enabled: "on",
+      force: "on",
+      off: "off",
+      disable: "off",
+      disabled: "off",
+    };
+    if (!aliases[modeRaw]) {
+      return "Usage: /tmux stream <auto|on|off>";
+    }
+    state.streamMode = aliases[modeRaw];
+    updateTmuxControlState(sessionKey, state);
+    return `stream_mode set to ${state.streamMode}.`;
+  }
+
+  if (sub === "capture") {
+    const target = state.target.trim();
+    if (!target) {
+      return "Error: target not set. Use `/tmux target <session:window.pane|id>` first.";
+    }
+    let lines = state.captureLines;
+    if (tokens.length > 2) {
+      const parsed = Number.parseInt(tokens[2], 10);
+      if (!Number.isFinite(parsed)) {
+        return "Error: capture lines must be an integer.";
+      }
+      lines = Math.max(20, Math.min(parsed, 5000));
+    }
+    const content = await captureTmuxTarget(target, lines, socketPath);
+    return `[tmux ${target}]\n${content}`;
+  }
+
+  if (sub === "key" || sub === "keys" || sub === "sendkey" || sub === "sendkeys" || sub === "send-keys") {
+    if (tokens.length < 3) {
+      return (
+        "Usage: /tmux key <key...>\n"
+        + "Examples:\n"
+        + "- /tmux key C-c\n"
+        + "- /tmux key Enter\n"
+        + "- /tmux key Ctrl+C"
+      );
+    }
+    const target = state.target.trim();
+    if (!target) {
+      return "Error: target not set. Use `/tmux target <session:window.pane|id>` first.";
+    }
+    return tmuxKeyPassthrough(
+      target,
+      tokens.slice(2),
+      socketPath,
+      state.captureLines,
+      state.waitMs,
+      state.streamMode,
+      onProgress,
+    );
+  }
+
+  if (sub === "send") {
+    if (!stripped.toLowerCase().startsWith("/tmux send ")) {
+      return "Usage: /tmux send <literal command>";
+    }
+    const payload = stripped.slice("/tmux send ".length);
+    const target = state.target.trim();
+    if (!target) {
+      return "Error: target not set. Use `/tmux target <session:window.pane|id>` first.";
+    }
+    if (!payload) {
+      return "Error: empty command.";
+    }
+    return tmuxPassthrough(
+      target,
+      payload,
+      socketPath,
+      state.captureLines,
+      state.waitMs,
+      state.streamMode,
+      onProgress,
+    );
+  }
+
+  return "Unknown /tmux command. Use `/tmux help`.";
+}
+
+async function handleTfclawTextCommand(
+  rawText: string,
+  sessionKeyRaw?: string,
+  onProgress?: TmuxProgressCallback,
+): Promise<string> {
+  const sessionKey = normalizeControlSessionKey(sessionKeyRaw);
+  const stripped = rawText.trim();
+  const lowered = stripped.toLowerCase();
+  const tmuxAlias = expandTmuxShortAliasCommand(rawText);
+  const tmuxCommand = tmuxAlias || rawText;
+  const tmuxLowered = tmuxCommand.trim().toLowerCase();
+  const tmuxState = getTmuxControlState(sessionKey);
+
+  const passthroughEnabled = tmuxState.enabled;
+  const passthroughEscape = isPassthroughEscape(stripped);
+  const localPassthroughCommand = isLocalPassthroughControlCommand(stripped);
+
+  if (passthroughEnabled && stripped && (passthroughEscape || !localPassthroughCommand)) {
+    const target = tmuxState.target.trim();
+    if (!target) {
+      return "Error: passthrough is on but no target is configured. Use `/tmux target <session:window.pane|id>`.";
+    }
+    const passthroughText = passthroughEscape ? decodePassthroughEscape(rawText) : rawText;
+    return tmuxPassthrough(
+      target,
+      passthroughText,
+      tmuxState.socket || undefined,
+      tmuxState.captureLines,
+      tmuxState.waitMs,
+      normalizeTmuxStreamMode(tmuxState.streamMode),
+      onProgress,
+    );
+  }
+
+  if (tmuxLowered.startsWith("/tmux")) {
+    return handleTmuxCommand(sessionKey, tmuxCommand, onProgress);
+  }
+
+  if (lowered.startsWith("/passthrough") || lowered.startsWith("/pt")) {
+    let passthroughCommand = rawText;
+    if (lowered.startsWith("/pt")) {
+      if (stripped === "/pt") {
+        passthroughCommand = "/passthrough";
+      } else {
+        passthroughCommand = `/passthrough ${stripped.slice(3).trim()}`;
+      }
+    }
+    return handlePassthroughCommand(sessionKey, passthroughCommand);
+  }
+
+  if (lowered === "/new") {
+    tmuxControlStateBySession.delete(sessionKey);
+    return "New session started.";
+  }
+
+  if (lowered === "/help") {
+    return (
+      "tfclaw commands:\n"
+      + "/new - Start a new command session\n"
+      + "/help - Show available commands\n"
+      + "/tmux help - tmux control commands\n"
+      + "/tmux key C-c - send shortcut keys to tmux pane\n"
+      + "/tkey ... /ttarget ... - shorthand aliases for /tmux subcommands\n"
+      + "/passthrough on|off|status - literal tmux passthrough mode\n"
+      + "/pt on|off|status - shorthand alias for /passthrough"
+    );
+  }
+
+  return "Unknown command. Use `/help` or `/tmux help`.";
+}
+
 async function handleCommand(command: ClientCommand): Promise<void> {
   const payload = command.payload;
 
@@ -979,6 +2025,17 @@ async function handleCommand(command: ClientCommand): Promise<void> {
       }
       case "screen.capture": {
         await captureSource(payload.source, payload.sourceId, payload.terminalId, command.requestId);
+        return;
+      }
+      case "tfclaw.command": {
+        const onProgress: TmuxProgressCallback = async (content: string) => {
+          sendCommandResult(content, command.requestId, {
+            progress: true,
+            progressSource: "tmux",
+          });
+        };
+        const output = await handleTfclawTextCommand(payload.text, payload.sessionKey, onProgress);
+        sendCommandResult(output, command.requestId);
         return;
       }
       default: {

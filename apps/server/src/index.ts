@@ -141,6 +141,7 @@ function handleAgentMessage(ws: WebSocket, session: TokenSession, message: Relay
     }
     case "agent.screen_capture":
     case "agent.capture_sources":
+    case "agent.command_result":
     case "agent.error": {
       for (const client of session.clients) {
         send(client, message);

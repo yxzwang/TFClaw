@@ -124,6 +124,19 @@ interface PendingCaptureSourceList {
   timer: NodeJS.Timeout;
 }
 
+interface PendingCommandResult {
+  resolve: (output: string) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+  onProgress?: (output: string, source?: string) => void | Promise<void>;
+}
+
+interface EarlyCommandProgress {
+  output: string;
+  progressSource?: string;
+  at: number;
+}
+
 interface ChatCaptureSelection {
   options: CaptureSource[];
   terminalId?: string;
@@ -140,6 +153,8 @@ interface RenderedTerminalOutput {
 interface MessageResponder {
   replyText(chatId: string, text: string): Promise<void>;
   replyImage(chatId: string, imageBase64: string): Promise<void>;
+  replyTextWithMeta?(chatId: string, text: string): Promise<{ messageId?: string }>;
+  deleteMessage?(messageId: string): Promise<void>;
 }
 
 interface InboundTextContext {
@@ -149,6 +164,29 @@ interface InboundTextContext {
   text: string;
   allowFrom: string[];
   responder: MessageResponder;
+}
+
+interface TerminalProgressSession {
+  selectionKey: string;
+  chatId: string;
+  terminalId: string;
+  responder: MessageResponder;
+  timer: NodeJS.Timeout;
+  lastSnapshot: string;
+  lastChangedAt: number;
+  startedAt: number;
+  busy: boolean;
+  lastProgressMessageId?: string;
+}
+
+interface CommandProgressSession {
+  requestId: string;
+  selectionKey: string;
+  chatId: string;
+  responder: MessageResponder;
+  queue: Promise<void>;
+  lastProgressMessageId?: string;
+  lastProgressBody?: string;
 }
 
 interface ChatApp {
@@ -161,6 +199,18 @@ interface ChatApp {
 function randomId(): string {
   return `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 }
+
+const REALTIME_FOREGROUND_COMMANDS = new Set([
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "bun",
+  "deno",
+  "tsx",
+  "ts-node",
+]);
 
 function toObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -188,6 +238,13 @@ function toNumber(value: unknown, fallback: number): number {
   }
   return fallback;
 }
+
+const COMMAND_RESULT_TIMEOUT_MS = Math.max(
+  1000,
+  Math.min(24 * 60 * 60 * 1000, toNumber(process.env.TFCLAW_COMMAND_RESULT_TIMEOUT_MS, 24 * 60 * 60 * 1000)),
+);
+const FEISHU_ACK_REACTION = toString(process.env.TFCLAW_FEISHU_ACK_REACTION, "OnIt").trim() || "OnIt";
+const FEISHU_ACK_REACTION_ENABLED = toBoolean(process.env.TFCLAW_FEISHU_ACK_REACTION_ENABLED, true);
 
 function toBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") {
@@ -561,6 +618,10 @@ class RelayBridge {
   private reconnectAttempts = 0;
   private pendingCaptures = new Map<string, PendingCapture>();
   private pendingCaptureSourceLists = new Map<string, PendingCaptureSourceList>();
+  private pendingCommandResults = new Map<string, PendingCommandResult>();
+  private earlyCommandOutcomes = new Map<string, { ok: boolean; value: string; at: number }>();
+  private earlyCommandProgress = new Map<string, EarlyCommandProgress[]>();
+  private readonly earlyCommandOutcomeTtlMs = 60_000;
 
   readonly cache: RelayCache = {
     terminals: new Map<string, TerminalSummary>(),
@@ -663,6 +724,48 @@ class RelayBridge {
     });
   }
 
+  waitForCommandResult(
+    requestId: string,
+    timeoutMs = COMMAND_RESULT_TIMEOUT_MS,
+    onProgress?: (output: string, source?: string) => void | Promise<void>,
+  ): Promise<string> {
+    this.pruneEarlyCommandOutcomes();
+    this.pruneEarlyCommandProgress();
+    const early = this.earlyCommandOutcomes.get(requestId);
+    if (early) {
+      this.earlyCommandOutcomes.delete(requestId);
+      this.earlyCommandProgress.delete(requestId);
+      if (early.ok) {
+        return Promise.resolve(early.value);
+      }
+      return Promise.reject(new Error(early.value));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingCommandResults.delete(requestId);
+        reject(new Error("command timeout"));
+      }, timeoutMs);
+
+      this.pendingCommandResults.set(requestId, {
+        resolve,
+        reject,
+        timer,
+        onProgress,
+      });
+
+      const earlyProgressItems = this.earlyCommandProgress.get(requestId);
+      if (earlyProgressItems?.length && onProgress) {
+        for (const item of earlyProgressItems) {
+          void Promise
+            .resolve(onProgress(item.output, item.progressSource))
+            .catch((error) => console.warn(`[gateway] progress callback failed: ${error instanceof Error ? error.message : String(error)}`));
+        }
+      }
+      this.earlyCommandProgress.delete(requestId);
+    });
+  }
+
   private handleRelayMessage(raw: string): void {
     const parsed = safeJsonParse(raw);
     if (!parsed) {
@@ -717,6 +820,32 @@ class RelayBridge {
       return;
     }
 
+    if (parsed.type === "agent.command_result") {
+      if (parsed.payload.requestId) {
+        const isProgress = Boolean(parsed.payload.progress);
+        const pending = this.pendingCommandResults.get(parsed.payload.requestId);
+        if (isProgress) {
+          if (pending?.onProgress) {
+            void Promise
+              .resolve(pending.onProgress(parsed.payload.output, parsed.payload.progressSource))
+              .catch((error) => console.warn(`[gateway] progress callback failed: ${error instanceof Error ? error.message : String(error)}`));
+          } else if (!pending) {
+            this.saveEarlyCommandProgress(parsed.payload.requestId, parsed.payload.output, parsed.payload.progressSource);
+          }
+        } else {
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingCommandResults.delete(parsed.payload.requestId);
+            pending.resolve(parsed.payload.output);
+          } else {
+            this.saveEarlyCommandOutcome(parsed.payload.requestId, true, parsed.payload.output);
+          }
+          this.earlyCommandProgress.delete(parsed.payload.requestId);
+        }
+      }
+      return;
+    }
+
     if (parsed.type === "agent.error" && parsed.payload.requestId) {
       const pendingCapture = this.pendingCaptures.get(parsed.payload.requestId);
       if (pendingCapture) {
@@ -731,7 +860,19 @@ class RelayBridge {
         clearTimeout(pendingSources.timer);
         this.pendingCaptureSourceLists.delete(parsed.payload.requestId);
         pendingSources.reject(new Error(`${parsed.payload.code}: ${parsed.payload.message}`));
+        return;
       }
+
+      const pendingCommand = this.pendingCommandResults.get(parsed.payload.requestId);
+      if (pendingCommand) {
+        clearTimeout(pendingCommand.timer);
+        this.pendingCommandResults.delete(parsed.payload.requestId);
+        pendingCommand.reject(new Error(`${parsed.payload.code}: ${parsed.payload.message}`));
+        return;
+      }
+
+      this.earlyCommandProgress.delete(parsed.payload.requestId);
+      this.saveEarlyCommandOutcome(parsed.payload.requestId, false, `${parsed.payload.code}: ${parsed.payload.message}`);
     }
   }
 
@@ -747,13 +888,86 @@ class RelayBridge {
       this.pendingCaptureSourceLists.delete(requestId);
       pending.reject(error);
     }
+
+    for (const [requestId, pending] of this.pendingCommandResults.entries()) {
+      clearTimeout(pending.timer);
+      this.pendingCommandResults.delete(requestId);
+      pending.reject(error);
+    }
+
+    this.earlyCommandOutcomes.clear();
+    this.earlyCommandProgress.clear();
+  }
+
+  private saveEarlyCommandOutcome(requestId: string, ok: boolean, value: string): void {
+    if (!requestId) {
+      return;
+    }
+    this.pruneEarlyCommandOutcomes();
+    this.earlyCommandOutcomes.set(requestId, {
+      ok,
+      value,
+      at: Date.now(),
+    });
+  }
+
+  private saveEarlyCommandProgress(requestId: string, output: string, progressSource?: string): void {
+    if (!requestId) {
+      return;
+    }
+    this.pruneEarlyCommandProgress();
+    const list = this.earlyCommandProgress.get(requestId) ?? [];
+    list.push({
+      output,
+      progressSource,
+      at: Date.now(),
+    });
+    if (list.length > 128) {
+      list.splice(0, list.length - 128);
+    }
+    this.earlyCommandProgress.set(requestId, list);
+  }
+
+  private pruneEarlyCommandOutcomes(): void {
+    const now = Date.now();
+    for (const [requestId, outcome] of this.earlyCommandOutcomes.entries()) {
+      if (now - outcome.at > this.earlyCommandOutcomeTtlMs) {
+        this.earlyCommandOutcomes.delete(requestId);
+      }
+    }
+  }
+
+  private pruneEarlyCommandProgress(): void {
+    const now = Date.now();
+    for (const [requestId, list] of this.earlyCommandProgress.entries()) {
+      const filtered = list.filter((item) => now - item.at <= this.earlyCommandOutcomeTtlMs);
+      if (filtered.length === 0) {
+        this.earlyCommandProgress.delete(requestId);
+        continue;
+      }
+      if (filtered.length !== list.length) {
+        this.earlyCommandProgress.set(requestId, filtered);
+      }
+    }
   }
 }
 // SECTION: router
 class TfclawCommandRouter {
   private chatTerminalSelection = new Map<string, string>();
+  private chatTmuxTarget = new Map<string, string>();
+  private chatPassthroughEnabled = new Map<string, boolean>();
   private chatCaptureSelections = new Map<string, ChatCaptureSelection>();
   private chatModes = new Map<string, ChatInteractionMode>();
+  private progressSessions = new Map<string, TerminalProgressSession>();
+  private commandProgressSessions = new Map<string, CommandProgressSession>();
+  private activeCommandRequestBySelection = new Map<string, string>();
+  private readonly progressPollMs = 1200;
+  private readonly progressRecallDelayMs = Math.max(
+    80,
+    Math.min(2000, toNumber(process.env.TFCLAW_PROGRESS_RECALL_DELAY_MS, 350)),
+  );
+  private readonly progressIdleTimeoutMs = 10 * 60 * 1000;
+  private readonly progressMaxLifetimeMs = 30 * 60 * 1000;
 
   constructor(private readonly relay: RelayBridge) {}
 
@@ -768,6 +982,10 @@ class TfclawCommandRouter {
   private setMode(selectionKey: string, mode: ChatInteractionMode): void {
     if (mode === "tfclaw") {
       this.chatModes.delete(selectionKey);
+      if (!this.chatPassthroughEnabled.get(selectionKey)) {
+        this.chatTmuxTarget.delete(selectionKey);
+      }
+      this.stopProgressSession(selectionKey);
       return;
     }
     this.chatModes.set(selectionKey, mode);
@@ -789,10 +1007,21 @@ class TfclawCommandRouter {
   }
 
   private modeTag(selectionKey: string): string {
+    const passthroughEnabled = Boolean(this.chatPassthroughEnabled.get(selectionKey));
+    const tmuxTarget = this.chatTmuxTarget.get(selectionKey);
+    if (passthroughEnabled) {
+      return `tmux:${tmuxTarget || "target"}`;
+    }
+
     const mode = this.getMode(selectionKey);
     if (mode === "tfclaw") {
       return "tfclaw";
     }
+
+    if (tmuxTarget) {
+      return `tmux:${tmuxTarget}`;
+    }
+
     const selected = this.selectedTerminal(selectionKey, false);
     if (selected) {
       return `terminal:${selected.title} (${selected.terminalId})`;
@@ -801,15 +1030,366 @@ class TfclawCommandRouter {
     return selectedId ? `terminal:${selectedId}` : "terminal";
   }
 
+  private normalizeCommandLine(line: string): string {
+    return line.trim().toLowerCase().replace(/\s+/g, " ");
+  }
+
+  private extractTmuxTarget(output: string): string | undefined {
+    const source = output.trim();
+    if (!source) {
+      return undefined;
+    }
+
+    const header = source.match(/\[tmux ([^\]\r\n]+)\]/i);
+    if (header?.[1]) {
+      return header[1].trim();
+    }
+
+    const targetSet = source.match(/target set to `([^`]+)`/i);
+    if (targetSet?.[1]) {
+      return targetSet[1].trim();
+    }
+
+    const statusTarget = source.match(/- target:\s*([^\r\n]+)/i);
+    if (statusTarget?.[1]) {
+      const target = statusTarget[1].trim();
+      if (target && target !== "(not set)") {
+        return target;
+      }
+    }
+
+    return undefined;
+  }
+
+  private updateModeFromResult(selectionKey: string, rawCommand: string, output: string): void {
+    const command = this.normalizeCommandLine(rawCommand);
+    const target = this.extractTmuxTarget(output);
+    if (target) {
+      this.chatTmuxTarget.set(selectionKey, target);
+    }
+
+    const passthroughOnCommand =
+      command === "/passthrough on" || command === "/passthrough enable" || command === "/pt on";
+    const passthroughOffCommand =
+      command === "/passthrough off" || command === "/passthrough disable" || command === "/pt off";
+
+    if (passthroughOnCommand) {
+      if (/passthrough enabled/i.test(output)) {
+        this.chatPassthroughEnabled.set(selectionKey, true);
+        this.setMode(selectionKey, "terminal");
+      }
+      return;
+    }
+
+    if (passthroughOffCommand) {
+      if (/passthrough disabled/i.test(output)) {
+        this.chatPassthroughEnabled.set(selectionKey, false);
+        this.setMode(selectionKey, "tfclaw");
+      }
+      return;
+    }
+
+    if (/tmux status:/i.test(output)) {
+      if (/- passthrough:\s*on/i.test(output)) {
+        this.chatPassthroughEnabled.set(selectionKey, true);
+        this.setMode(selectionKey, "terminal");
+      } else if (/- passthrough:\s*off/i.test(output)) {
+        this.chatPassthroughEnabled.set(selectionKey, false);
+        this.setMode(selectionKey, "tfclaw");
+      }
+    }
+  }
+
+  private normalizeLegacyErrorMessage(output: string): string {
+    const source = output.trim();
+    if (!source) {
+      return source;
+    }
+    if (/unknown tfclaw command:/i.test(source)) {
+      return "Unknown command. Use `/tmux help`.";
+    }
+    if (/use\s+\/help,\s*or\s*\/attach/i.test(source)) {
+      return source.replace(/use\s+\/help,\s*or\s*\/attach[^\r\n]*/gi, "Use `/tmux help`.");
+    }
+    return source;
+  }
+
+  private normalizeForegroundCommand(command: string | undefined): string {
+    const trimmed = (command ?? "").trim().toLowerCase();
+    if (!trimmed) {
+      return "";
+    }
+    const base = trimmed.split(/[\\/]/).pop() ?? trimmed;
+    return base.endsWith(".exe") ? base.slice(0, -4) : base;
+  }
+
+  private shouldEnableProgress(terminal: TerminalSummary | undefined): boolean {
+    if (!terminal || !terminal.isActive) {
+      return false;
+    }
+    const normalized = this.normalizeForegroundCommand(terminal.foregroundCommand);
+    return normalized.length > 0 && REALTIME_FOREGROUND_COMMANDS.has(normalized);
+  }
+
   private async replyWithMode(
     chatId: string,
     responder: MessageResponder,
     selectionKey: string,
     body: string,
   ): Promise<void> {
+    await this.replyWithModeMeta(chatId, responder, selectionKey, body);
+  }
+
+  private async replyWithModeMeta(
+    chatId: string,
+    responder: MessageResponder,
+    selectionKey: string,
+    body: string,
+  ): Promise<{ messageId?: string }> {
     const head = `[mode] ${this.modeTag(selectionKey)}`;
     const content = body.trim();
-    await responder.replyText(chatId, content ? `${head}\n${content}` : head);
+    const payload = content ? `${head}\n${content}` : head;
+    if (typeof responder.replyTextWithMeta === "function") {
+      return (await responder.replyTextWithMeta(chatId, payload)) ?? {};
+    }
+    await responder.replyText(chatId, payload);
+    return {};
+  }
+
+  private stopProgressSession(selectionKey: string): void {
+    const session = this.progressSessions.get(selectionKey);
+    if (!session) {
+      return;
+    }
+    clearInterval(session.timer);
+    this.progressSessions.delete(selectionKey);
+  }
+
+  private scheduleDeleteMessage(responder: MessageResponder, messageId: string): void {
+    if (!messageId || typeof responder.deleteMessage !== "function") {
+      return;
+    }
+    setTimeout(() => {
+      void responder
+        .deleteMessage?.(messageId)
+        .catch((error) => console.warn(`[gateway] feishu delete message failed: ${error instanceof Error ? error.message : String(error)}`));
+    }, this.progressRecallDelayMs);
+  }
+
+  private async sendProgressUpdate(session: TerminalProgressSession, body: string): Promise<void> {
+    const previousMessageId = session.lastProgressMessageId;
+    const meta = await this.replyWithModeMeta(session.chatId, session.responder, session.selectionKey, body);
+    const currentMessageId = meta.messageId;
+    if (currentMessageId) {
+      session.lastProgressMessageId = currentMessageId;
+      if (previousMessageId && previousMessageId !== currentMessageId) {
+        this.scheduleDeleteMessage(session.responder, previousMessageId);
+      }
+    }
+  }
+
+  private beginCommandProgressSession(
+    selectionKey: string,
+    requestId: string,
+    chatId: string,
+    responder: MessageResponder,
+  ): void {
+    const previousRequestId = this.activeCommandRequestBySelection.get(selectionKey);
+    if (previousRequestId && previousRequestId !== requestId) {
+      this.stopCommandProgressSession(previousRequestId, true);
+    }
+
+    this.activeCommandRequestBySelection.set(selectionKey, requestId);
+    this.commandProgressSessions.set(requestId, {
+      requestId,
+      selectionKey,
+      chatId,
+      responder,
+      queue: Promise.resolve(),
+    });
+  }
+
+  private stopCommandProgressSession(requestId: string, recallLastMessage: boolean): void {
+    const session = this.commandProgressSessions.get(requestId);
+    if (!session) {
+      return;
+    }
+    this.commandProgressSessions.delete(requestId);
+
+    if (this.activeCommandRequestBySelection.get(session.selectionKey) === requestId) {
+      this.activeCommandRequestBySelection.delete(session.selectionKey);
+    }
+
+    if (recallLastMessage && session.lastProgressMessageId && typeof session.responder.deleteMessage === "function") {
+      void session.responder
+        .deleteMessage(session.lastProgressMessageId)
+        .catch((error) => console.warn(`[gateway] feishu delete message failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
+
+  private queueCommandProgressUpdate(requestId: string, body: string): void {
+    const session = this.commandProgressSessions.get(requestId);
+    if (!session) {
+      return;
+    }
+    const nextBody = body.trim();
+    if (!nextBody) {
+      return;
+    }
+
+    session.queue = session.queue
+      .catch(() => undefined)
+      .then(async () => {
+        const active = this.commandProgressSessions.get(requestId);
+        if (!active) {
+          return;
+        }
+        if (this.activeCommandRequestBySelection.get(active.selectionKey) !== requestId) {
+          return;
+        }
+        if (active.lastProgressBody === nextBody) {
+          return;
+        }
+
+        const previousMessageId = active.lastProgressMessageId;
+        const meta = await this.replyWithModeMeta(active.chatId, active.responder, active.selectionKey, nextBody);
+        active.lastProgressBody = nextBody;
+        const currentMessageId = meta.messageId;
+        if (!currentMessageId) {
+          return;
+        }
+        active.lastProgressMessageId = currentMessageId;
+        if (previousMessageId && previousMessageId !== currentMessageId) {
+          this.scheduleDeleteMessage(active.responder, previousMessageId);
+        }
+      })
+      .catch((error) => console.warn(`[gateway] progress send failed: ${error instanceof Error ? error.message : String(error)}`));
+  }
+
+  private async flushCommandProgressSession(requestId: string): Promise<void> {
+    const session = this.commandProgressSessions.get(requestId);
+    if (!session) {
+      return;
+    }
+    try {
+      await session.queue;
+    } catch {
+      // no-op
+    }
+  }
+
+  private async replyWithModeReplacingCommandProgress(
+    requestId: string,
+    chatId: string,
+    responder: MessageResponder,
+    selectionKey: string,
+    body: string,
+  ): Promise<void> {
+    await this.flushCommandProgressSession(requestId);
+    const progressSession = this.commandProgressSessions.get(requestId);
+    const previousProgressMessageId = progressSession?.lastProgressMessageId;
+    const meta = await this.replyWithModeMeta(chatId, responder, selectionKey, body);
+    if (previousProgressMessageId && (!meta.messageId || meta.messageId !== previousProgressMessageId)) {
+      this.scheduleDeleteMessage(progressSession?.responder ?? responder, previousProgressMessageId);
+    }
+  }
+
+  private startOrRefreshProgressSession(
+    selectionKey: string,
+    chatId: string,
+    responder: MessageResponder,
+    terminalId: string,
+    baselineOutput?: string,
+  ): void {
+    const now = Date.now();
+    const initialOutput = baselineOutput ?? this.relay.cache.snapshots.get(terminalId)?.output ?? "";
+    const existing = this.progressSessions.get(selectionKey);
+
+    if (existing && existing.terminalId === terminalId) {
+      existing.chatId = chatId;
+      existing.responder = responder;
+      existing.lastSnapshot = initialOutput;
+      existing.lastChangedAt = now;
+      return;
+    }
+
+    if (existing) {
+      this.stopProgressSession(selectionKey);
+    }
+
+    const session: TerminalProgressSession = {
+      selectionKey,
+      chatId,
+      terminalId,
+      responder,
+      timer: setInterval(() => {
+        void this.pollProgressSession(selectionKey);
+      }, this.progressPollMs),
+      lastSnapshot: initialOutput,
+      lastChangedAt: now,
+      startedAt: now,
+      busy: false,
+    };
+
+    this.progressSessions.set(selectionKey, session);
+  }
+
+  private async pollProgressSession(selectionKey: string): Promise<void> {
+    const session = this.progressSessions.get(selectionKey);
+    if (!session || session.busy) {
+      return;
+    }
+    session.busy = true;
+
+    try {
+      const now = Date.now();
+      if (this.getMode(selectionKey) !== "terminal") {
+        this.stopProgressSession(selectionKey);
+        return;
+      }
+      if (now - session.startedAt > this.progressMaxLifetimeMs || now - session.lastChangedAt > this.progressIdleTimeoutMs) {
+        this.stopProgressSession(selectionKey);
+        return;
+      }
+
+      const selected = this.selectedTerminal(selectionKey, true);
+      if (!selected || selected.terminalId !== session.terminalId) {
+        this.stopProgressSession(selectionKey);
+        return;
+      }
+
+      const current = this.relay.cache.snapshots.get(session.terminalId)?.output ?? "";
+      if (!this.shouldEnableProgress(selected)) {
+        if (current !== session.lastSnapshot) {
+          session.lastSnapshot = current;
+          session.lastChangedAt = now;
+        }
+        return;
+      }
+
+      if (current === session.lastSnapshot) {
+        return;
+      }
+
+      const delta = current.startsWith(session.lastSnapshot) ? current.slice(session.lastSnapshot.length) : current;
+      session.lastSnapshot = current;
+      session.lastChangedAt = now;
+
+      const rendered = this.renderOutputForChat(delta, 1800);
+      if (rendered === "(no output yet)") {
+        return;
+      }
+
+      const terminalTitle = selected.title || session.terminalId;
+      await this.sendProgressUpdate(session, `# ${terminalTitle} [progress]\n${rendered}`);
+    } catch (error) {
+      console.warn(`[gateway] progress poll failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      const latest = this.progressSessions.get(selectionKey);
+      if (latest) {
+        latest.busy = false;
+      }
+    }
   }
 
   private resolveTerminal(input: string): TerminalSummary | undefined {
@@ -882,7 +1462,7 @@ class TfclawCommandRouter {
       frames.push(cleaned);
     }
 
-    if (frames.length >= 2) {
+    if (frames.length >= 1) {
       const sampled = frames.slice(-8).join("\n");
       const maxDynamicChars = 900;
       const dynamicText = sampled.length > maxDynamicChars ? sampled.slice(-maxDynamicChars) : sampled;
@@ -955,6 +1535,8 @@ class TfclawCommandRouter {
       "7) reply number after /capture - capture selected source",
       "8) <terminal-id>: <command> - run one command in specified terminal",
       "9) /state - show current mode",
+      "10) /key <enter|tab|esc|ctrl+c|ctrl+d|ctrl+z|ctrl+letter> - send one key to terminal",
+      "11) in terminal mode, use .tf <command> to run tfclaw commands",
     ].join("\n");
   }
 
@@ -962,9 +1544,84 @@ class TfclawCommandRouter {
     return [
       "Terminal mode:",
       "1) any message -> sent to tmux terminal input",
-      "2) .ctrlc / .ctrld -> send control key",
+      "2) .ctrlc / .ctrld / /key <key> -> send one key to terminal",
       "3) .exit -> back to tfclaw mode",
+      "4) .tf <command> (or /tf <command>) -> run tfclaw command in terminal mode",
+      "5) progress output is auto-polled only for realtime commands (node/npm/pnpm/yarn...)",
     ].join("\n");
+  }
+
+  private keyUsageText(prefix = "/key"): string {
+    return `usage: ${prefix} <enter|tab|esc|ctrl+c|ctrl+d|ctrl+z|ctrl+letter>`;
+  }
+
+  private parseKeyInput(spec: string): { data: string; label: string } | undefined {
+    const trimmed = spec.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+
+    const normalized = trimmed.toLowerCase().replace(/\s+/g, "");
+    if (normalized === "enter" || normalized === "return") {
+      return { data: "__ENTER__", label: "enter" };
+    }
+    if (normalized === "tab") {
+      return { data: "\t", label: "tab" };
+    }
+    if (normalized === "esc" || normalized === "escape") {
+      return { data: "\x1b", label: "esc" };
+    }
+    if (normalized === "space") {
+      return { data: " ", label: "space" };
+    }
+    if (normalized === "ctrlc" || normalized === "ctrl+c" || normalized === "ctrl-c" || normalized === "^c") {
+      return { data: "__CTRL_C__", label: "ctrl+c" };
+    }
+    if (normalized === "ctrld" || normalized === "ctrl+d" || normalized === "ctrl-d" || normalized === "^d") {
+      return { data: "__CTRL_D__", label: "ctrl+d" };
+    }
+    if (normalized === "ctrlz" || normalized === "ctrl+z" || normalized === "ctrl-z" || normalized === "^z") {
+      return { data: "__CTRL_Z__", label: "ctrl+z" };
+    }
+
+    const ctrlMatch = normalized.match(/^(?:ctrl[+-]|\^)([a-z])$/);
+    if (ctrlMatch) {
+      const letter = ctrlMatch[1];
+      const code = letter.charCodeAt(0) - 96;
+      if (code >= 1 && code <= 26) {
+        return {
+          data: String.fromCharCode(code),
+          label: `ctrl+${letter}`,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  private async sendKeyToTerminal(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    terminal: TerminalSummary,
+    keySpec: string,
+    usagePrefix: string,
+  ): Promise<boolean> {
+    const parsed = this.parseKeyInput(keySpec);
+    if (!parsed) {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.keyUsageText(usagePrefix));
+      return false;
+    }
+
+    this.relay.command({
+      command: "terminal.input",
+      terminalId: terminal.terminalId,
+      data: parsed.data,
+    });
+    const rendered = await this.collectCommandOutput(terminal.terminalId);
+    await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `[key] ${parsed.label}\n# ${terminal.title}\n${rendered}`);
+    const baseline = this.relay.cache.snapshots.get(terminal.terminalId)?.output ?? "";
+    this.startOrRefreshProgressSession(selectionKey, ctx.chatId, ctx.responder, terminal.terminalId, baseline);
+    return true;
   }
 
   private parseCommandLine(line: string): { cmd: string; args: string } {
@@ -980,6 +1637,139 @@ class TfclawCommandRouter {
       cmd: normalized.slice(0, firstSpace).toLowerCase(),
       args: normalized.slice(firstSpace + 1).trim(),
     };
+  }
+
+  private async handleTfclawCommand(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    cmd: string,
+    args: string,
+  ): Promise<boolean> {
+    if (cmd === "help") {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.tfclawHelpText());
+      return true;
+    }
+
+    if (cmd === "state") {
+      const selected = this.selectedTerminal(selectionKey, false);
+      const text = selected
+        ? `selected terminal: ${selected.title} (${selected.terminalId})`
+        : "selected terminal: (none)";
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, text);
+      return true;
+    }
+
+    if (cmd === "list") {
+      const terminals = Array.from(this.relay.cache.terminals.values());
+      if (terminals.length === 0) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no terminals");
+        return true;
+      }
+      const selected = this.chatTerminalSelection.get(selectionKey);
+      const content = terminals
+        .map((terminal, idx) => {
+          const flag = selected === terminal.terminalId ? " *selected" : "";
+          const foreground = this.normalizeForegroundCommand(terminal.foregroundCommand);
+          const runtime = foreground ? ` cmd=${foreground}` : "";
+          return `${idx + 1}. ${terminal.title} [${terminal.terminalId}] ${terminal.isActive ? "active" : "closed"}${runtime}${flag}`;
+        })
+        .join("\n");
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, content);
+      return true;
+    }
+
+    if (cmd === "new") {
+      this.relay.command({
+        command: "terminal.create",
+        title: `${ctx.channel}-${Date.now()}`,
+      });
+      await delay(500);
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "terminal.create sent");
+      return true;
+    }
+
+    if (cmd === "capture") {
+      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
+      return true;
+    }
+
+    if (cmd === "attach") {
+      await this.enterTerminalMode(ctx, selectionKey, args || undefined);
+      return true;
+    }
+
+    if (cmd === "key") {
+      if (!args) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.keyUsageText("/key"));
+        return true;
+      }
+      const selected = this.selectedTerminal(selectionKey, true) ?? this.firstActiveTerminal();
+      if (!selected) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no active terminal. use /new then /attach.");
+        return true;
+      }
+      this.chatTerminalSelection.set(selectionKey, selected.terminalId);
+      await this.sendKeyToTerminal(ctx, selectionKey, selected, args, "/key");
+      return true;
+    }
+
+    if (cmd === "ctrlc" || cmd === "ctrld") {
+      const selected = this.selectedTerminal(selectionKey, true);
+      if (!selected) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no selected terminal. use /list then /use <id>");
+        return true;
+      }
+      this.relay.command({
+        command: "terminal.input",
+        terminalId: selected.terminalId,
+        data: cmd === "ctrlc" ? "__CTRL_C__" : "__CTRL_D__",
+      });
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `/${cmd} sent`);
+      return true;
+    }
+
+    if (cmd === "use") {
+      if (!args) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /use <id|title|index>");
+        return true;
+      }
+      const terminal = this.resolveTerminal(args);
+      if (!terminal) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${args}`);
+        return true;
+      }
+      this.chatTerminalSelection.set(selectionKey, terminal.terminalId);
+      if (this.getMode(selectionKey) === "terminal" && terminal.isActive) {
+        const baseline = this.relay.cache.snapshots.get(terminal.terminalId)?.output ?? "";
+        this.startOrRefreshProgressSession(selectionKey, ctx.chatId, ctx.responder, terminal.terminalId, baseline);
+      }
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `selected: ${terminal.title} (${terminal.terminalId})`);
+      return true;
+    }
+
+    if (cmd === "close") {
+      const key = args || this.chatTerminalSelection.get(selectionKey);
+      if (!key) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /close <id|title|index>");
+        return true;
+      }
+      const terminal = this.resolveTerminal(key);
+      if (!terminal) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${key}`);
+        return true;
+      }
+      this.relay.command({
+        command: "terminal.close",
+        terminalId: terminal.terminalId,
+      });
+      if (this.chatTerminalSelection.get(selectionKey) === terminal.terminalId && this.getMode(selectionKey) === "terminal") {
+        this.setMode(selectionKey, "tfclaw");
+      }
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `close requested: ${terminal.title}`);
+      return true;
+    }
+
+    return false;
   }
 
   private formatCaptureOptions(sources: CaptureSource[]): string {
@@ -1045,8 +1835,9 @@ class TfclawCommandRouter {
       ctx.chatId,
       ctx.responder,
       selectionKey,
-      `entered terminal mode: ${terminal.title} (${terminal.terminalId})\nspecial: .ctrlc  .ctrld  .exit\n\n# ${terminal.title}\n${rendered}`,
+      `entered terminal mode: ${terminal.title} (${terminal.terminalId})\nspecial: .ctrlc  .ctrld  /key enter  .exit\n\n# ${terminal.title}\n${rendered}`,
     );
+    this.startOrRefreshProgressSession(selectionKey, ctx.chatId, ctx.responder, terminal.terminalId, snapshot);
   }
 
   private async handleTerminalModeInput(
@@ -1068,12 +1859,7 @@ class TfclawCommandRouter {
       return;
     }
 
-    if (lower === "/capture" || lower === "capture") {
-      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
-      return;
-    }
-
-    if (lower === ".ctrlc" || lower === "/ctrlc") {
+    if (lower === ".ctrlc") {
       const selected = this.selectedTerminal(selectionKey, true);
       if (!selected) {
         this.setMode(selectionKey, "tfclaw");
@@ -1089,7 +1875,7 @@ class TfclawCommandRouter {
       return;
     }
 
-    if (lower === ".ctrld" || lower === "/ctrld") {
+    if (lower === ".ctrld") {
       const selected = this.selectedTerminal(selectionKey, true);
       if (!selected) {
         this.setMode(selectionKey, "tfclaw");
@@ -1105,21 +1891,43 @@ class TfclawCommandRouter {
       return;
     }
 
-    if (
-      lower === "/help" ||
-      lower === "/list" ||
-      lower === "/new" ||
-      lower === "/capture" ||
-      lower === "/state" ||
-      lower === "/attach" ||
-      lower.startsWith("/use ") ||
-      lower.startsWith("/close ")
-    ) {
+    if (lower === "/key" || lower.startsWith("/key ") || lower === ".key" || lower.startsWith(".key ")) {
+      const keySpec = line.replace(/^([/.]key)\s*/i, "").trim();
+      if (!keySpec) {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.keyUsageText("/key"));
+        return;
+      }
+      const selected = this.selectedTerminal(selectionKey, true);
+      if (!selected) {
+        this.setMode(selectionKey, "tfclaw");
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "selected terminal missing. switched back to tfclaw.");
+        return;
+      }
+      await this.sendKeyToTerminal(ctx, selectionKey, selected, keySpec, "/key");
+      return;
+    }
+
+    if (lower === ".tf" || lower.startsWith(".tf ") || lower === "/tf" || lower.startsWith("/tf ")) {
+      const tfclawLine = line.replace(/^(\.tf|\/tf)\s*/i, "").trim();
+      if (!tfclawLine) {
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          "usage: .tf <command>\nexample: .tf list, .tf capture, .tf use terminal-1",
+        );
+        return;
+      }
+      const { cmd, args } = this.parseCommandLine(tfclawLine);
+      const handled = await this.handleTfclawCommand(ctx, selectionKey, cmd, args);
+      if (handled) {
+        return;
+      }
       await this.replyWithMode(
         ctx.chatId,
         ctx.responder,
         selectionKey,
-        "you are in terminal mode. send .exit to return to tfclaw commands.",
+        `unknown tfclaw command: ${tfclawLine}\nuse .tf help`,
       );
       return;
     }
@@ -1144,6 +1952,8 @@ class TfclawCommandRouter {
     });
     const rendered = await this.collectCommandOutput(selected.terminalId);
     await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `# ${selected.title}\n${rendered}`);
+    const baseline = this.relay.cache.snapshots.get(selected.terminalId)?.output ?? "";
+    this.startOrRefreshProgressSession(selectionKey, ctx.chatId, ctx.responder, selected.terminalId, baseline);
   }
 
   private async handleCaptureSelection(
@@ -1231,168 +2041,66 @@ class TfclawCommandRouter {
   async handleTextMessage(ctx: InboundTextContext): Promise<void> {
     const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
     if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "not allowed");
+      await ctx.responder.replyText(ctx.chatId, "not allowed");
       return;
     }
 
-    const originalText = ctx.text.replace(/\r/g, "");
-    const line = originalText.trim();
-    if (!line) {
-      return;
-    }
-
-    const consumedByCaptureSelection = await this.handleCaptureSelection(ctx.channel, ctx.chatId, line, ctx.responder);
-    if (consumedByCaptureSelection) {
+    const text = ctx.text.replace(/\r/g, "").trim();
+    if (!text) {
       return;
     }
 
     const mode = this.getMode(selectionKey);
-    if (mode === "terminal") {
-      await this.handleTerminalModeInput(ctx, selectionKey, line, originalText);
-      return;
-    }
+    const passthroughEnabled = Boolean(this.chatPassthroughEnabled.get(selectionKey));
+    const isSlashCommand = text.startsWith("/");
+    const isDotControl = text.startsWith(".");
+    const outboundText = (mode === "terminal" || passthroughEnabled) && !isSlashCommand && !isDotControl
+      ? `/tmux send ${text}`
+      : text;
 
-    const colonIndex = line.indexOf(":");
-    if (colonIndex > 0) {
-      const terminalKey = line.slice(0, colonIndex).trim();
-      const command = line.slice(colonIndex + 1).trim();
-      const terminal = this.resolveTerminal(terminalKey);
+    const requestId = this.relay.command({
+      command: "tfclaw.command",
+      text: outboundText,
+      sessionKey: selectionKey,
+    });
+    this.beginCommandProgressSession(selectionKey, requestId, ctx.chatId, ctx.responder);
 
-      if (!terminal) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${terminalKey}`);
+    try {
+      const output = await this.relay.waitForCommandResult(
+        requestId,
+        COMMAND_RESULT_TIMEOUT_MS,
+        (progressOutput, progressSource) => {
+          const source = (progressSource ?? "").trim().toLowerCase();
+          if (source && source !== "tmux") {
+            return;
+          }
+          const reply = this.normalizeLegacyErrorMessage(progressOutput);
+          if (!reply) {
+            return;
+          }
+          this.queueCommandProgressUpdate(requestId, reply);
+        },
+      );
+      this.updateModeFromResult(selectionKey, outboundText, output);
+      const reply = this.normalizeLegacyErrorMessage(output);
+      if (!reply) {
+        await this.replyWithModeReplacingCommandProgress(requestId, ctx.chatId, ctx.responder, selectionKey, "(no output)");
         return;
       }
-      if (!terminal.isActive) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal is closed: ${terminal.title}`);
-        return;
-      }
-      if (!command) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "empty command after ':'.");
-        return;
-      }
-
-      this.chatTerminalSelection.set(selectionKey, terminal.terminalId);
-      this.relay.command({
-        command: "terminal.input",
-        terminalId: terminal.terminalId,
-        data: `${command}\n`,
-      });
-      const rendered = await this.collectCommandOutput(terminal.terminalId);
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `# ${terminal.title}\n${rendered}`);
+      await this.replyWithModeReplacingCommandProgress(requestId, ctx.chatId, ctx.responder, selectionKey, reply);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.replyWithModeReplacingCommandProgress(
+        requestId,
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        `command failed: ${message}`,
+      );
       return;
+    } finally {
+      this.stopCommandProgressSession(requestId, false);
     }
-
-    const { cmd, args } = this.parseCommandLine(line);
-
-    if (cmd === "help") {
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.tfclawHelpText());
-      return;
-    }
-
-    if (cmd === "state") {
-      const selected = this.selectedTerminal(selectionKey, false);
-      const text = selected
-        ? `selected terminal: ${selected.title} (${selected.terminalId})`
-        : "selected terminal: (none)";
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, text);
-      return;
-    }
-
-    if (cmd === "list") {
-      const terminals = Array.from(this.relay.cache.terminals.values());
-      if (terminals.length === 0) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no terminals");
-        return;
-      }
-      const selected = this.chatTerminalSelection.get(selectionKey);
-      const content = terminals
-        .map((terminal, idx) => {
-          const flag = selected === terminal.terminalId ? " *selected" : "";
-          return `${idx + 1}. ${terminal.title} [${terminal.terminalId}] ${terminal.isActive ? "active" : "closed"}${flag}`;
-        })
-        .join("\n");
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, content);
-      return;
-    }
-
-    if (cmd === "new") {
-      this.relay.command({
-        command: "terminal.create",
-        title: `${ctx.channel}-${Date.now()}`,
-      });
-      await delay(500);
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "terminal.create sent");
-      return;
-    }
-
-    if (cmd === "capture") {
-      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
-      return;
-    }
-
-    if (cmd === "attach") {
-      await this.enterTerminalMode(ctx, selectionKey, args || undefined);
-      return;
-    }
-
-    if (cmd === "ctrlc" || cmd === "ctrld") {
-      const selected = this.selectedTerminal(selectionKey, true);
-      if (!selected) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no selected terminal. use /list then /use <id>");
-        return;
-      }
-      this.relay.command({
-        command: "terminal.input",
-        terminalId: selected.terminalId,
-        data: cmd === "ctrlc" ? "__CTRL_C__" : "__CTRL_D__",
-      });
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `/${cmd} sent`);
-      return;
-    }
-
-    if (cmd === "use") {
-      if (!args) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /use <id|title|index>");
-        return;
-      }
-      const terminal = this.resolveTerminal(args);
-      if (!terminal) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${args}`);
-        return;
-      }
-      this.chatTerminalSelection.set(selectionKey, terminal.terminalId);
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `selected: ${terminal.title} (${terminal.terminalId})`);
-      return;
-    }
-
-    if (cmd === "close") {
-      const key = args || this.chatTerminalSelection.get(selectionKey);
-      if (!key) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /close <id|title|index>");
-        return;
-      }
-      const terminal = this.resolveTerminal(key);
-      if (!terminal) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${key}`);
-        return;
-      }
-      this.relay.command({
-        command: "terminal.close",
-        terminalId: terminal.terminalId,
-      });
-      if (this.chatTerminalSelection.get(selectionKey) === terminal.terminalId && this.getMode(selectionKey) === "terminal") {
-        this.setMode(selectionKey, "tfclaw");
-      }
-      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `close requested: ${terminal.title}`);
-      return;
-    }
-
-    await this.replyWithMode(
-      ctx.chatId,
-      ctx.responder,
-      selectionKey,
-      `unknown tfclaw command: ${line}\nuse /help, or /attach to enter terminal mode.`,
-    );
   }
 }
 // SECTION: chat apps
@@ -1479,11 +2187,12 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     return false;
   }
 
-  async replyText(chatId: string, text: string): Promise<void> {
+  private async sendTextMessage(chatId: string, text: string): Promise<{ messageId?: string }> {
     if (!this.larkClient) {
       throw new Error("feishu client not initialized");
     }
-    await this.larkClient.im.v1.message.create({
+
+    const result = await this.larkClient.im.v1.message.create({
       params: {
         receive_id_type: "chat_id",
       },
@@ -1491,6 +2200,51 @@ class FeishuChatApp implements ChatApp, MessageResponder {
         receive_id: chatId,
         msg_type: "text",
         content: JSON.stringify({ text }),
+      },
+    });
+
+    const resultObj = toObject(result);
+    const dataObj = toObject(resultObj.data);
+    return {
+      messageId: toString(dataObj.message_id) || toString(resultObj.message_id),
+    };
+  }
+
+  async replyText(chatId: string, text: string): Promise<void> {
+    await this.sendTextMessage(chatId, text);
+  }
+
+  async replyTextWithMeta(chatId: string, text: string): Promise<{ messageId?: string }> {
+    return this.sendTextMessage(chatId, text);
+  }
+
+  async deleteMessage(messageId: string): Promise<void> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+    try {
+      await this.larkClient.im.v1.message.delete({
+        path: {
+          message_id: messageId,
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu message delete failed: ${describeSdkError(error)} | message_id=${messageId}`);
+    }
+  }
+
+  private async addReaction(messageId: string, emojiType = FEISHU_ACK_REACTION): Promise<void> {
+    if (!this.larkClient || !messageId) {
+      return;
+    }
+    await this.larkClient.im.v1.messageReaction.create({
+      path: {
+        message_id: messageId,
+      },
+      data: {
+        reaction_type: {
+          emoji_type: emojiType,
+        },
       },
     });
   }
@@ -1599,6 +2353,13 @@ class FeishuChatApp implements ChatApp, MessageResponder {
 
     const sender = toObject(toObject(root.sender).sender_id);
     const senderOpenId = toString(sender.open_id);
+
+    if (messageId && FEISHU_ACK_REACTION_ENABLED) {
+      void this.addReaction(messageId).catch((error) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.warn(`[gateway] feishu add reaction failed: ${msg}`);
+      });
+    }
 
     try {
       await this.router.handleTextMessage({

@@ -14,6 +14,8 @@
     "dev:gateway": "npm run dev --workspace @tfclaw/feishu-gateway",
     "dev:feishu": "npm run dev:gateway",
     "start:gateway": "npm run start --workspace @tfclaw/feishu-gateway",
+    "start:stack": "bash scripts/start-stack.sh",
+    "dev:stack": "bash scripts/start-stack.sh --dev",
     "dev:mobile": "npm run start --workspace @tfclaw/mobile",
     "dev:all": "concurrently -n relay,agent,mobile -c cyan,green,magenta \"npm run dev:server\" \"npm run dev:agent\" \"npm run dev:mobile\"",
     "test:local-client": "node scripts/local-test-client.js",
