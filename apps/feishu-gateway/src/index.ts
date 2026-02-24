@@ -2050,6 +2050,22 @@ class TfclawCommandRouter {
       return;
     }
 
+    const captureSelectionConsumed = await this.handleCaptureSelection(
+      ctx.channel,
+      ctx.chatId,
+      text,
+      ctx.responder,
+    );
+    if (captureSelectionConsumed) {
+      return;
+    }
+
+    const lowered = text.toLowerCase();
+    if (lowered === "/capture" || lowered === "capture") {
+      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
+      return;
+    }
+
     const mode = this.getMode(selectionKey);
     const passthroughEnabled = Boolean(this.chatPassthroughEnabled.get(selectionKey));
     const isSlashCommand = text.startsWith("/");
