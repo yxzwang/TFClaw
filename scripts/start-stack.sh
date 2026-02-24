@@ -47,6 +47,9 @@ if [[ "$MODE" == "start" ]]; then
   start_process "gateway" env TFCLAW_CONFIG_PATH="$TFCLAW_CONFIG_PATH" node apps/feishu-gateway/dist/index.js
 else
   echo "[start-stack] dev mode"
+  echo "[start-stack] building protocol package for dev ..."
+  npm run build --workspace @tfclaw/protocol
+
   start_process "server(dev)" npm run dev --workspace @tfclaw/server
   start_process "terminal-agent(dev)" env TFCLAW_TOKEN="$TFCLAW_TOKEN" TFCLAW_RELAY_URL="$TFCLAW_RELAY_URL" npm run dev --workspace @tfclaw/terminal-agent
   start_process "gateway(dev)" env TFCLAW_CONFIG_PATH="$TFCLAW_CONFIG_PATH" npm run dev --workspace @tfclaw/feishu-gateway
