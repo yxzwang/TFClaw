@@ -113,3 +113,17 @@ cat /opt/tfclaw-state/runtime.env
 1. 该脚本假定容器基于 Ubuntu/Debian（可用 `apt-get`）。
 2. Quick Tunnel URL 在进程重启后可能变化。生产建议使用 Cloudflare Named Tunnel + 域名。
 3. 若你不想走 cloudflared，可设置 `TFCLAW_ENABLE_CLOUDFLARE_TUNNEL=0`，然后自己做反代/TLS。
+
+## 8. Terminal-agent 默认行为（新增）
+
+从当前版本开始，`start` 默认会自动启动 `terminal-agent`（`TFCLAW_ENABLE_TERMINAL_AGENT=1`）。
+
+- agent 连接地址：`ws://127.0.0.1:<TFCLAW_SERVER_PORT><TFCLAW_WS_PATH>`
+- agent token：与服务端 `TFCLAW_TOKEN` 相同
+- agent 日志：`/var/log/tfclaw-terminal-agent.log`
+
+如果你只想启动 relay server + tunnel，不启动 agent：
+
+```bash
+TFCLAW_ENABLE_TERMINAL_AGENT=0 bash scripts/deploy-docker-public.sh start
+```

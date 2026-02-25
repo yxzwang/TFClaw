@@ -24,6 +24,7 @@ SERVER_HOST="${TFCLAW_SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${TFCLAW_SERVER_PORT:-18787}"
 WS_PATH="${TFCLAW_WS_PATH:-/}"
 ENABLE_TUNNEL="${TFCLAW_ENABLE_CLOUDFLARE_TUNNEL:-1}"
+ENABLE_TERMINAL_AGENT="${TFCLAW_ENABLE_TERMINAL_AGENT:-1}"
 TOKEN_INPUT="${TFCLAW_TOKEN:-}"
 FORCE_SETUP="${TFCLAW_FORCE_SETUP:-0}"
 FORCE_BUILD="${TFCLAW_FORCE_BUILD:-0}"
@@ -31,10 +32,12 @@ ARCH="$(dpkg --print-architecture)"
 
 SERVER_LOG="${TFCLAW_SERVER_LOG:-/var/log/tfclaw-server.log}"
 TUNNEL_LOG="${TFCLAW_TUNNEL_LOG:-/var/log/tfclaw-cloudflared.log}"
+AGENT_LOG="${TFCLAW_AGENT_LOG:-/var/log/tfclaw-terminal-agent.log}"
 RUNTIME_ENV="$STATE_DIR/runtime.env"
 
 TFCLAW_RUNTIME_TOKEN=""
 TFCLAW_RUNTIME_RELAY_URL=""
+TFCLAW_AGENT_RELAY_URL=""
 
 install_packages() {
   local required=(ca-certificates curl git jq gnupg openssl procps)
@@ -112,7 +115,7 @@ prepare_source() {
   git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$INSTALL_DIR"
 }
 
-build_server() {
+build_runtime() {
   cd "$INSTALL_DIR"
 
   if [[ "$FORCE_SETUP" == "1" || ! -d node_modules ]]; then
@@ -124,10 +127,12 @@ build_server() {
 
   local protocol_dist="packages/protocol/dist/index.js"
   local server_dist="apps/server/dist/index.js"
-  if [[ "$FORCE_BUILD" == "1" || ! -f "$protocol_dist" || ! -f "$server_dist" ]]; then
-    log "Building protocol and server ..."
+  local agent_dist="apps/terminal-agent/dist/index.js"
+  if [[ "$FORCE_BUILD" == "1" || ! -f "$protocol_dist" || ! -f "$server_dist" || ! -f "$agent_dist" ]]; then
+    log "Building protocol, server and terminal-agent ..."
     npm run build --workspace @tfclaw/protocol
     npm run build --workspace @tfclaw/server
+    npm run build --workspace @tfclaw/terminal-agent
   else
     log "Build artifacts exist. Skip build."
   fi
@@ -136,6 +141,7 @@ build_server() {
 ensure_state() {
   mkdir -p "$STATE_DIR" "$(dirname "$SERVER_LOG")" "$(dirname "$TUNNEL_LOG")"
   touch "$SERVER_LOG"
+  touch "$AGENT_LOG"
   if [[ "$ENABLE_TUNNEL" == "1" ]]; then
     touch "$TUNNEL_LOG"
   fi
@@ -169,6 +175,7 @@ stop_processes() {
   local maybe_pids=(
     "${TFCLAW_SERVER_PID:-}"
     "${TFCLAW_TUNNEL_PID:-}"
+    "${TFCLAW_AGENT_PID:-}"
   )
 
   for pid in "${maybe_pids[@]}"; do
@@ -187,6 +194,7 @@ stop_processes() {
 
   pkill -f 'apps/server/dist/index.js' >/dev/null 2>&1 || true
   pkill -f 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:' >/dev/null 2>&1 || true
+  pkill -f 'apps/terminal-agent/dist/index.js' >/dev/null 2>&1 || true
 }
 
 is_pid_running() {
@@ -214,6 +222,17 @@ is_tunnel_running() {
   fi
   if command -v pgrep >/dev/null 2>&1; then
     pgrep -f 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:' >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+is_agent_running() {
+  if is_pid_running "${TFCLAW_AGENT_PID:-}"; then
+    return 0
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f 'apps/terminal-agent/dist/index.js' >/dev/null 2>&1
     return $?
   fi
   return 1
@@ -255,6 +274,33 @@ start_server() {
   TFCLAW_SERVER_PID="$!"
 }
 
+resolve_agent_relay_url() {
+  local path="$WS_PATH"
+  if [[ -z "$path" ]]; then
+    path="/"
+  fi
+  if [[ "$path" != /* ]]; then
+    path="/$path"
+  fi
+  TFCLAW_AGENT_RELAY_URL="ws://127.0.0.1:${SERVER_PORT}${path}"
+}
+
+start_agent() {
+  TFCLAW_AGENT_PID=""
+  if [[ "$ENABLE_TERMINAL_AGENT" != "1" ]]; then
+    log "terminal-agent disabled (TFCLAW_ENABLE_TERMINAL_AGENT=$ENABLE_TERMINAL_AGENT)."
+    return
+  fi
+
+  resolve_agent_relay_url
+  log "Starting terminal-agent ..."
+  nohup env \
+    TFCLAW_TOKEN="$TFCLAW_RUNTIME_TOKEN" \
+    TFCLAW_RELAY_URL="$TFCLAW_AGENT_RELAY_URL" \
+    node apps/terminal-agent/dist/index.js >>"$AGENT_LOG" 2>&1 &
+  TFCLAW_AGENT_PID="$!"
+}
+
 start_tunnel() {
   TFCLAW_TUNNEL_PID=""
   if [[ "$ENABLE_TUNNEL" != "1" ]]; then
@@ -289,14 +335,32 @@ assert_server_started() {
   fail "Server startup check failed."
 }
 
+assert_agent_started() {
+  if [[ "$ENABLE_TERMINAL_AGENT" != "1" ]]; then
+    return
+  fi
+  sleep 1
+  if is_agent_running; then
+    return
+  fi
+
+  echo
+  echo "Terminal-agent failed to stay running. Recent log output:"
+  tail -n 120 "$AGENT_LOG" || true
+  fail "Terminal-agent startup check failed."
+}
+
 write_runtime_env() {
   cat >"$RUNTIME_ENV" <<EOF
 TFCLAW_TOKEN=$TFCLAW_RUNTIME_TOKEN
 TFCLAW_RELAY_URL=$TFCLAW_RUNTIME_RELAY_URL
+TFCLAW_AGENT_RELAY_URL=$TFCLAW_AGENT_RELAY_URL
 TFCLAW_SERVER_PID=${TFCLAW_SERVER_PID:-}
 TFCLAW_TUNNEL_PID=${TFCLAW_TUNNEL_PID:-}
+TFCLAW_AGENT_PID=${TFCLAW_AGENT_PID:-}
 TFCLAW_SERVER_LOG=$SERVER_LOG
 TFCLAW_TUNNEL_LOG=$TUNNEL_LOG
+TFCLAW_AGENT_LOG=$AGENT_LOG
 EOF
 }
 
@@ -309,9 +373,15 @@ show_status() {
   else
     echo "tunnel_running=disabled"
   fi
+  if [[ "$ENABLE_TERMINAL_AGENT" == "1" ]]; then
+    echo "terminal_agent_running=$(is_agent_running && echo yes || echo no)"
+  else
+    echo "terminal_agent_running=disabled"
+  fi
   if [[ -f "$RUNTIME_ENV" ]]; then
     echo "TFCLAW_TOKEN=${TFCLAW_TOKEN:-}"
     echo "TFCLAW_RELAY_URL=${TFCLAW_RELAY_URL:-}"
+    echo "TFCLAW_AGENT_RELAY_URL=${TFCLAW_AGENT_RELAY_URL:-}"
   fi
 }
 
@@ -323,11 +393,18 @@ show_result() {
   else
     echo "TFCLAW_RELAY_URL=(pending, check: tail -f $TUNNEL_LOG)"
   fi
+  if [[ "$ENABLE_TERMINAL_AGENT" == "1" ]]; then
+    echo "TERMINAL_AGENT=enabled"
+    echo "TFCLAW_AGENT_RELAY_URL=$TFCLAW_AGENT_RELAY_URL"
+  else
+    echo "TERMINAL_AGENT=disabled"
+  fi
   echo "runtime_file=$RUNTIME_ENV"
   echo "server_log=$SERVER_LOG"
   if [[ "$ENABLE_TUNNEL" == "1" ]]; then
     echo "tunnel_log=$TUNNEL_LOG"
   fi
+  echo "agent_log=$AGENT_LOG"
   echo
   echo "Tip: run '$0 status' to inspect runtime state."
 }
@@ -337,23 +414,25 @@ start_flow() {
   install_nodejs
   install_cloudflared
   prepare_source
-  build_server
+  build_runtime
   ensure_state
   resolve_token
   stop_processes
   start_server
   assert_server_started
+  start_agent
+  assert_agent_started
   start_tunnel
   write_runtime_env
   show_result
 }
 
 logs_flow() {
+  local files=("$SERVER_LOG" "$AGENT_LOG")
   if [[ "$ENABLE_TUNNEL" == "1" ]]; then
-    tail -n 120 -f "$SERVER_LOG" "$TUNNEL_LOG"
-  else
-    tail -n 120 -f "$SERVER_LOG"
+    files+=("$TUNNEL_LOG")
   fi
+  tail -n 120 -f "${files[@]}"
 }
 
 case "$ACTION" in
