@@ -150,6 +150,22 @@ gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
   - `TFCLAW_TMUX_STREAM_INITIAL_SILENCE_MS`（默认 `12000`）
   - `TFCLAW_TMUX_STREAM_WINDOW_MS`（默认 `86400000`，24h）
 
+## 公网部署与安全
+
+推荐架构：公网仅开放 `443`，由反向代理（Nginx/Caddy/Traefik/Cloudflare Tunnel）接入，再反代到本机 `server`（如 `127.0.0.1:8787`）。
+
+最低安全基线：
+
+1. 启用 TLS（仅 `wss://`），不要直接裸露 `ws://` 到公网。
+2. 使用强 token（建议 32+ 随机字符）并定期轮换。
+3. 在 `apps/server` 启用以下限制：
+   - `RELAY_ENFORCE_STRONG_TOKEN=true`
+   - `RELAY_ALLOWED_TOKENS=<comma-separated tokens>`
+   - `RELAY_ALLOWED_ORIGINS=<comma-separated origins>`（仅浏览器端需要）
+   - 连接/消息限流相关参数见 `apps/server/.env.example`
+4. 防火墙限制：只允许反向代理访问 relay 端口，不允许公网直连 relay。
+5. 运行在进程管理器下（systemd/pm2/docker restart policy）并开启日志监控与告警。
+
 ## 已知限制（MVP）
 
 - `terminal-agent` 已切到 `tmux` 渲染/会话模型，仍未支持移动端驱动的动态 resize。
