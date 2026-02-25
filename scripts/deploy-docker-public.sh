@@ -244,6 +244,18 @@ start_tunnel() {
   fi
 }
 
+assert_server_started() {
+  sleep 1
+  if is_server_running; then
+    return
+  fi
+
+  echo
+  echo "Server failed to stay running. Recent log output:"
+  tail -n 120 "$SERVER_LOG" || true
+  fail "Server startup check failed."
+}
+
 write_runtime_env() {
   cat >"$RUNTIME_ENV" <<EOF
 TFCLAW_TOKEN=$TFCLAW_RUNTIME_TOKEN
@@ -297,6 +309,7 @@ start_flow() {
   resolve_token
   stop_processes
   start_server
+  assert_server_started
   start_tunnel
   write_runtime_env
   show_result
