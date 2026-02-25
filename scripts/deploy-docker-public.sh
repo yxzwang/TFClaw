@@ -37,7 +37,7 @@ TFCLAW_RUNTIME_RELAY_URL=""
 install_packages() {
   log "Installing base packages ..."
   apt-get update
-  apt-get install -y ca-certificates curl git jq gnupg openssl
+  apt-get install -y ca-certificates curl git jq gnupg openssl procps
 }
 
 install_nodejs() {
@@ -158,6 +158,36 @@ stop_processes() {
   pkill -f 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:' >/dev/null 2>&1 || true
 }
 
+is_pid_running() {
+  local pid="${1:-}"
+  if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+is_server_running() {
+  if is_pid_running "${TFCLAW_SERVER_PID:-}"; then
+    return 0
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f 'apps/server/dist/index.js' >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+is_tunnel_running() {
+  if is_pid_running "${TFCLAW_TUNNEL_PID:-}"; then
+    return 0
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:' >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
 discover_tunnel_url() {
   local url=""
   if [[ "$ENABLE_TUNNEL" == "1" ]]; then
@@ -173,7 +203,7 @@ discover_tunnel_url() {
 start_server() {
   log "Starting tfclaw server ..."
   nohup env \
-    PORT="$SERVER_PORT" \
+    RELAY_PORT="$SERVER_PORT" \
     RELAY_HOST="$SERVER_HOST" \
     RELAY_WS_PATH="$WS_PATH" \
     RELAY_ENFORCE_STRONG_TOKEN=true \
@@ -228,9 +258,9 @@ EOF
 show_status() {
   load_previous_runtime
   echo "runtime_file=$RUNTIME_ENV"
-  echo "server_running=$(pgrep -f 'apps/server/dist/index.js' >/dev/null 2>&1 && echo yes || echo no)"
+  echo "server_running=$(is_server_running && echo yes || echo no)"
   if [[ "$ENABLE_TUNNEL" == "1" ]]; then
-    echo "tunnel_running=$(pgrep -f 'cloudflared tunnel --no-autoupdate --url http://127.0.0.1:' >/dev/null 2>&1 && echo yes || echo no)"
+    echo "tunnel_running=$(is_tunnel_running && echo yes || echo no)"
   else
     echo "tunnel_running=disabled"
   fi
