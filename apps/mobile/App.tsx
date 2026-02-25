@@ -4,6 +4,7 @@ import {
   KeyboardAvoidingView,
   Keyboard,
   LayoutChangeEvent,
+  Modal,
   PanResponder,
   Platform,
   Pressable,
@@ -25,6 +26,14 @@ const TMUX_LINES_MIN = 10;
 const TMUX_LINES_MAX = 300;
 const TMUX_LINES_SLIDER_THUMB_SIZE = 18;
 const TERMINAL_RENDER_MAX_CHARS = 120000;
+const TMUX_RENDER_DEFAULT_KEY = "__default__";
+const TMUX_KEY_SHORTCUTS: Array<{ label: string; token: string }> = [
+  { label: "^C", token: "^C" },
+  { label: "Enter", token: "enter" },
+  { label: "Esc", token: "esc" },
+  { label: "Up", token: "up" },
+  { label: "Down", token: "down" },
+];
 
 interface AgentDescriptor {
   agentId: string;
@@ -95,6 +104,7 @@ interface ChatMessage {
 
 interface PendingCommandState {
   progressMessageId?: string;
+  tmuxTargetKey?: string;
 }
 
 function randomId(prefix: string): string {
@@ -119,6 +129,26 @@ function clampTmuxLines(value: number): number {
   return Math.max(TMUX_LINES_MIN, Math.min(TMUX_LINES_MAX, Math.round(value)));
 }
 
+function normalizeTmuxTarget(target: string): string {
+  return String(target ?? "").trim().split(/\s+/)[0] ?? "";
+}
+
+function sanitizeTmuxWindowName(name: string): string {
+  return String(name ?? "").trim().replace(/\s+/g, "-");
+}
+
+function parseTmuxTargetFromCommand(commandText: string): string | undefined {
+  const tmuxTargetMatch = commandText.match(/^\/(?:tmux|t)\s+target\s+(.+)$/i);
+  if (tmuxTargetMatch?.[1]) {
+    return normalizeTmuxTarget(tmuxTargetMatch[1]);
+  }
+  const shortAliasMatch = commandText.match(/^\/ttarget\s+(.+)$/i);
+  if (shortAliasMatch?.[1]) {
+    return normalizeTmuxTarget(shortAliasMatch[1]);
+  }
+  return undefined;
+}
+
 function parseTmuxTargets(output: string): string[] {
   const lines = output.split(/\r?\n/);
   const found: string[] = [];
@@ -130,7 +160,10 @@ function parseTmuxTargets(output: string): string[] {
     }
     const tmuxHeader = line.match(/^\s*\[tmux\s+([^\]]+)\]/);
     if (tmuxHeader?.[1]) {
-      found.push(tmuxHeader[1].trim());
+      const normalized = normalizeTmuxTarget(tmuxHeader[1]);
+      if (normalized) {
+        found.push(normalized);
+      }
     }
   }
   return Array.from(new Set(found));
@@ -139,15 +172,15 @@ function parseTmuxTargets(output: string): string[] {
 function parseTmuxTargetHint(output: string): string | undefined {
   const targetSet = output.match(/Target set to\s+`([^`]+)`/i);
   if (targetSet?.[1]) {
-    return targetSet[1].trim();
+    return normalizeTmuxTarget(targetSet[1]);
   }
   const passthroughTarget = output.match(/tmux target\s+`([^`]+)`/i);
   if (passthroughTarget?.[1]) {
-    return passthroughTarget[1].trim();
+    return normalizeTmuxTarget(passthroughTarget[1]);
   }
   const tmuxHeader = output.match(/\[tmux\s+([^\]]+)\]/);
   if (tmuxHeader?.[1]) {
-    return tmuxHeader[1].trim();
+    return normalizeTmuxTarget(tmuxHeader[1]);
   }
   return undefined;
 }
@@ -175,17 +208,23 @@ export default function App() {
   const [tmuxTargets, setTmuxTargets] = useState<string[]>([]);
   const [selectedTmuxTarget, setSelectedTmuxTarget] = useState("");
   const [tmuxTargetMenuOpen, setTmuxTargetMenuOpen] = useState(false);
+  const [tmuxNewDialogOpen, setTmuxNewDialogOpen] = useState(false);
+  const [tmuxNewNameInput, setTmuxNewNameInput] = useState("");
   const [hideTfclawWindowInTmux, setHideTfclawWindowInTmux] = useState(false);
+  const [tmuxKeyPanelOpen, setTmuxKeyPanelOpen] = useState(false);
   const [agent, setAgent] = useState<AgentDescriptor | undefined>(undefined);
   const [inputText, setInputText] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [terminalRender, setTerminalRender] = useState("");
-  const [tmuxLiveProgress, setTmuxLiveProgress] = useState("");
+  const [tmuxRenderByTarget, setTmuxRenderByTarget] = useState<Record<string, string>>({});
+  const [tmuxLiveProgressByTarget, setTmuxLiveProgressByTarget] = useState<Record<string, string>>({});
 
   const wsRef = useRef<WebSocket | null>(null);
   const workModeRef = useRef<WorkMode>("tfclaw");
-  const tmuxLiveProgressRequestIdRef = useRef("");
+  const selectedTmuxTargetRef = useRef("");
+  const tmuxProgressRequestTargetRef = useRef<Map<string, string>>(new Map());
   const pendingMapRef = useRef<Map<string, PendingCommandState>>(new Map());
+  const silentRequestIdsRef = useRef<Set<string>>(new Set());
+  const closeSwitchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatScrollRef = useRef<ScrollView | null>(null);
   const terminalScrollRef = useRef<ScrollView | null>(null);
   const tmuxLinesTrackWidthRef = useRef(1);
@@ -233,14 +272,82 @@ export default function App() {
     setMessages((prev) => prev.filter((msg) => msg.id !== id));
   };
 
-  const setTmuxProgress = (text: string, requestId?: string) => {
-    const nextRequestId = requestId ?? "";
-    tmuxLiveProgressRequestIdRef.current = nextRequestId;
-    setTmuxLiveProgress(text);
+  const normalizeTmuxRenderKey = (target?: string): string => {
+    const normalized = normalizeTmuxTarget(target ?? "");
+    if (normalized) {
+      return normalized;
+    }
+    const selected = normalizeTmuxTarget(selectedTmuxTargetRef.current);
+    if (selected) {
+      return selected;
+    }
+    return TMUX_RENDER_DEFAULT_KEY;
+  };
+
+  const resolveTmuxTargetForOutput = (output: string, requestId?: string): string => {
+    if (requestId) {
+      const pending = pendingMapRef.current.get(requestId);
+      const pendingTarget = normalizeTmuxTarget(pending?.tmuxTargetKey ?? "");
+      if (pendingTarget) {
+        return pendingTarget;
+      }
+    }
+    const hintedTarget = parseTmuxTargetHint(output);
+    if (hintedTarget) {
+      return hintedTarget;
+    }
+    return normalizeTmuxRenderKey();
+  };
+
+  const resolveTmuxTargetForCommand = (commandText: string, mode: WorkMode): string => {
+    if (mode !== "tmux") {
+      return TMUX_RENDER_DEFAULT_KEY;
+    }
+    const explicitTarget = parseTmuxTargetFromCommand(commandText);
+    if (explicitTarget) {
+      return normalizeTmuxRenderKey(explicitTarget);
+    }
+    return normalizeTmuxRenderKey();
+  };
+
+  const setTmuxProgress = (text: string, tmuxTargetKey?: string, requestId?: string) => {
+    const key = normalizeTmuxRenderKey(tmuxTargetKey);
+    if (requestId) {
+      tmuxProgressRequestTargetRef.current.set(requestId, key);
+    }
+    setTmuxLiveProgressByTarget((prev) => ({
+      ...prev,
+      [key]: text,
+    }));
+  };
+
+  const clearTmuxProgressByTarget = (tmuxTargetKey?: string) => {
+    const key = normalizeTmuxRenderKey(tmuxTargetKey);
+    setTmuxLiveProgressByTarget((prev) => {
+      if (!(key in prev) || !prev[key]) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [key]: "",
+      };
+    });
+  };
+
+  const clearTmuxProgressByRequest = (requestId?: string) => {
+    if (!requestId) {
+      return;
+    }
+    const key = tmuxProgressRequestTargetRef.current.get(requestId);
+    tmuxProgressRequestTargetRef.current.delete(requestId);
+    if (!key) {
+      return;
+    }
+    clearTmuxProgressByTarget(key);
   };
 
   const clearTmuxProgress = () => {
-    setTmuxProgress("");
+    clearTmuxProgressByTarget();
   };
 
   const sendJson = (payload: unknown): boolean => {
@@ -261,15 +368,47 @@ export default function App() {
     return true;
   };
 
-  const appendTerminalRender = (chunk: string) => {
+  const sendSilentCommandText = (commandText: string): boolean => {
+    const text = commandText.trim();
+    if (!text) {
+      return false;
+    }
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    const requestId = randomId("tfclaw-silent");
+    silentRequestIdsRef.current.add(requestId);
+    pendingMapRef.current.set(requestId, {});
+    ws.send(
+      JSON.stringify({
+        type: "client.command",
+        requestId,
+        payload: {
+          command: "tfclaw.command",
+          text,
+          sessionKey: "mobile-app",
+        },
+      }),
+    );
+    return true;
+  };
+
+  const appendTerminalRender = (chunk: string, tmuxTargetKey?: string) => {
     const cleaned = stripAnsi(String(chunk ?? "")).replace(/\r\n/g, "\n");
     if (!cleaned) {
       return;
     }
     const normalized = cleaned.endsWith("\n") ? cleaned : `${cleaned}\n`;
-    setTerminalRender((prev) => {
-      const merged = `${prev}${normalized}`;
-      return merged.length > TERMINAL_RENDER_MAX_CHARS ? merged.slice(-TERMINAL_RENDER_MAX_CHARS) : merged;
+    const key = normalizeTmuxRenderKey(tmuxTargetKey);
+    setTmuxRenderByTarget((prev) => {
+      const existing = prev[key] ?? "";
+      const merged = `${existing}${normalized}`;
+      const trimmed = merged.length > TERMINAL_RENDER_MAX_CHARS ? merged.slice(-TERMINAL_RENDER_MAX_CHARS) : merged;
+      return {
+        ...prev,
+        [key]: trimmed,
+      };
     });
   };
 
@@ -295,14 +434,43 @@ export default function App() {
     }
   };
 
+  const applySelectedTmuxTarget = (target: string) => {
+    const normalized = normalizeTmuxTarget(target);
+    if (!normalized) {
+      return;
+    }
+    selectedTmuxTargetRef.current = normalized;
+    setSelectedTmuxTarget(normalized);
+    setTmuxTargets((prev) => Array.from(new Set([...prev, normalized])));
+  };
+
+  const syncSelectedTmuxTargetFromOutput = (output: string) => {
+    const targetSet = output.match(/Target set to\s+`([^`]+)`/i);
+    if (targetSet?.[1]) {
+      applySelectedTmuxTarget(targetSet[1]);
+      return;
+    }
+    if (normalizeTmuxTarget(selectedTmuxTargetRef.current)) {
+      return;
+    }
+    const fallback = output.match(/tmux target\s+`([^`]+)`/i) ?? output.match(/\[tmux\s+([^\]]+)\]/);
+    if (fallback?.[1]) {
+      applySelectedTmuxTarget(fallback[1]);
+    }
+  };
+
   const syncTmuxContextFromOutput = (output: string) => {
     const discoveredTargets = parseTmuxTargets(output);
     if (discoveredTargets.length > 0) {
-      setTmuxTargets((prev) => Array.from(new Set([...prev, ...discoveredTargets])));
+      const hasPaneListing = /^\s*-\s*\[\d+\]/m.test(output);
+      if (hasPaneListing) {
+        setTmuxTargets(Array.from(new Set(discoveredTargets)));
+      } else {
+        setTmuxTargets((prev) => Array.from(new Set([...prev, ...discoveredTargets])));
+      }
     }
     const hintedTarget = parseTmuxTargetHint(output);
     if (hintedTarget) {
-      setSelectedTmuxTarget(hintedTarget);
       setTmuxTargets((prev) => Array.from(new Set([...prev, hintedTarget])));
     }
     const maybeLines = parseTmuxLinesValue(output);
@@ -320,6 +488,7 @@ export default function App() {
     if (pending?.progressMessageId) {
       removeMessage(pending.progressMessageId);
     }
+    tmuxProgressRequestTargetRef.current.delete(requestId);
     pendingMapRef.current.delete(requestId);
   };
 
@@ -340,15 +509,21 @@ export default function App() {
     if (parsed.type === "agent.command_result") {
       const requestId = parsed.payload.requestId;
       const isProgress = Boolean(parsed.payload.progress);
+      const isSilent = Boolean(requestId && silentRequestIdsRef.current.has(requestId));
       const rawOutput = String(parsed.payload.output ?? "");
+      const tmuxTargetForOutput = resolveTmuxTargetForOutput(rawOutput, requestId);
       const outputText = cleanOutput(rawOutput);
       syncModeFromOutput(rawOutput);
       syncTmuxContextFromOutput(rawOutput);
+      syncSelectedTmuxTargetFromOutput(rawOutput);
       const currentMode = workModeRef.current;
 
       if (isProgress) {
+        if (isSilent) {
+          return;
+        }
         if (currentMode === "tmux") {
-          setTmuxProgress(cleanOutput(rawOutput), requestId);
+          setTmuxProgress(cleanOutput(rawOutput), tmuxTargetForOutput, requestId);
           return;
         }
         if (!requestId) {
@@ -372,11 +547,19 @@ export default function App() {
       }
 
       finishPending(requestId);
+      if (requestId) {
+        silentRequestIdsRef.current.delete(requestId);
+      }
+      if (isSilent) {
+        return;
+      }
       if (currentMode === "tmux") {
-        if (!requestId || requestId === tmuxLiveProgressRequestIdRef.current) {
-          clearTmuxProgress();
+        if (requestId) {
+          clearTmuxProgressByRequest(requestId);
+        } else {
+          clearTmuxProgressByTarget(tmuxTargetForOutput);
         }
-        appendTerminalRender(rawOutput);
+        appendTerminalRender(rawOutput, tmuxTargetForOutput);
         return;
       }
       appendMessage({
@@ -396,13 +579,24 @@ export default function App() {
     }
 
     if (parsed.type === "agent.error") {
-      finishPending(parsed.payload.requestId);
+      const requestId = parsed.payload.requestId;
+      const isSilent = Boolean(requestId && silentRequestIdsRef.current.has(requestId));
+      finishPending(requestId);
+      if (requestId) {
+        silentRequestIdsRef.current.delete(requestId);
+      }
+      if (isSilent) {
+        return;
+      }
       const errorText = `[${parsed.payload.code}] ${parsed.payload.message}`;
       if (workModeRef.current === "tmux") {
-        if (!parsed.payload.requestId || parsed.payload.requestId === tmuxLiveProgressRequestIdRef.current) {
-          clearTmuxProgress();
+        const tmuxTargetForError = resolveTmuxTargetForOutput(errorText, requestId);
+        if (requestId) {
+          clearTmuxProgressByRequest(requestId);
+        } else {
+          clearTmuxProgressByTarget(tmuxTargetForError);
         }
-        appendTerminalRender(errorText);
+        appendTerminalRender(errorText, tmuxTargetForError);
       } else {
         appendMessage({
           id: randomId("assistant-error"),
@@ -429,6 +623,17 @@ export default function App() {
     wsRef.current?.close();
     wsRef.current = null;
     clearTmuxProgress();
+    setTmuxRenderByTarget({});
+    setTmuxLiveProgressByTarget({});
+    tmuxProgressRequestTargetRef.current.clear();
+    selectedTmuxTargetRef.current = "";
+    setTmuxNewDialogOpen(false);
+    setTmuxNewNameInput("");
+    silentRequestIdsRef.current.clear();
+    if (closeSwitchTimerRef.current) {
+      clearTimeout(closeSwitchTimerRef.current);
+      closeSwitchTimerRef.current = null;
+    }
 
     setStage("chat");
     setConnectionState("connecting");
@@ -449,6 +654,10 @@ export default function App() {
           clientType: "mobile",
         },
       });
+      // Auto-refresh tmux targets immediately after connecting.
+      setTimeout(() => {
+        void sendSilentCommandText("/tmux panes");
+      }, 180);
     };
 
     ws.onmessage = (event) => {
@@ -465,6 +674,17 @@ export default function App() {
       setAgent(undefined);
       wsRef.current = null;
       pendingMapRef.current.clear();
+      setTmuxNewDialogOpen(false);
+      setTmuxNewNameInput("");
+      silentRequestIdsRef.current.clear();
+      setTmuxRenderByTarget({});
+      setTmuxLiveProgressByTarget({});
+      tmuxProgressRequestTargetRef.current.clear();
+      selectedTmuxTargetRef.current = "";
+      if (closeSwitchTimerRef.current) {
+        clearTimeout(closeSwitchTimerRef.current);
+        closeSwitchTimerRef.current = null;
+      }
       clearTmuxProgress();
       const disconnectedText = "Disconnected.";
       appendSystemText(disconnectedText);
@@ -477,6 +697,17 @@ export default function App() {
     setConnectionState("offline");
     setAgent(undefined);
     pendingMapRef.current.clear();
+    setTmuxNewDialogOpen(false);
+    setTmuxNewNameInput("");
+    silentRequestIdsRef.current.clear();
+    setTmuxRenderByTarget({});
+    setTmuxLiveProgressByTarget({});
+    tmuxProgressRequestTargetRef.current.clear();
+    selectedTmuxTargetRef.current = "";
+    if (closeSwitchTimerRef.current) {
+      clearTimeout(closeSwitchTimerRef.current);
+      closeSwitchTimerRef.current = null;
+    }
     clearTmuxProgress();
     setStage("login");
   };
@@ -498,9 +729,10 @@ export default function App() {
       targetMode = "tfclaw";
       switchWorkMode("tfclaw");
     }
+    const tmuxTargetForCommand = resolveTmuxTargetForCommand(text, targetMode);
     if (targetMode === "tmux") {
-      clearTmuxProgress();
-      appendTerminalRender(`$ ${text}`);
+      clearTmuxProgressByTarget(tmuxTargetForCommand);
+      appendTerminalRender(`$ ${text}`, tmuxTargetForCommand);
     } else {
       appendMessage({
         id: randomId("user"),
@@ -512,7 +744,7 @@ export default function App() {
     if (!isOnline) {
       const offlineText = "Not connected yet. Tap Reconnect after checking URL/token.";
       if (targetMode === "tmux") {
-        appendTerminalRender(offlineText);
+        appendTerminalRender(offlineText, tmuxTargetForCommand);
       } else {
         appendSystemText(offlineText);
       }
@@ -534,14 +766,17 @@ export default function App() {
       return false;
     }
 
-    pendingMapRef.current.set(requestId, {});
+    pendingMapRef.current.set(requestId, {
+      tmuxTargetKey: targetMode === "tmux" ? tmuxTargetForCommand : undefined,
+    });
     return true;
   };
 
   const handlePtOn = () => {
     void sendCommandText("/pt on");
-    if (selectedTmuxTarget.trim()) {
-      void sendCommandText(`/tmux target ${selectedTmuxTarget.trim()}`);
+    const normalizedTarget = normalizeTmuxTarget(selectedTmuxTarget);
+    if (normalizedTarget) {
+      void sendCommandText(`/tmux target ${normalizedTarget}`);
     } else {
       void sendCommandText("/tmux panes");
     }
@@ -608,13 +843,92 @@ export default function App() {
     void sendCommandText("/tmux panes");
   };
 
+  const closeTmuxNewDialog = () => {
+    setTmuxNewDialogOpen(false);
+    setTmuxNewNameInput("");
+  };
+
+  const handleOpenTmuxNewDialog = () => {
+    setTmuxTargetMenuOpen(false);
+    setTmuxNewNameInput("");
+    setTmuxNewDialogOpen(true);
+  };
+
+  const handleCreateTmuxWindow = () => {
+    const windowName = sanitizeTmuxWindowName(tmuxNewNameInput);
+    if (!windowName) {
+      appendSystemText("Enter tmux window name.");
+      return;
+    }
+    if (workModeRef.current !== "tmux") {
+      void sendCommandText("/pt on");
+    }
+    const sent = sendCommandText(`/tmux new ${windowName}`);
+    if (!sent) {
+      return;
+    }
+    closeTmuxNewDialog();
+    if (closeSwitchTimerRef.current) {
+      clearTimeout(closeSwitchTimerRef.current);
+      closeSwitchTimerRef.current = null;
+    }
+    closeSwitchTimerRef.current = setTimeout(() => {
+      void sendSilentCommandText("/tmux panes");
+      closeSwitchTimerRef.current = null;
+    }, 220);
+  };
+
+  const handleCloseTmuxTarget = () => {
+    const currentTarget = normalizeTmuxTarget(selectedTmuxTarget);
+    if (!currentTarget) {
+      appendSystemText("Select tmux window before closing.");
+      return;
+    }
+
+    const normalizedTargets = Array.from(
+      new Set(tmuxTargets.map((target) => normalizeTmuxTarget(target)).filter((target) => target.length > 0)),
+    );
+    const currentIndex = normalizedTargets.indexOf(currentTarget);
+    let fallbackTarget = "";
+    if (currentIndex > 0) {
+      fallbackTarget = normalizedTargets[currentIndex - 1];
+    } else if (currentIndex === 0 && normalizedTargets.length > 1) {
+      fallbackTarget = normalizedTargets[1];
+    } else if (currentIndex < 0) {
+      fallbackTarget = normalizedTargets.find((target) => target !== currentTarget) ?? "";
+    }
+
+    const sent = sendCommandText(`/tmux close ${currentTarget}`);
+    if (!sent) {
+      return;
+    }
+
+    setTmuxTargetMenuOpen(false);
+    selectedTmuxTargetRef.current = fallbackTarget;
+    setSelectedTmuxTarget(fallbackTarget);
+
+    if (closeSwitchTimerRef.current) {
+      clearTimeout(closeSwitchTimerRef.current);
+      closeSwitchTimerRef.current = null;
+    }
+    closeSwitchTimerRef.current = setTimeout(() => {
+      if (fallbackTarget) {
+        void sendCommandText(`/tmux target ${fallbackTarget}`);
+      }
+      void sendSilentCommandText("/tmux panes");
+      closeSwitchTimerRef.current = null;
+    }, 220);
+  };
+
   const handleSelectTmuxTarget = (target: string) => {
-    const normalized = target.trim();
+    const normalized = normalizeTmuxTarget(target);
     if (!normalized) {
       return;
     }
+    selectedTmuxTargetRef.current = normalized;
     setSelectedTmuxTarget(normalized);
     setTmuxTargetMenuOpen(false);
+    clearTmuxProgressByTarget(normalized);
     void sendCommandText(`/tmux target ${normalized}`);
   };
 
@@ -623,6 +937,17 @@ export default function App() {
       return;
     }
     setHideTfclawWindowInTmux((prev) => !prev);
+  };
+
+  const handleTmuxKeyShortcut = (token: string) => {
+    const normalized = token.trim();
+    if (!normalized) {
+      return;
+    }
+    if (workModeRef.current !== "tmux") {
+      void sendCommandText("/pt on");
+    }
+    void sendCommandText(`/tkey ${normalized}`);
   };
 
   const sendChat = () => {
@@ -637,15 +962,38 @@ export default function App() {
   useEffect(() => {
     return () => {
       wsRef.current?.close();
+      silentRequestIdsRef.current.clear();
+      if (closeSwitchTimerRef.current) {
+        clearTimeout(closeSwitchTimerRef.current);
+        closeSwitchTimerRef.current = null;
+      }
     };
   }, []);
 
   useEffect(() => {
     if (workMode !== "tmux") {
       setHideTfclawWindowInTmux(false);
-      clearTmuxProgress();
+      setTmuxKeyPanelOpen(false);
+      setTmuxNewDialogOpen(false);
+      setTmuxNewNameInput("");
+      setTmuxLiveProgressByTarget({});
+      tmuxProgressRequestTargetRef.current.clear();
     }
   }, [workMode]);
+
+  useEffect(() => {
+    selectedTmuxTargetRef.current = normalizeTmuxTarget(selectedTmuxTarget);
+  }, [selectedTmuxTarget]);
+
+  useEffect(() => {
+    setSelectedTmuxTarget((prev) => {
+      const normalizedPrev = normalizeTmuxTarget(prev);
+      if (normalizedPrev && tmuxTargets.includes(normalizedPrev)) {
+        return normalizedPrev;
+      }
+      return tmuxTargets[0] ?? "";
+    });
+  }, [tmuxTargets]);
 
   const tmuxLinesRatio = (clampTmuxLines(tmuxLines) - TMUX_LINES_MIN) / (TMUX_LINES_MAX - TMUX_LINES_MIN);
   const tmuxLinesFillWidth = Math.max(0, Math.min(tmuxLinesTrackWidth, tmuxLinesTrackWidth * tmuxLinesRatio));
@@ -657,17 +1005,19 @@ export default function App() {
     chatScrollRef.current?.scrollToEnd({ animated });
     terminalScrollRef.current?.scrollToEnd({ animated });
   };
+  const activeTmuxRenderKey = normalizeTmuxTarget(selectedTmuxTarget) || TMUX_RENDER_DEFAULT_KEY;
   const terminalDisplay = useMemo(() => {
-    const base = terminalRender || "# tmux renderer\n# output will appear here";
+    const baseRender = tmuxRenderByTarget[activeTmuxRenderKey] ?? "";
+    const base = baseRender || "# tmux renderer\n# output will appear here";
     if (workMode !== "tmux") {
       return base;
     }
-    const live = stripAnsi(tmuxLiveProgress).replace(/\r\n/g, "\n").trim();
+    const live = stripAnsi(tmuxLiveProgressByTarget[activeTmuxRenderKey] ?? "").replace(/\r\n/g, "\n").trim();
     if (!live) {
       return base;
     }
     return `${base}${base.endsWith("\n") ? "" : "\n"}${live}`;
-  }, [terminalRender, tmuxLiveProgress, workMode]);
+  }, [activeTmuxRenderKey, tmuxLiveProgressByTarget, tmuxRenderByTarget, workMode]);
 
   useEffect(() => {
     if (workMode !== "tmux") {
@@ -835,8 +1185,14 @@ export default function App() {
                   {selectedTmuxTarget || "Select target"}
                 </Text>
               </Pressable>
+              <Pressable style={[styles.linesApplyBtn, styles.targetNewBtn]} onPress={handleOpenTmuxNewDialog}>
+                <Text style={styles.linesApplyBtnText}>New</Text>
+              </Pressable>
               <Pressable style={styles.linesApplyBtn} onPress={handleRefreshTmuxTargets}>
                 <Text style={styles.linesApplyBtnText}>Refresh</Text>
+              </Pressable>
+              <Pressable style={[styles.linesApplyBtn, styles.targetCloseBtn]} onPress={handleCloseTmuxTarget}>
+                <Text style={styles.linesApplyBtnText}>Close</Text>
               </Pressable>
             </View>
             {tmuxTargetMenuOpen ? (
@@ -914,8 +1270,63 @@ export default function App() {
                 <Text style={styles.btnText}>Send</Text>
               </Pressable>
             </View>
+            <View style={styles.keyToggleRow}>
+              <Pressable
+                style={[styles.btn, styles.keyToggleBtn]}
+                onPress={() => setTmuxKeyPanelOpen((prev) => !prev)}
+              >
+                <Text style={styles.btnText}>{tmuxKeyPanelOpen ? "Hide Key" : "Key"}</Text>
+              </Pressable>
+              <Text style={styles.metaText}>Send /tkey shortcuts to tmux</Text>
+            </View>
+            {tmuxKeyPanelOpen ? (
+              <View style={styles.keyPanel}>
+                {TMUX_KEY_SHORTCUTS.map((item) => (
+                  <Pressable
+                    key={item.token}
+                    style={styles.keyPanelBtn}
+                    onPress={() => handleTmuxKeyShortcut(item.token)}
+                  >
+                    <Text style={styles.keyPanelBtnText}>{item.label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
           </View>
         )}
+        <Modal
+          visible={tmuxNewDialogOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={closeTmuxNewDialog}
+        >
+          <View style={styles.dialogBackdrop}>
+            <View style={styles.dialogCard}>
+              <Text style={styles.dialogTitle}>New tmux window</Text>
+              <Text style={styles.metaText}>name:</Text>
+              <TextInput
+                style={styles.input}
+                value={tmuxNewNameInput}
+                onChangeText={setTmuxNewNameInput}
+                placeholder="window-name"
+                placeholderTextColor="#6f878f"
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoFocus
+                returnKeyType="done"
+                onSubmitEditing={handleCreateTmuxWindow}
+              />
+              <View style={styles.dialogActions}>
+                <Pressable style={[styles.linesApplyBtn, styles.dialogCancelBtn]} onPress={closeTmuxNewDialog}>
+                  <Text style={styles.linesApplyBtnText}>Cancel</Text>
+                </Pressable>
+                <Pressable style={[styles.linesApplyBtn, styles.dialogConfirmBtn]} onPress={handleCreateTmuxWindow}>
+                  <Text style={styles.linesApplyBtnText}>Create</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -1091,6 +1502,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+    flexWrap: "wrap",
   },
   targetPickerBtn: {
     flex: 1,
@@ -1123,6 +1535,14 @@ const styles = StyleSheet.create({
   targetMenuItemText: {
     color: "#d4ecf5",
     fontSize: 12,
+  },
+  targetCloseBtn: {
+    backgroundColor: "#7f5348",
+    borderColor: "#b07d72",
+  },
+  targetNewBtn: {
+    backgroundColor: "#4f7f4c",
+    borderColor: "#79b078",
   },
   chatTopRow: {
     flexDirection: "row",
@@ -1237,6 +1657,76 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+  },
+  keyToggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  keyToggleBtn: {
+    backgroundColor: "#7d9350",
+    minWidth: 92,
+  },
+  keyPanel: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#375664",
+    backgroundColor: "#0f1a1f",
+    padding: 8,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  keyPanelBtn: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#5f8ea0",
+    backgroundColor: "#355663",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    minWidth: 68,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  keyPanelBtnText: {
+    color: "#d9ecf5",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  dialogBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(4, 8, 11, 0.72)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 16,
+  },
+  dialogCard: {
+    width: "100%",
+    maxWidth: 420,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#3b5966",
+    backgroundColor: "#132128",
+    padding: 12,
+    gap: 10,
+  },
+  dialogTitle: {
+    color: "#d7eef6",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  dialogActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 8,
+  },
+  dialogCancelBtn: {
+    backgroundColor: "#3b5561",
+    borderColor: "#5f8391",
+  },
+  dialogConfirmBtn: {
+    backgroundColor: "#4f7f4c",
+    borderColor: "#79b078",
   },
   sendInput: {
     flex: 1,
