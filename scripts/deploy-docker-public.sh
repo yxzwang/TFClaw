@@ -21,10 +21,12 @@ STATE_DIR="${TFCLAW_STATE_DIR:-/opt/tfclaw-state}"
 REPO_URL="${TFCLAW_REPO_URL:-https://github.com/yxzwang/TFClaw.git}"
 REPO_REF="${TFCLAW_REPO_REF:-main}"
 SERVER_HOST="${TFCLAW_SERVER_HOST:-0.0.0.0}"
-SERVER_PORT="${TFCLAW_SERVER_PORT:-8787}"
+SERVER_PORT="${TFCLAW_SERVER_PORT:-18787}"
 WS_PATH="${TFCLAW_WS_PATH:-/}"
 ENABLE_TUNNEL="${TFCLAW_ENABLE_CLOUDFLARE_TUNNEL:-1}"
 TOKEN_INPUT="${TFCLAW_TOKEN:-}"
+FORCE_SETUP="${TFCLAW_FORCE_SETUP:-0}"
+FORCE_BUILD="${TFCLAW_FORCE_BUILD:-0}"
 ARCH="$(dpkg --print-architecture)"
 
 SERVER_LOG="${TFCLAW_SERVER_LOG:-/var/log/tfclaw-server.log}"
@@ -35,9 +37,27 @@ TFCLAW_RUNTIME_TOKEN=""
 TFCLAW_RUNTIME_RELAY_URL=""
 
 install_packages() {
-  log "Installing base packages ..."
+  local required=(ca-certificates curl git jq gnupg openssl procps)
+  local missing=()
+
+  if [[ "$FORCE_SETUP" != "1" ]]; then
+    for pkg in "${required[@]}"; do
+      if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        missing+=("$pkg")
+      fi
+    done
+  else
+    missing=("${required[@]}")
+  fi
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    log "Base packages already installed. Skip apt install."
+    return
+  fi
+
+  log "Installing base packages: ${missing[*]}"
   apt-get update
-  apt-get install -y ca-certificates curl git jq gnupg openssl procps
+  apt-get install -y "${missing[@]}"
 }
 
 install_nodejs() {
@@ -93,13 +113,24 @@ prepare_source() {
 }
 
 build_server() {
-  log "Installing npm dependencies ..."
   cd "$INSTALL_DIR"
-  npm ci
 
-  log "Building protocol and server ..."
-  npm run build --workspace @tfclaw/protocol
-  npm run build --workspace @tfclaw/server
+  if [[ "$FORCE_SETUP" == "1" || ! -d node_modules ]]; then
+    log "Installing npm dependencies ..."
+    npm ci
+  else
+    log "node_modules exists. Skip npm ci."
+  fi
+
+  local protocol_dist="packages/protocol/dist/index.js"
+  local server_dist="apps/server/dist/index.js"
+  if [[ "$FORCE_BUILD" == "1" || ! -f "$protocol_dist" || ! -f "$server_dist" ]]; then
+    log "Building protocol and server ..."
+    npm run build --workspace @tfclaw/protocol
+    npm run build --workspace @tfclaw/server
+  else
+    log "Build artifacts exist. Skip build."
+  fi
 }
 
 ensure_state() {
@@ -232,6 +263,8 @@ start_tunnel() {
   fi
 
   log "Starting cloudflared quick tunnel ..."
+  # Clear old tunnel history so URL discovery always picks current run.
+  : >"$TUNNEL_LOG"
   nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$SERVER_PORT" >>"$TUNNEL_LOG" 2>&1 &
   TFCLAW_TUNNEL_PID="$!"
 

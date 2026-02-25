@@ -32,6 +32,8 @@ TFCLAW_RELAY_URL=wss://xxxx.trycloudflare.com
 6. 使用 `nohup` 启动 server 与 cloudflared（无 systemd）
 7. 写运行信息到 `/opt/tfclaw-state/runtime.env`
 
+默认优化：`start` 时如果依赖和构建产物已存在，会自动跳过重复安装和重复构建。
+
 ## 3. Token 会随机生成吗？
 
 会。规则如下：
@@ -78,12 +80,20 @@ TFCLAW_SERVER_HOST=0.0.0.0
 TFCLAW_REPO_REF=main
 TFCLAW_INSTALL_DIR=/opt/token-free-claw
 TFCLAW_STATE_DIR=/opt/tfclaw-state
+TFCLAW_FORCE_SETUP=0
+TFCLAW_FORCE_BUILD=0
 ```
 
 示例：
 
 ```bash
 TFCLAW_TOKEN='replace-with-strong-token' TFCLAW_SERVER_PORT=8787 bash scripts/deploy-docker-public.sh start
+```
+
+如需强制重装依赖并重新构建：
+
+```bash
+TFCLAW_FORCE_SETUP=1 TFCLAW_FORCE_BUILD=1 bash scripts/deploy-docker-public.sh start
 ```
 
 ## 6. 运行信息与日志位置
