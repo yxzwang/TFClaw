@@ -1,4 +1,4 @@
-import { StatusBar } from "expo-status-bar";
+import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
@@ -10,11 +10,13 @@ import {
   Pressable,
   SafeAreaView,
   ScrollView,
+  StatusBar as NativeStatusBar,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 type PlatformName = "windows" | "macos" | "linux" | "unknown";
 type AppStage = "login" | "chat";
@@ -27,6 +29,10 @@ const TMUX_LINES_MAX = 300;
 const TMUX_LINES_SLIDER_THUMB_SIZE = 18;
 const TERMINAL_RENDER_MAX_CHARS = 120000;
 const TMUX_RENDER_DEFAULT_KEY = "__default__";
+const DEFAULT_RELAY_URL = process.env.EXPO_PUBLIC_TFCLAW_RELAY_URL ?? "ws://127.0.0.1:8787";
+const DEFAULT_TOKEN = process.env.EXPO_PUBLIC_TFCLAW_TOKEN ?? "demo-token";
+const LOGIN_PREFS_STORAGE_KEY = "@tfclaw/mobile/login-prefs";
+const UI_SCALE_DEFAULT_PERCENT = 50;
 const UI_SCALE_MIN_PERCENT = 10;
 const UI_SCALE_MAX_PERCENT = 300;
 const UI_SCALE_STEPS = [10, 25, 50, 75, 100, 115, 130, 160, 200] as const;
@@ -108,6 +114,12 @@ interface ChatMessage {
 interface PendingCommandState {
   progressMessageId?: string;
   tmuxTargetKey?: string;
+}
+
+interface SavedLoginPrefs {
+  remember: boolean;
+  relayUrl?: string;
+  token?: string;
 }
 
 function randomId(prefix: string): string {
@@ -209,8 +221,9 @@ function parseTmuxLinesValue(output: string): number | undefined {
 
 export default function App() {
   const [stage, setStage] = useState<AppStage>("login");
-  const [relayUrl, setRelayUrl] = useState(process.env.EXPO_PUBLIC_TFCLAW_RELAY_URL ?? "ws://127.0.0.1:8787");
-  const [token, setToken] = useState(process.env.EXPO_PUBLIC_TFCLAW_TOKEN ?? "demo-token");
+  const [relayUrl, setRelayUrl] = useState("");
+  const [token, setToken] = useState("");
+  const [rememberLogin, setRememberLogin] = useState(false);
   const [connectionState, setConnectionState] = useState<ConnectionState>("offline");
   const [workMode, setWorkMode] = useState<WorkMode>("tfclaw");
   const [tmuxLines, setTmuxLines] = useState(200);
@@ -222,8 +235,8 @@ export default function App() {
   const [tmuxNewNameInput, setTmuxNewNameInput] = useState("");
   const [hideTfclawWindowInTmux, setHideTfclawWindowInTmux] = useState(false);
   const [ignoreTopPanels, setIgnoreTopPanels] = useState(false);
-  const [uiScalePercent, setUiScalePercent] = useState(100);
-  const [uiScaleInput, setUiScaleInput] = useState("100");
+  const [uiScalePercent, setUiScalePercent] = useState(UI_SCALE_DEFAULT_PERCENT);
+  const [uiScaleInput, setUiScaleInput] = useState(String(UI_SCALE_DEFAULT_PERCENT));
   const [tmuxKeyPanelOpen, setTmuxKeyPanelOpen] = useState(false);
   const [agent, setAgent] = useState<AgentDescriptor | undefined>(undefined);
   const [inputText, setInputText] = useState("");
@@ -698,11 +711,27 @@ export default function App() {
   };
 
   const connectWithToken = () => {
-    const urlText = relayUrl.trim();
-    const tokenText = token.trim();
-    if (!urlText || !tokenText || isConnecting) {
+    const urlText = relayUrl.trim() || DEFAULT_RELAY_URL;
+    const tokenText = token.trim() || DEFAULT_TOKEN;
+    if (isConnecting) {
       return;
     }
+    void (async () => {
+      try {
+        if (rememberLogin) {
+          const saved: SavedLoginPrefs = {
+            remember: true,
+            relayUrl: urlText,
+            token: tokenText,
+          };
+          await AsyncStorage.setItem(LOGIN_PREFS_STORAGE_KEY, JSON.stringify(saved));
+          return;
+        }
+        await AsyncStorage.removeItem(LOGIN_PREFS_STORAGE_KEY);
+      } catch {
+        // Keep login flow working even when local persistence fails.
+      }
+    })();
 
     wsRef.current?.close();
     wsRef.current = null;
@@ -870,6 +899,10 @@ export default function App() {
     void sendCommandText("/pt off");
   };
 
+  const handleTCapture = () => {
+    void sendCommandText("/tcapture");
+  };
+
   const applyUiScalePercent = (value: number) => {
     const clamped = clampUiScalePercent(value);
     setUiScalePercent(clamped);
@@ -904,6 +937,23 @@ export default function App() {
       }
       return next;
     });
+  };
+
+  const handleToggleRememberLogin = () => {
+    setRememberLogin((prev) => {
+      const next = !prev;
+      if (!next) {
+        void AsyncStorage.removeItem(LOGIN_PREFS_STORAGE_KEY).catch(() => {
+          // Ignore persistence failures when clearing remembered credentials.
+        });
+      }
+      return next;
+    });
+  };
+
+  const handleClearLoginInputs = () => {
+    setRelayUrl("");
+    setToken("");
   };
 
   const handleTmuxLinesApply = (lines: number) => {
@@ -1080,6 +1130,35 @@ export default function App() {
   };
 
   useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(LOGIN_PREFS_STORAGE_KEY);
+        if (!active || !raw) {
+          return;
+        }
+        const parsed = JSON.parse(raw) as SavedLoginPrefs;
+        const shouldRemember = Boolean(parsed?.remember);
+        setRememberLogin(shouldRemember);
+        if (!shouldRemember) {
+          return;
+        }
+        if (typeof parsed.relayUrl === "string") {
+          setRelayUrl(parsed.relayUrl);
+        }
+        if (typeof parsed.token === "string") {
+          setToken(parsed.token);
+        }
+      } catch {
+        // Ignore invalid persisted values and continue with defaults.
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       wsRef.current?.close();
       silentRequestIdsRef.current.clear();
@@ -1207,9 +1286,9 @@ export default function App() {
     );
   };
 
-  return (
+    return (
     <SafeAreaView style={styles.safe}>
-      <StatusBar style="light" />
+      <ExpoStatusBar style="light" />
       <KeyboardAvoidingView
         behavior="padding"
         keyboardVerticalOffset={0}
@@ -1236,7 +1315,7 @@ export default function App() {
                   returnKeyType="done"
                   onSubmitEditing={handleUiScaleInputSubmit}
                   onEndEditing={handleUiScaleInputSubmit}
-                  placeholder="100"
+                  placeholder={String(UI_SCALE_DEFAULT_PERCENT)}
                   placeholderTextColor="#8ca5b0"
                   maxLength={3}
                 />
@@ -1268,7 +1347,7 @@ export default function App() {
               onChangeText={setRelayUrl}
               autoCapitalize="none"
               autoCorrect={false}
-              placeholder="ws://10.0.2.2:8787"
+              placeholder={DEFAULT_RELAY_URL}
               placeholderTextColor="#6f878f"
             />
             <Text style={[styles.label, dynamicUi.label]}>Token</Text>
@@ -1278,13 +1357,25 @@ export default function App() {
               onChangeText={setToken}
               autoCapitalize="none"
               autoCorrect={false}
-              placeholder="demo-token"
+              placeholder={DEFAULT_TOKEN}
               placeholderTextColor="#6f878f"
             />
-            <Pressable style={[styles.btn, dynamicUi.btn, styles.btnPrimary]} onPress={connectWithToken}>
-              <Text style={[styles.btnText, dynamicUi.btnText]}>Login</Text>
+            <Pressable style={styles.rememberRow} onPress={handleToggleRememberLogin}>
+              <View style={[styles.rememberBox, rememberLogin ? styles.rememberBoxActive : undefined]}>
+                {rememberLogin ? <Text style={[styles.rememberBoxMark, dynamicUi.metaText]}>✓</Text> : null}
+              </View>
+              <Text style={[styles.metaText, dynamicUi.metaText]}>Remember URL and token on this device</Text>
             </Pressable>
+            <View style={styles.loginActionsRow}>
+              <Pressable style={[styles.btn, dynamicUi.btn, styles.btnPrimary, styles.loginActionBtn]} onPress={connectWithToken}>
+                <Text style={[styles.btnText, dynamicUi.btnText]}>Login</Text>
+              </Pressable>
+              <Pressable style={[styles.btn, dynamicUi.btn, styles.btnGhost, styles.loginActionBtn]} onPress={handleClearLoginInputs}>
+                <Text style={[styles.btnText, dynamicUi.btnText]}>Clear</Text>
+              </Pressable>
+            </View>
             <Text style={[styles.metaText, dynamicUi.metaText]}>Tap Login to enter chat immediately and start connecting.</Text>
+            <Text style={[styles.metaText, dynamicUi.metaText]}>Leave URL/token blank to use default values.</Text>
             <Text style={[styles.metaText, dynamicUi.metaText]}>For Android emulator use: `adb reverse tcp:8787 tcp:8787`.</Text>
           </View>
         ) : (
@@ -1295,16 +1386,30 @@ export default function App() {
             {!ignoreTopPanels ? (
               <>
                 <View style={styles.chatTopRow}>
-                  <Text style={[styles.sectionTitle, dynamicUi.sectionTitle]}>Conversation</Text>
+                  <View style={styles.chatTopLeft}>
+                    <Text style={[styles.sectionTitle, dynamicUi.sectionTitle]}>Conversation</Text>
+                    <View
+                      style={[
+                        styles.connectionDot,
+                        connectionState === "online" ? styles.connectionDotOnline : styles.connectionDotOffline,
+                      ]}
+                    />
+                  </View>
                   <View style={styles.chatTopBtns}>
                     <Pressable
-                      style={[styles.btn, dynamicUi.btn, styles.btnGhost, styles.topBtn, dynamicUi.topBtn]}
+                      style={[styles.btn, dynamicUi.btn, styles.topBtn, dynamicUi.topBtn, styles.topBtnCapture]}
+                      onPress={handleTCapture}
+                    >
+                      <Text style={[styles.btnText, dynamicUi.btnText]}>/tcapture</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.btn, dynamicUi.btn, styles.topBtn, dynamicUi.topBtn, styles.topBtnBright]}
                       onPress={connectWithToken}
                       disabled={isConnecting}
                     >
                       <Text style={[styles.btnText, dynamicUi.btnText]}>{isConnecting ? "Connecting" : "Reconnect"}</Text>
                     </Pressable>
-                    <Pressable style={[styles.btn, dynamicUi.btn, styles.btnGhost, styles.topBtn, dynamicUi.topBtn]} onPress={backToLogin}>
+                    <Pressable style={[styles.btn, dynamicUi.btn, styles.topBtn, dynamicUi.topBtn, styles.topBtnBright]} onPress={backToLogin}>
                       <Text style={[styles.btnText, dynamicUi.btnText]}>Back</Text>
                     </Pressable>
                   </View>
@@ -1526,7 +1631,9 @@ const styles = StyleSheet.create({
   },
   container: {
     flex: 1,
-    padding: 12,
+    paddingHorizontal: 12,
+    paddingBottom: 12,
+    paddingTop: Platform.OS === "android" ? (NativeStatusBar.currentHeight ?? 0) + 8 : 12,
     gap: 10,
   },
   header: {
@@ -1610,6 +1717,38 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 0,
   },
+  loginActionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  rememberRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  rememberBox: {
+    width: 20,
+    height: 20,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: "#4f6a76",
+    backgroundColor: "#0f1a1f",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  rememberBoxActive: {
+    backgroundColor: "#436f7f",
+    borderColor: "#7fb4c8",
+  },
+  rememberBoxMark: {
+    color: "#e6f6ff",
+    fontWeight: "700",
+    lineHeight: 14,
+  },
+  loginActionBtn: {
+    flex: 1,
+  },
   chatCardIgnore: {
     gap: 8,
   },
@@ -1643,6 +1782,16 @@ const styles = StyleSheet.create({
   },
   btnGhost: {
     backgroundColor: "#304c59",
+  },
+  topBtnBright: {
+    backgroundColor: "#496a79",
+    borderWidth: 1,
+    borderColor: "#6f95a7",
+  },
+  topBtnCapture: {
+    backgroundColor: "#4f7b51",
+    borderWidth: 1,
+    borderColor: "#7ab27d",
   },
   btnText: {
     color: "#081114",
@@ -1791,10 +1940,29 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 8,
   },
-  chatTopBtns: {
+  chatTopLeft: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+  },
+  chatTopBtns: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    flex: 1,
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  connectionDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  connectionDotOnline: {
+    backgroundColor: "#4dd26f",
+  },
+  connectionDotOffline: {
+    backgroundColor: "#de4f4f",
   },
   chatList: {
     flex: 1,
