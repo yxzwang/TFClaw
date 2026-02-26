@@ -27,6 +27,9 @@ const TMUX_LINES_MAX = 300;
 const TMUX_LINES_SLIDER_THUMB_SIZE = 18;
 const TERMINAL_RENDER_MAX_CHARS = 120000;
 const TMUX_RENDER_DEFAULT_KEY = "__default__";
+const UI_SCALE_MIN_PERCENT = 10;
+const UI_SCALE_MAX_PERCENT = 300;
+const UI_SCALE_STEPS = [10, 25, 50, 75, 100, 115, 130, 160, 200] as const;
 const TMUX_KEY_SHORTCUTS: Array<{ label: string; token: string }> = [
   { label: "^C", token: "^C" },
   { label: "Enter", token: "enter" },
@@ -129,6 +132,13 @@ function clampTmuxLines(value: number): number {
   return Math.max(TMUX_LINES_MIN, Math.min(TMUX_LINES_MAX, Math.round(value)));
 }
 
+function clampUiScalePercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 100;
+  }
+  return Math.max(UI_SCALE_MIN_PERCENT, Math.min(UI_SCALE_MAX_PERCENT, Math.round(value)));
+}
+
 function normalizeTmuxTarget(target: string): string {
   return String(target ?? "").trim().split(/\s+/)[0] ?? "";
 }
@@ -211,6 +221,9 @@ export default function App() {
   const [tmuxNewDialogOpen, setTmuxNewDialogOpen] = useState(false);
   const [tmuxNewNameInput, setTmuxNewNameInput] = useState("");
   const [hideTfclawWindowInTmux, setHideTfclawWindowInTmux] = useState(false);
+  const [ignoreTopPanels, setIgnoreTopPanels] = useState(false);
+  const [uiScalePercent, setUiScalePercent] = useState(100);
+  const [uiScaleInput, setUiScaleInput] = useState("100");
   const [tmuxKeyPanelOpen, setTmuxKeyPanelOpen] = useState(false);
   const [agent, setAgent] = useState<AgentDescriptor | undefined>(undefined);
   const [inputText, setInputText] = useState("");
@@ -232,6 +245,77 @@ export default function App() {
 
   const isOnline = connectionState === "online";
   const isConnecting = connectionState === "connecting";
+  const uiScaleValue = clampUiScalePercent(uiScalePercent);
+  const uiScale = uiScaleValue / 100;
+  const uiScaleLabel = `${uiScaleValue}%`;
+
+  const dynamicUi = useMemo(() => {
+    const scaled = (value: number, min = 1) => Math.max(min, Math.round(value * uiScale));
+    return {
+      title: { fontSize: scaled(21, 6) },
+      subtitle: { fontSize: scaled(12, 4) },
+      label: { fontSize: scaled(12, 4) },
+      sectionTitle: { fontSize: scaled(15, 5) },
+      metaText: { fontSize: scaled(12, 4) },
+      btn: {
+        borderRadius: scaled(10, 4),
+        paddingHorizontal: scaled(12, 4),
+        paddingVertical: scaled(10, 4),
+        minWidth: scaled(80, 36),
+      },
+      topBtn: { minWidth: scaled(92, 40) },
+      btnText: { fontSize: scaled(13, 5) },
+      modeBadgeText: { fontSize: scaled(12, 5) },
+      input: {
+        fontSize: scaled(14, 5),
+        paddingHorizontal: scaled(10, 5),
+        paddingVertical: scaled(10, 4),
+      },
+      linesInput: { width: scaled(88, 44) },
+      linesApplyBtn: {
+        borderRadius: scaled(8, 4),
+        paddingHorizontal: scaled(10, 4),
+        paddingVertical: scaled(6, 4),
+      },
+      linesApplyBtnText: { fontSize: scaled(12, 5) },
+      targetPickerText: { fontSize: scaled(12, 5) },
+      targetMenuItemText: { fontSize: scaled(12, 5) },
+      terminalText: {
+        fontSize: scaled(12, 5),
+        lineHeight: scaled(18, 8),
+      },
+      msgName: { fontSize: scaled(11, 4) },
+      msgText: {
+        fontSize: scaled(13, 5),
+        lineHeight: scaled(18, 8),
+      },
+      msgSystemText: { fontSize: scaled(12, 4) },
+      emptyText: { fontSize: scaled(12, 4) },
+      keyPanelBtn: {
+        minWidth: scaled(68, 34),
+        paddingHorizontal: scaled(10, 4),
+        paddingVertical: scaled(8, 4),
+        borderRadius: scaled(8, 4),
+      },
+      keyPanelBtnText: { fontSize: scaled(12, 5) },
+      headerActionBtn: {
+        minWidth: scaled(74, 34),
+        borderRadius: scaled(8, 4),
+        paddingHorizontal: scaled(10, 4),
+        paddingVertical: scaled(8, 4),
+      },
+      headerScaleInputWrap: {
+        minWidth: scaled(56, 36),
+        borderRadius: scaled(8, 4),
+      },
+      headerScaleInput: {
+        fontSize: scaled(12, 5),
+        paddingHorizontal: scaled(8, 4),
+        paddingVertical: scaled(6, 3),
+      },
+      dialogTitle: { fontSize: scaled(16, 6) },
+    };
+  }, [uiScale]);
 
   const statusText = useMemo(() => {
     if (connectionState === "online") {
@@ -786,6 +870,42 @@ export default function App() {
     void sendCommandText("/pt off");
   };
 
+  const applyUiScalePercent = (value: number) => {
+    const clamped = clampUiScalePercent(value);
+    setUiScalePercent(clamped);
+    setUiScaleInput(String(clamped));
+  };
+
+  const handleCycleUiScale = () => {
+    const current = clampUiScalePercent(uiScalePercent);
+    const existingIndex = UI_SCALE_STEPS.findIndex((item) => item === current);
+    if (existingIndex >= 0) {
+      applyUiScalePercent(UI_SCALE_STEPS[(existingIndex + 1) % UI_SCALE_STEPS.length]);
+      return;
+    }
+    const next = UI_SCALE_STEPS.find((item) => item > current) ?? UI_SCALE_STEPS[0];
+    applyUiScalePercent(next);
+  };
+
+  const handleUiScaleInputSubmit = () => {
+    const parsed = Number.parseInt(uiScaleInput, 10);
+    if (!Number.isFinite(parsed)) {
+      setUiScaleInput(String(clampUiScalePercent(uiScalePercent)));
+      return;
+    }
+    applyUiScalePercent(parsed);
+  };
+
+  const handleToggleIgnoreTopPanels = () => {
+    setIgnoreTopPanels((prev) => {
+      const next = !prev;
+      if (next) {
+        setTmuxTargetMenuOpen(false);
+      }
+      return next;
+    });
+  };
+
   const handleTmuxLinesApply = (lines: number) => {
     const clamped = clampTmuxLines(lines);
     setTmuxLines(clamped);
@@ -982,6 +1102,13 @@ export default function App() {
   }, [workMode]);
 
   useEffect(() => {
+    if (!ignoreTopPanels) {
+      return;
+    }
+    setTmuxTargetMenuOpen(false);
+  }, [ignoreTopPanels]);
+
+  useEffect(() => {
     selectedTmuxTargetRef.current = normalizeTmuxTarget(selectedTmuxTarget);
   }, [selectedTmuxTarget]);
 
@@ -1054,7 +1181,14 @@ export default function App() {
 
     return (
       <View key={msg.id} style={[styles.msgWrap, isUser ? styles.msgWrapUser : styles.msgWrapAssistant]}>
-        <Text style={[styles.msgName, isUser ? styles.msgNameUser : undefined, isSystem ? styles.msgNameSystem : undefined]}>
+        <Text
+          style={[
+            styles.msgName,
+            dynamicUi.msgName,
+            isUser ? styles.msgNameUser : undefined,
+            isSystem ? styles.msgNameSystem : undefined,
+          ]}
+        >
           {name}
         </Text>
         <View
@@ -1065,7 +1199,9 @@ export default function App() {
             msg.progress ? styles.msgProgress : undefined,
           ]}
         >
-          <Text style={[styles.msgText, isSystem ? styles.msgSystemText : undefined]}>{msg.text}</Text>
+          <Text style={[styles.msgText, dynamicUi.msgText, isSystem ? styles.msgSystemText : undefined, dynamicUi.msgSystemText]}>
+            {msg.text}
+          </Text>
         </View>
       </View>
     );
@@ -1080,17 +1216,54 @@ export default function App() {
         style={styles.container}
       >
         <View style={styles.header}>
-          <Text style={styles.title}>TFClaw Chat</Text>
-          <Text style={styles.subtitle}>
-            {statusText} | {modeText}
-          </Text>
+          <View style={styles.headerTopRow}>
+            <View style={styles.headerTitleWrap}>
+              <Text style={[styles.title, dynamicUi.title]}>TFClaw Chat</Text>
+              <Text style={[styles.subtitle, dynamicUi.subtitle]}>
+                {statusText} | {modeText}
+              </Text>
+            </View>
+            <View style={styles.headerActions}>
+              <Pressable style={[styles.headerActionBtn, dynamicUi.headerActionBtn]} onPress={handleCycleUiScale}>
+                <Text style={[styles.headerActionBtnText, dynamicUi.btnText]}>A {uiScaleLabel}</Text>
+              </Pressable>
+              <View style={[styles.headerScaleInputWrap, dynamicUi.headerScaleInputWrap]}>
+                <TextInput
+                  style={[styles.headerScaleInput, dynamicUi.headerScaleInput]}
+                  value={uiScaleInput}
+                  onChangeText={(text) => setUiScaleInput(text.replace(/[^0-9]/g, ""))}
+                  keyboardType="number-pad"
+                  returnKeyType="done"
+                  onSubmitEditing={handleUiScaleInputSubmit}
+                  onEndEditing={handleUiScaleInputSubmit}
+                  placeholder="100"
+                  placeholderTextColor="#8ca5b0"
+                  maxLength={3}
+                />
+              </View>
+              {stage === "chat" ? (
+                <Pressable
+                  style={[
+                    styles.headerActionBtn,
+                    styles.headerActionBtnIgnore,
+                    dynamicUi.headerActionBtn,
+                  ]}
+                  onPress={handleToggleIgnoreTopPanels}
+                >
+                  <Text style={[styles.headerActionBtnText, dynamicUi.btnText]}>
+                    {ignoreTopPanels ? "Show Panel" : "Ignore"}
+                  </Text>
+                </Pressable>
+              ) : null}
+            </View>
+          </View>
         </View>
 
         {stage === "login" ? (
           <View style={styles.card}>
-            <Text style={styles.label}>Relay URL</Text>
+            <Text style={[styles.label, dynamicUi.label]}>Relay URL</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, dynamicUi.input]}
               value={relayUrl}
               onChangeText={setRelayUrl}
               autoCapitalize="none"
@@ -1098,9 +1271,9 @@ export default function App() {
               placeholder="ws://10.0.2.2:8787"
               placeholderTextColor="#6f878f"
             />
-            <Text style={styles.label}>Token</Text>
+            <Text style={[styles.label, dynamicUi.label]}>Token</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, dynamicUi.input]}
               value={token}
               onChangeText={setToken}
               autoCapitalize="none"
@@ -1108,128 +1281,135 @@ export default function App() {
               placeholder="demo-token"
               placeholderTextColor="#6f878f"
             />
-            <Pressable style={[styles.btn, styles.btnPrimary]} onPress={connectWithToken}>
-              <Text style={styles.btnText}>Login</Text>
+            <Pressable style={[styles.btn, dynamicUi.btn, styles.btnPrimary]} onPress={connectWithToken}>
+              <Text style={[styles.btnText, dynamicUi.btnText]}>Login</Text>
             </Pressable>
-            <Text style={styles.metaText}>Tap Login to enter chat immediately and start connecting.</Text>
-            <Text style={styles.metaText}>For Android emulator use: `adb reverse tcp:8787 tcp:8787`.</Text>
+            <Text style={[styles.metaText, dynamicUi.metaText]}>Tap Login to enter chat immediately and start connecting.</Text>
+            <Text style={[styles.metaText, dynamicUi.metaText]}>For Android emulator use: `adb reverse tcp:8787 tcp:8787`.</Text>
           </View>
         ) : (
-          <View style={[styles.card, styles.chatCard]} onLayout={() => scrollOutputsToEnd(false)}>
-            <View style={styles.chatTopRow}>
-              <Text style={styles.sectionTitle}>Conversation</Text>
-              <View style={styles.chatTopBtns}>
-                <Pressable
-                  style={[styles.btn, styles.btnGhost, styles.topBtn]}
-                  onPress={connectWithToken}
-                  disabled={isConnecting}
-                >
-                  <Text style={styles.btnText}>{isConnecting ? "Connecting" : "Reconnect"}</Text>
-                </Pressable>
-                <Pressable style={[styles.btn, styles.btnGhost, styles.topBtn]} onPress={backToLogin}>
-                  <Text style={styles.btnText}>Back</Text>
-                </Pressable>
-              </View>
-            </View>
-            <View style={styles.modeRow}>
-              <View style={[styles.modeBadge, workMode === "tmux" ? styles.modeTmux : styles.modeTfclaw]}>
-                <Text style={styles.modeBadgeText}>{modeText}</Text>
-              </View>
-              <Pressable style={[styles.btn, styles.modeBtnOn]} onPress={handlePtOn}>
-                <Text style={styles.btnText}>PT ON</Text>
-              </Pressable>
-              <Pressable style={[styles.btn, styles.modeBtnOff]} onPress={handlePtOff}>
-                <Text style={styles.btnText}>PT OFF</Text>
-              </Pressable>
-              {workMode === "tmux" ? (
-                <Pressable style={[styles.btn, styles.modeBtnToggleTfclaw]} onPress={handleToggleTfclawWindowInTmux}>
-                  <Text style={styles.btnText}>
-                    {hideTfclawWindowInTmux ? "Show TFClaw" : "Hide TFClaw"}
-                  </Text>
-                </Pressable>
-              ) : null}
-            </View>
-
-            <View style={styles.linesRow}>
-              <Text style={styles.metaText}>/tmux lines:</Text>
-              <View
-                style={styles.linesSliderWrap}
-                onLayout={handleTmuxLinesTrackLayout}
-                {...tmuxLinesPanResponder.panHandlers}
-              >
-                <View style={styles.linesSliderTrack}>
-                  <View style={[styles.linesSliderFill, { width: tmuxLinesFillWidth }]} />
-                </View>
-                <View style={[styles.linesSliderThumb, { left: tmuxLinesThumbLeft }]} />
-              </View>
-              <TextInput
-                style={[styles.input, styles.linesInput]}
-                value={tmuxLinesInput}
-                onChangeText={setTmuxLinesInput}
-                keyboardType="number-pad"
-                returnKeyType="done"
-                onSubmitEditing={handleTmuxLinesInputSubmit}
-              />
-              <Pressable style={[styles.linesApplyBtn]} onPress={handleTmuxLinesInputSubmit}>
-                <Text style={styles.linesApplyBtnText}>Set</Text>
-              </Pressable>
-            </View>
-
-            <View style={styles.targetRow}>
-              <Text style={styles.metaText}>tmux window:</Text>
-              <Pressable
-                style={styles.targetPickerBtn}
-                onPress={() => setTmuxTargetMenuOpen((prev) => !prev)}
-              >
-                <Text style={styles.targetPickerText}>
-                  {selectedTmuxTarget || "Select target"}
-                </Text>
-              </Pressable>
-              <Pressable style={[styles.linesApplyBtn, styles.targetNewBtn]} onPress={handleOpenTmuxNewDialog}>
-                <Text style={styles.linesApplyBtnText}>New</Text>
-              </Pressable>
-              <Pressable style={styles.linesApplyBtn} onPress={handleRefreshTmuxTargets}>
-                <Text style={styles.linesApplyBtnText}>Refresh</Text>
-              </Pressable>
-              <Pressable style={[styles.linesApplyBtn, styles.targetCloseBtn]} onPress={handleCloseTmuxTarget}>
-                <Text style={styles.linesApplyBtnText}>Close</Text>
-              </Pressable>
-            </View>
-            {tmuxTargetMenuOpen ? (
-              <View style={styles.targetMenu}>
-                {tmuxTargets.length === 0 ? (
-                  <Text style={styles.metaText}>No tmux panes yet. Tap Refresh.</Text>
-                ) : (
-                  tmuxTargets.map((target) => (
+          <View
+            style={[styles.card, styles.chatCard, ignoreTopPanels ? styles.chatCardIgnore : undefined]}
+            onLayout={() => scrollOutputsToEnd(false)}
+          >
+            {!ignoreTopPanels ? (
+              <>
+                <View style={styles.chatTopRow}>
+                  <Text style={[styles.sectionTitle, dynamicUi.sectionTitle]}>Conversation</Text>
+                  <View style={styles.chatTopBtns}>
                     <Pressable
-                      key={target}
-                      style={[
-                        styles.targetMenuItem,
-                        selectedTmuxTarget === target ? styles.targetMenuItemActive : undefined,
-                      ]}
-                      onPress={() => handleSelectTmuxTarget(target)}
+                      style={[styles.btn, dynamicUi.btn, styles.btnGhost, styles.topBtn, dynamicUi.topBtn]}
+                      onPress={connectWithToken}
+                      disabled={isConnecting}
                     >
-                      <Text style={styles.targetMenuItemText}>{target}</Text>
+                      <Text style={[styles.btnText, dynamicUi.btnText]}>{isConnecting ? "Connecting" : "Reconnect"}</Text>
                     </Pressable>
-                  ))
-                )}
-              </View>
-            ) : null}
+                    <Pressable style={[styles.btn, dynamicUi.btn, styles.btnGhost, styles.topBtn, dynamicUi.topBtn]} onPress={backToLogin}>
+                      <Text style={[styles.btnText, dynamicUi.btnText]}>Back</Text>
+                    </Pressable>
+                  </View>
+                </View>
+                <View style={styles.modeRow}>
+                  <View style={[styles.modeBadge, workMode === "tmux" ? styles.modeTmux : styles.modeTfclaw]}>
+                    <Text style={[styles.modeBadgeText, dynamicUi.modeBadgeText]}>{modeText}</Text>
+                  </View>
+                  <Pressable style={[styles.btn, dynamicUi.btn, styles.modeBtnOn]} onPress={handlePtOn}>
+                    <Text style={[styles.btnText, dynamicUi.btnText]}>PT ON</Text>
+                  </Pressable>
+                  <Pressable style={[styles.btn, dynamicUi.btn, styles.modeBtnOff]} onPress={handlePtOff}>
+                    <Text style={[styles.btnText, dynamicUi.btnText]}>PT OFF</Text>
+                  </Pressable>
+                  {workMode === "tmux" ? (
+                    <Pressable style={[styles.btn, dynamicUi.btn, styles.modeBtnToggleTfclaw]} onPress={handleToggleTfclawWindowInTmux}>
+                      <Text style={[styles.btnText, dynamicUi.btnText]}>
+                        {hideTfclawWindowInTmux ? "Show TFClaw" : "Hide TFClaw"}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </View>
 
-            <Text style={styles.metaText}>
-              {agentText} | lines: {tmuxLines} | target: {selectedTmuxTarget || "(none)"}
-            </Text>
+                <View style={styles.linesRow}>
+                  <Text style={[styles.metaText, dynamicUi.metaText]}>/tmux lines:</Text>
+                  <View
+                    style={styles.linesSliderWrap}
+                    onLayout={handleTmuxLinesTrackLayout}
+                    {...tmuxLinesPanResponder.panHandlers}
+                  >
+                    <View style={styles.linesSliderTrack}>
+                      <View style={[styles.linesSliderFill, { width: tmuxLinesFillWidth }]} />
+                    </View>
+                    <View style={[styles.linesSliderThumb, { left: tmuxLinesThumbLeft }]} />
+                  </View>
+                  <TextInput
+                    style={[styles.input, dynamicUi.input, styles.linesInput, dynamicUi.linesInput]}
+                    value={tmuxLinesInput}
+                    onChangeText={setTmuxLinesInput}
+                    keyboardType="number-pad"
+                    returnKeyType="done"
+                    onSubmitEditing={handleTmuxLinesInputSubmit}
+                  />
+                  <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn]} onPress={handleTmuxLinesInputSubmit}>
+                    <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Set</Text>
+                  </Pressable>
+                </View>
+
+                <View style={styles.targetRow}>
+                  <Text style={[styles.metaText, dynamicUi.metaText]}>tmux window:</Text>
+                  <Pressable
+                    style={styles.targetPickerBtn}
+                    onPress={() => setTmuxTargetMenuOpen((prev) => !prev)}
+                  >
+                    <Text style={[styles.targetPickerText, dynamicUi.targetPickerText]}>
+                      {selectedTmuxTarget || "Select target"}
+                    </Text>
+                  </Pressable>
+                  <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn, styles.targetNewBtn]} onPress={handleOpenTmuxNewDialog}>
+                    <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>New</Text>
+                  </Pressable>
+                  <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn]} onPress={handleRefreshTmuxTargets}>
+                    <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Refresh</Text>
+                  </Pressable>
+                  <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn, styles.targetCloseBtn]} onPress={handleCloseTmuxTarget}>
+                    <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Close</Text>
+                  </Pressable>
+                </View>
+                {tmuxTargetMenuOpen ? (
+                  <View style={styles.targetMenu}>
+                    {tmuxTargets.length === 0 ? (
+                      <Text style={[styles.metaText, dynamicUi.metaText]}>No tmux panes yet. Tap Refresh.</Text>
+                    ) : (
+                      tmuxTargets.map((target) => (
+                        <Pressable
+                          key={target}
+                          style={[
+                            styles.targetMenuItem,
+                            selectedTmuxTarget === target ? styles.targetMenuItemActive : undefined,
+                          ]}
+                          onPress={() => handleSelectTmuxTarget(target)}
+                        >
+                          <Text style={[styles.targetMenuItemText, dynamicUi.targetMenuItemText]}>{target}</Text>
+                        </Pressable>
+                      ))
+                    )}
+                  </View>
+                ) : null}
+
+                <Text style={[styles.metaText, dynamicUi.metaText]}>
+                  {agentText} | lines: {tmuxLines} | target: {selectedTmuxTarget || "(none)"}
+                </Text>
+              </>
+            ) : null}
 
             {!(workMode === "tmux" && hideTfclawWindowInTmux) ? (
               <ScrollView
                 ref={chatScrollRef}
-                style={styles.chatList}
+                style={[styles.chatList, ignoreTopPanels ? styles.chatListIgnore : undefined]}
                 contentContainerStyle={styles.chatListContent}
                 keyboardShouldPersistTaps="handled"
                 onContentSizeChange={() => chatScrollRef.current?.scrollToEnd({ animated: true })}
               >
                 {messages.length === 0 ? (
-                  <Text style={styles.emptyText}>No messages yet.</Text>
+                  <Text style={[styles.emptyText, dynamicUi.emptyText]}>No messages yet.</Text>
                 ) : (
                   messages.map(renderMessage)
                 )}
@@ -1238,10 +1418,17 @@ export default function App() {
 
             {workMode === "tmux" ? (
               <View
-                style={[styles.terminalWrap, hideTfclawWindowInTmux ? styles.terminalWrapFullscreen : styles.terminalWrapInline]}
+                style={[
+                  styles.terminalWrap,
+                  hideTfclawWindowInTmux
+                    ? styles.terminalWrapFullscreen
+                    : ignoreTopPanels
+                      ? styles.terminalWrapSplit
+                      : styles.terminalWrapInline,
+                ]}
                 onLayout={() => scrollOutputsToEnd(false)}
               >
-                <Text style={styles.metaText}>tmux renderer</Text>
+                <Text style={[styles.metaText, dynamicUi.metaText]}>tmux renderer</Text>
                 <ScrollView
                   ref={terminalScrollRef}
                   style={styles.terminalView}
@@ -1249,14 +1436,14 @@ export default function App() {
                   keyboardShouldPersistTaps="handled"
                   onContentSizeChange={() => terminalScrollRef.current?.scrollToEnd({ animated: true })}
                 >
-                  <Text style={styles.terminalText}>{terminalDisplay}</Text>
+                  <Text style={[styles.terminalText, dynamicUi.terminalText]}>{terminalDisplay}</Text>
                 </ScrollView>
               </View>
             ) : null}
 
             <View style={styles.sendRow}>
               <TextInput
-                style={[styles.input, styles.sendInput]}
+                style={[styles.input, dynamicUi.input, styles.sendInput]}
                 value={inputText}
                 onChangeText={setInputText}
                 placeholder={workMode === "tmux" ? "tmux command..." : "Type command or /tmux ..."}
@@ -1266,28 +1453,28 @@ export default function App() {
                 blurOnSubmit={false}
                 onSubmitEditing={sendChat}
               />
-              <Pressable style={[styles.btn, styles.btnPrimary]} onPress={sendChat}>
-                <Text style={styles.btnText}>Send</Text>
+              <Pressable style={[styles.btn, dynamicUi.btn, styles.btnPrimary]} onPress={sendChat}>
+                <Text style={[styles.btnText, dynamicUi.btnText]}>Send</Text>
               </Pressable>
             </View>
             <View style={styles.keyToggleRow}>
               <Pressable
-                style={[styles.btn, styles.keyToggleBtn]}
+                style={[styles.btn, dynamicUi.btn, styles.keyToggleBtn]}
                 onPress={() => setTmuxKeyPanelOpen((prev) => !prev)}
               >
-                <Text style={styles.btnText}>{tmuxKeyPanelOpen ? "Hide Key" : "Key"}</Text>
+                <Text style={[styles.btnText, dynamicUi.btnText]}>{tmuxKeyPanelOpen ? "Hide Key" : "Key"}</Text>
               </Pressable>
-              <Text style={styles.metaText}>Send /tkey shortcuts to tmux</Text>
+              <Text style={[styles.metaText, dynamicUi.metaText]}>Send /tkey shortcuts to tmux</Text>
             </View>
             {tmuxKeyPanelOpen ? (
               <View style={styles.keyPanel}>
                 {TMUX_KEY_SHORTCUTS.map((item) => (
                   <Pressable
                     key={item.token}
-                    style={styles.keyPanelBtn}
+                    style={[styles.keyPanelBtn, dynamicUi.keyPanelBtn]}
                     onPress={() => handleTmuxKeyShortcut(item.token)}
                   >
-                    <Text style={styles.keyPanelBtnText}>{item.label}</Text>
+                    <Text style={[styles.keyPanelBtnText, dynamicUi.keyPanelBtnText]}>{item.label}</Text>
                   </Pressable>
                 ))}
               </View>
@@ -1302,10 +1489,10 @@ export default function App() {
         >
           <View style={styles.dialogBackdrop}>
             <View style={styles.dialogCard}>
-              <Text style={styles.dialogTitle}>New tmux window</Text>
-              <Text style={styles.metaText}>name:</Text>
+              <Text style={[styles.dialogTitle, dynamicUi.dialogTitle]}>New tmux window</Text>
+              <Text style={[styles.metaText, dynamicUi.metaText]}>name:</Text>
               <TextInput
-                style={styles.input}
+                style={[styles.input, dynamicUi.input]}
                 value={tmuxNewNameInput}
                 onChangeText={setTmuxNewNameInput}
                 placeholder="window-name"
@@ -1317,11 +1504,11 @@ export default function App() {
                 onSubmitEditing={handleCreateTmuxWindow}
               />
               <View style={styles.dialogActions}>
-                <Pressable style={[styles.linesApplyBtn, styles.dialogCancelBtn]} onPress={closeTmuxNewDialog}>
-                  <Text style={styles.linesApplyBtnText}>Cancel</Text>
+                <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn, styles.dialogCancelBtn]} onPress={closeTmuxNewDialog}>
+                  <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Cancel</Text>
                 </Pressable>
-                <Pressable style={[styles.linesApplyBtn, styles.dialogConfirmBtn]} onPress={handleCreateTmuxWindow}>
-                  <Text style={styles.linesApplyBtnText}>Create</Text>
+                <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn, styles.dialogConfirmBtn]} onPress={handleCreateTmuxWindow}>
+                  <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Create</Text>
                 </Pressable>
               </View>
             </View>
@@ -1350,6 +1537,57 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#2c434f",
   },
+  headerTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  headerTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  headerActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  headerScaleInputWrap: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#4f6a76",
+    backgroundColor: "#122129",
+    minWidth: 56,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  headerScaleInput: {
+    color: "#d9ecf5",
+    textAlign: "center",
+    fontWeight: "700",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    width: "100%",
+  },
+  headerActionBtn: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#4f6a76",
+    backgroundColor: "#2a4450",
+    minWidth: 74,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  headerActionBtnIgnore: {
+    backgroundColor: "#5b4f2f",
+    borderColor: "#8d7a46",
+  },
+  headerActionBtnText: {
+    color: "#d9ecf5",
+    fontWeight: "700",
+  },
   title: {
     color: "#d4f0f7",
     fontSize: 21,
@@ -1371,6 +1609,9 @@ const styles = StyleSheet.create({
   chatCard: {
     flex: 1,
     minHeight: 0,
+  },
+  chatCardIgnore: {
+    gap: 8,
   },
   label: {
     color: "#9cc7d4",
@@ -1562,6 +1803,10 @@ const styles = StyleSheet.create({
     borderColor: "#2c4350",
     backgroundColor: "#0b1418",
   },
+  chatListIgnore: {
+    flex: 1,
+    minHeight: 0,
+  },
   chatListContent: {
     padding: 10,
     gap: 8,
@@ -1577,6 +1822,11 @@ const styles = StyleSheet.create({
     minHeight: 130,
     maxHeight: 260,
     height: 210,
+    paddingTop: 8,
+  },
+  terminalWrapSplit: {
+    flex: 1,
+    minHeight: 0,
     paddingTop: 8,
   },
   terminalWrapFullscreen: {
