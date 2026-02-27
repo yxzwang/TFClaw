@@ -211,11 +211,11 @@ TFCLAW_RELAY_URL=wss://xxxxxxxxxx.com
 用这两个在手机app上login，显示connect就成功了。
 
 登录界面如下，最上面的A 50%可以点击切换比例，右边可以手动输入比例。
-![登陆界面](images/login.jpg)
+<img src="images/login.jpg" alt="登陆界面" width="320" />
 
 
 登陆后连接状态指示灯变绿，点击最上面ignore可以将terminal显示全屏：
-![登陆后](images/connected.jpg)
+<img src="images/connected.jpg" alt="登陆后" width="320" />
 
 
 2. 查看状态
