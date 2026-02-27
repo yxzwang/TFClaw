@@ -109,6 +109,7 @@ npm run dev:stack
 
 
 ### 3.1. 手机app服务启动
+具体查看[dockerdeployReadMe.md](https://github.com/yxzwang/TFClaw/blob/main/dockerdeployReadMe.md)
 
 1. 一键在docker中启动
 ```bash
@@ -126,11 +127,6 @@ TFCLAW_RELAY_URL=wss://xxxxxxxxxx.com
 3. 关闭服务
 ```bash
 ./scripts/deploy-docker-public.sh stop
-```
-4. 重启服务
-
-```bash
-./scripts/deploy-docker-public.sh restart
 ```
 
 注意服务第一次启动的token会随机生成，后续每次启动（重启）会复用原token，url会重新生成。
