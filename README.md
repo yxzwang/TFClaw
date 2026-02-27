@@ -47,9 +47,99 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP，并提供对应的app
   - 新建/关闭 terminal
   - 触发截图并显示最新图片（仅限windows端。）
 
-/tmux 命令解析如下：
 
+### /tmux 与 /passthrough 命令说明
 
+以下命令在飞书端、mobile 端、terminal 本地测试链路中保持一致：
+
+```text
+/tmux help
+/tmux status
+/tmux sessions
+/tmux panes [session]
+/tmux new [session]
+/tmux target <session:window.pane|id>
+/tmux close <id|session:window.pane>
+/tmux socket <path|default>
+/tmux lines <20-5000>
+/tmux wait <0-5000>
+/tmux stream <auto|on|off>
+/tmux capture [lines]
+/tmux key <key...>
+/tmux send <literal command>
+/passthrough on|off|status
+/pt on|off|status
+/t<subcommand> 作为 /tmux 子命令别名（例如 /tkey /ttarget /tcapture）
+```
+
+说明：
+1. `/tmux help`
+   显示 tmux 控制命令总览（相当于命令菜单），用于快速查看当前支持的子命令和语法。
+
+2. `/tmux status`
+   查看当前会话的 tmux 控制状态，包括：`passthrough` 开关、当前 `target`、`socket`、`capture_lines`、`wait_ms`、`stream_mode`。
+
+3. `/tmux sessions`
+   列出当前 tmux server 下可见的 session 列表（等价于 tmux 会话级概览）。
+
+4. `/tmux panes [session]`
+   列出 pane 清单；会返回可用于后续操作的编号 id（`[1] [2] ...`）。  
+   可选参数 `[session]` 用于只看某个 session；不传则列出可见 pane。  
+   返回结果中每个 pane 包含 `target/window/cmd/activity` 信息。
+
+5. `/tmux new [session]`
+   新建 tmux session（默认名 `tfclaw`），并把当前 target 自动切到 `${session}:0.0`。  
+   传 `[session]` 时按给定名称创建。
+
+6. `/tmux target <session:window.pane|id>`
+   切换当前操作目标 pane。  
+   参数既可用完整 target（如 `tfclaw:0.0`），也可用 `/tmux panes` 返回的编号 id。  
+   切换后会返回该 target 的最新 capture 内容。
+
+7. `/tmux close <id|session:window.pane>`
+   关闭指定 pane/window（支持编号 id 或完整 target）。  
+   若当前 target 正好属于被关闭窗口，会自动清空当前 target 并提示。
+
+8. `/tmux socket <path|default>`
+   设置或切换 tmux socket。  
+   传 `default` 恢复默认 socket；传具体 `path` 使用指定 socket。  
+   不带参数时返回当前 socket。
+
+9. `/tmux lines <20-5000>`
+   设置 capture 行数上限（用于后续 capture/send/key 返回内容长度）。  
+   值会被限制在 `20-5000`。不带参数时返回当前行数。
+
+10. `/tmux wait <0-5000>`
+    设置发送命令后抓取输出前的等待时间（毫秒）。  
+    值会被限制在 `0-5000`。不带参数时返回当前 wait 值。
+
+11. `/tmux stream <auto|on|off>`
+    设置流式输出策略：  
+    `auto`：对常见长任务命令自动启用流式；  
+    `on`：强制流式；  
+    `off`：关闭流式。  
+    不带参数时返回当前 stream 模式。
+
+12. `/tmux capture [lines]`
+    直接抓取当前 target 的屏幕内容并返回。  
+    可选 `[lines]` 可临时覆盖本次抓取行数（同样会被限制到 `20-5000`）。
+
+13. `/tmux key <key...>`
+    向当前 target 发送按键序列（不直接发送文字命令），例如 `Enter`、`Esc`、`Ctrl+C`、`^C`。  
+    支持多 token 组合，常用于中断、确认、方向键等控制动作。
+
+14. `/tmux send <literal command>`
+    将后续文本按“字面命令”发送到当前 target 并回车执行，再按当前 `wait/lines/stream` 规则回传输出。  
+    适合明确要求“原样发送”的场景。
+
+`/passthrough` 模式行为(支持简写为`/pt`)：
+
+- `/passthrough on`（或 `/pt on`）后，后续普通消息会持续直通当前 tmux target，直到 `/passthrough off`。
+- 若开启时尚未设置 target，会自动使用 `tfclaw:0.0`。
+- passthrough 开启时，`/tmux ...`、`/passthrough ...`、`/pt ...` 这些控制命令仍在本地解析，不会直通 tmux。
+- 如需强制把“看起来像本地控制命令”的 slash 文本发给 tmux，可在前面加一个 `/`，即使用 `//` 前缀（例如 `//tmux list-sessions`）。
+
+手机app端已实现上述大部分命令的直接按钮。
 
 ## 目录结构
 
@@ -120,6 +210,14 @@ TFCLAW_TOKEN=xxxxxxxxx
 TFCLAW_RELAY_URL=wss://xxxxxxxxxx.com
 用这两个在手机app上login，显示connect就成功了。
 
+登录界面如下，最上面的A 50%可以点击切换比例，右边可以手动输入比例。
+![登陆界面](images/login.jpg)
+
+
+登陆后连接状态指示灯变绿，点击最上面ignore可以将terminal显示全屏：
+![登陆后](images/connected.jpg)
+
+
 2. 查看状态
 ```bash
 ./scripts/deploy-docker-public.sh status
@@ -180,7 +278,7 @@ gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
 5. 运行在进程管理器下（systemd/pm2/docker restart policy）并开启日志监控与告警。
 
 ## 已知限制（MVP）
-
+- 目前飞书端动态窗口的跟踪还是没有做到预设的24h，原因未知。可以手动/tcapture查看目前运行情况。
 - 窗口枚举/窗口截图当前仅在 Windows agent 上实现；Linux/macOS 暂仅屏幕截图。
 - 未实现用户注册；身份依赖共享 token。
 - 使用手机app需要server连接公网，注意安全。
