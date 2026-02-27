@@ -168,7 +168,7 @@ packages/
 
 ---
 
-## Local Startup
+## Startup on Your Computer Or Linux Server.
 
 From project root:
 
