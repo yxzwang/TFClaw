@@ -1,7 +1,7 @@
 ﻿
 # Token-Free-Claw (TFClaw)
 
-- The OpenClaw core requires an API Key, which is too expensive.
+- The OpenClaw core requires an API Key, which is expensive.
 - Use OAuth? Claude refuses to provide OAuth access to third-party software.
 - The official Claude Code App is only available to Max subscription users.
 
