@@ -211,10 +211,12 @@ TFCLAW_RELAY_URL=wss://xxxxxxxxxx.com
 用这两个在手机app上login，显示connect就成功了。
 
 登录界面如下，最上面的A 50%可以点击切换比例，右边可以手动输入比例。
+
 <img src="images/login.jpg" alt="登陆界面" width="320" />
 
 
 登陆后连接状态指示灯变绿，点击最上面ignore可以将terminal显示全屏：
+
 <img src="images/connected.jpg" alt="登陆后" width="320" />
 
 
@@ -280,6 +282,5 @@ gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
 ## 已知限制（MVP）
 - 目前飞书端动态窗口的跟踪还是没有做到预设的24h，原因未知。可以手动/tcapture查看目前运行情况。
 - 窗口枚举/窗口截图当前仅在 Windows agent 上实现；Linux/macOS 暂仅屏幕截图。
-- 未实现用户注册；身份依赖共享 token。
 - 使用手机app需要server连接公网，注意安全。
 
