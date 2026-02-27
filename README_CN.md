@@ -45,7 +45,7 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP，并提供对应的app
   - 查看 terminal 列表并切换
   - 查看输出、输入命令、快捷键
   - 新建/关闭 terminal
-  - 触发截图并显示最新图片（仅限windows端。）
+  - 触发截图并显示最新图片（仅限windows端。）(使用 `/capture` 命令然后选择窗口号)
 
 
 ### /tmux 与 /passthrough 命令说明
