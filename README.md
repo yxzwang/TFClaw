@@ -62,7 +62,7 @@ Supports most `/tmux` and `/passthrough` commands via buttons:
 - View and switch terminal list
 - View output, send commands, use shortcut keys
 - Create/close terminal
-- Trigger screenshot and display latest image (Windows agent only)
+- Trigger screenshot and display latest image (Windows agent only) (use `/capture` command and choose the window id)
 
 ---
 
