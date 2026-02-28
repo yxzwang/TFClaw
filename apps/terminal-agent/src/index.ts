@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { URL } from "node:url";
 import {
@@ -75,6 +77,31 @@ interface TmuxPaneRow {
   activity: string;
 }
 
+interface NexChatBotConfig {
+  enabled: boolean;
+  baseUrl: string;
+  runPath: string;
+  apiKey: string;
+  timeoutMs: number;
+}
+
+interface NexChatBridgeRequest {
+  source: string;
+  channel: string;
+  selectionKey: string;
+  chatId: string;
+  senderId?: string;
+  senderOpenId?: string;
+  senderUserId?: string;
+  messageId?: string;
+  eventId?: string;
+  messageType: string;
+  text: string;
+  contentRaw: string;
+  contentObj: Record<string, unknown>;
+  feishuEvent: Record<string, unknown>;
+}
+
 function sanitizeTmuxName(name: string): string {
   return name
     .trim()
@@ -95,6 +122,175 @@ function parseBoolean(value: string | undefined, defaultValue: boolean): boolean
     return false;
   }
   return defaultValue;
+}
+
+function toObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function toString(value: unknown, fallback = ""): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  return fallback;
+}
+
+function toNumber(value: unknown, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function toBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+  }
+  return fallback;
+}
+
+function joinHttpUrl(baseUrl: string, pathValue: string): string {
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  const pathPart = pathValue.trim();
+  if (!base) {
+    return pathPart;
+  }
+  if (!pathPart) {
+    return base;
+  }
+  if (pathPart.startsWith("http://") || pathPart.startsWith("https://")) {
+    return pathPart;
+  }
+  return `${base}/${pathPart.replace(/^\/+/, "")}`;
+}
+
+function loadNexChatConfig(): NexChatBotConfig {
+  const configPath = path.resolve(process.env.TFCLAW_CONFIG_PATH ?? "config.json");
+  let rawConfig: Record<string, unknown> = {};
+
+  if (fs.existsSync(configPath)) {
+    try {
+      const rawText = fs.readFileSync(configPath, "utf8");
+      rawConfig = toObject(JSON.parse(rawText));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`[nexchat] failed to parse config file (${configPath}): ${msg}`);
+    }
+  }
+
+  const rawNex = toObject(rawConfig.nexchatbot);
+  const timeoutMs = Math.max(
+    1000,
+    Math.min(10 * 60 * 1000, toNumber(rawNex.timeoutMs, toNumber(process.env.TFCLAW_NEXCHATBOT_TIMEOUT_MS, 90_000))),
+  );
+
+  return {
+    enabled: toBoolean(rawNex.enabled, toBoolean(process.env.TFCLAW_NEXCHATBOT_ENABLED, false)),
+    baseUrl: toString(rawNex.baseUrl, process.env.TFCLAW_NEXCHATBOT_BASE_URL ?? "http://127.0.0.1:8094"),
+    runPath: toString(rawNex.runPath, process.env.TFCLAW_NEXCHATBOT_RUN_PATH ?? "/v1/main-agent/feishu-bridge"),
+    apiKey: toString(rawNex.apiKey, process.env.TFCLAW_NEXCHATBOT_API_KEY ?? ""),
+    timeoutMs,
+  };
+}
+
+class NexChatBridgeClient {
+  readonly enabled: boolean;
+
+  constructor(private readonly config: NexChatBotConfig) {
+    this.enabled = config.enabled && config.baseUrl.trim().length > 0;
+  }
+
+  endpointUrl(): string {
+    return joinHttpUrl(this.config.baseUrl, this.config.runPath);
+  }
+
+  async run(request: NexChatBridgeRequest): Promise<string> {
+    if (!this.enabled) {
+      throw new Error("nexchatbot bridge is disabled");
+    }
+
+    const timeoutMs = Math.max(1000, this.config.timeoutMs);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+      };
+      const apiKey = this.config.apiKey.trim();
+      if (apiKey) {
+        headers["x-api-key"] = apiKey;
+        headers.authorization = `Bearer ${apiKey}`;
+      }
+
+      const response = await fetch(this.endpointUrl(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+      const responseText = await response.text();
+
+      let payload: Record<string, unknown> = {};
+      if (responseText) {
+        try {
+          payload = toObject(JSON.parse(responseText));
+        } catch {
+          payload = {};
+        }
+      }
+
+      if (!response.ok) {
+        const detail = toString(payload.detail) || toString(payload.error) || responseText.slice(0, 300);
+        throw new Error(`http ${response.status}: ${detail || response.statusText}`);
+      }
+
+      const status = toString(payload.status).trim().toLowerCase();
+      if (status && status !== "ok") {
+        const detail = toString(payload.error) || toString(payload.detail) || "unknown error";
+        throw new Error(`bridge status=${status}: ${detail}`);
+      }
+
+      const reply = toString(payload.reply).trim();
+      if (reply) {
+        return reply;
+      }
+
+      const detail = toString(payload.error) || toString(payload.detail);
+      if (detail) {
+        throw new Error(detail);
+      }
+      return "(nexchatbot returned empty reply)";
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(`request timeout after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 const TOKEN = process.env.TFCLAW_TOKEN;
@@ -125,6 +321,8 @@ const TMUX_STREAM_WINDOW_MS = Number.parseInt(process.env.TFCLAW_TMUX_STREAM_WIN
 const TMUX_BOOTSTRAP_WINDOW = sanitizeTmuxName(process.env.TFCLAW_TMUX_BOOTSTRAP_WINDOW ?? "__tfclaw_bootstrap__");
 const TMUX_RESET_ON_BOOT = parseBoolean(process.env.TFCLAW_TMUX_RESET_ON_BOOT, true);
 const TMUX_PERSIST_SESSION_ON_SHUTDOWN = parseBoolean(process.env.TFCLAW_TMUX_PERSIST_SESSION_ON_SHUTDOWN, false);
+const NEXCHAT_CONFIG = loadNexChatConfig();
+const nexChatBridge = new NexChatBridgeClient(NEXCHAT_CONFIG);
 
 if (!TOKEN) {
   console.error("Missing TFCLAW_TOKEN. Example: TFCLAW_TOKEN=demo-token npm run dev --workspace @tfclaw/terminal-agent");
@@ -1636,7 +1834,7 @@ async function handlePassthroughCommand(sessionKey: string, rawCommand: string):
 
   if (action === "on" || action === "enable") {
     if (!state.target) {
-      state.target = "tfclaw:0.0";
+      state.target = `${TMUX_SESSION}:0.0`;
     }
     state.enabled = true;
     updateTmuxControlState(sessionKey, state);
@@ -1989,6 +2187,33 @@ async function handleTfclawTextCommand(
     );
   }
 
+  if (stripped) {
+    const userId = `mobile:${sessionKey}`;
+    if (!nexChatBridge.enabled) {
+      return "nexchatbot bridge is disabled. set `nexchatbot.enabled=true` and `nexchatbot.baseUrl` in config.";
+    }
+    try {
+      return await nexChatBridge.run({
+        source: "tfclaw_mobile_agent",
+        channel: "mobile",
+        selectionKey: sessionKey,
+        chatId: userId,
+        senderId: userId,
+        senderUserId: userId,
+        messageType: "text",
+        text: stripped,
+        contentRaw: "",
+        contentObj: {
+          text: stripped,
+        },
+        feishuEvent: {},
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return `nexchatbot bridge failed: ${message}`;
+    }
+  }
+
   return "Unknown command. Use `/help` or `/tmux help`.";
 }
 
@@ -2118,6 +2343,12 @@ async function shutdown(): Promise<void> {
 
 async function bootstrap(): Promise<void> {
   try {
+    if (nexChatBridge.enabled) {
+      console.log(`[nexchat] enabled -> ${nexChatBridge.endpointUrl()}`);
+    } else {
+      console.log("[nexchat] disabled");
+    }
+
     await ensureTmuxAvailable();
 
     if (TMUX_RESET_ON_BOOT) {

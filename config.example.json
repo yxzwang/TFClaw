@@ -3,6 +3,13 @@
     "token": "demo-token",
     "url": "ws://127.0.0.1:8787"
   },
+  "nexchatbot": {
+    "enabled": false,
+    "baseUrl": "http://127.0.0.1:8094",
+    "runPath": "/v1/main-agent/feishu-bridge",
+    "apiKey": "",
+    "timeoutMs": 90000
+  },
   "channels": {
     "feishu": {
       "enabled": true,

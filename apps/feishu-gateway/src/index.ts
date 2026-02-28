@@ -96,8 +96,17 @@ interface RelayConfig {
   url: string;
 }
 
+interface NexChatBotConfig {
+  enabled: boolean;
+  baseUrl: string;
+  runPath: string;
+  apiKey: string;
+  timeoutMs: number;
+}
+
 interface GatewayConfig {
   relay: RelayConfig;
+  nexchatbot: NexChatBotConfig;
   channels: ChannelsConfig;
 }
 
@@ -157,13 +166,60 @@ interface MessageResponder {
   deleteMessage?(messageId: string): Promise<void>;
 }
 
+interface HistorySeedEntry {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+interface FeishuMentionEntry {
+  key: string;
+  name: string;
+  openId: string;
+  userId: string;
+}
+
+interface FeishuAtTagEntry {
+  key: string;
+  id: string;
+  name: string;
+}
+
 interface InboundTextContext {
   channel: ChannelName;
   chatId: string;
+  chatType: string;
+  isMentioned: boolean;
   senderId?: string;
+  senderOpenId?: string;
+  senderUserId?: string;
+  messageId?: string;
+  eventId?: string;
+  messageType: string;
+  contentRaw: string;
+  contentObj: Record<string, unknown>;
   text: string;
+  llmText: string;
+  rawEvent: Record<string, unknown>;
   allowFrom: string[];
   responder: MessageResponder;
+}
+
+interface NexChatBridgeRequest {
+  source: "tfclaw_feishu_gateway";
+  channel: ChannelName;
+  selectionKey: string;
+  chatId: string;
+  senderId?: string;
+  senderOpenId?: string;
+  senderUserId?: string;
+  messageId?: string;
+  eventId?: string;
+  messageType: string;
+  text: string;
+  contentRaw: string;
+  contentObj: Record<string, unknown>;
+  feishuEvent: Record<string, unknown>;
+  historySeed?: HistorySeedEntry[];
 }
 
 interface TerminalProgressSession {
@@ -189,6 +245,12 @@ interface CommandProgressSession {
   lastProgressBody?: string;
 }
 
+interface GroupBufferedMessage {
+  senderId: string;
+  text: string;
+  at: number;
+}
+
 interface ChatApp {
   readonly name: ChannelName;
   readonly enabled: boolean;
@@ -210,6 +272,23 @@ const REALTIME_FOREGROUND_COMMANDS = new Set([
   "deno",
   "tsx",
   "ts-node",
+]);
+
+const TMUX_SHORT_ALIAS_COMMANDS = new Set([
+  "/thelp",
+  "/tstatus",
+  "/tsessions",
+  "/tpanes",
+  "/tnew",
+  "/ttarget",
+  "/tclose",
+  "/tsocket",
+  "/tlines",
+  "/twait",
+  "/tstream",
+  "/tcapture",
+  "/tkey",
+  "/tsend",
 ]);
 
 function toObject(value: unknown): Record<string, unknown> {
@@ -245,6 +324,7 @@ const COMMAND_RESULT_TIMEOUT_MS = Math.max(
 );
 const FEISHU_ACK_REACTION = toString(process.env.TFCLAW_FEISHU_ACK_REACTION, "OnIt").trim() || "OnIt";
 const FEISHU_ACK_REACTION_ENABLED = toBoolean(process.env.TFCLAW_FEISHU_ACK_REACTION_ENABLED, true);
+const FEISHU_DEBUG_INBOUND = toBoolean(process.env.TFCLAW_FEISHU_DEBUG_INBOUND, false);
 
 function toBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") {
@@ -285,6 +365,280 @@ function toStringArray(value: unknown, fallback: string[] = []): string[] {
     return parseCsv(value);
   }
   return fallback;
+}
+
+function normalizeLeadingCommandSlash(text: string): string {
+  const leadingSpaces = text.match(/^\s*/)?.[0] ?? "";
+  const rest = text.slice(leadingSpaces.length);
+  if (rest.startsWith("／")) {
+    return `${leadingSpaces}/${rest.slice(1)}`;
+  }
+  return text;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripLeadingFeishuMentions(text: string, mentionKeys: string[]): string {
+  let current = text;
+  const normalizedKeys = mentionKeys
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const trimmedStart = current.trimStart();
+
+    // remove explicit <at ...>...</at> prefixes
+    const atTag = trimmedStart.match(/^<at\b[^>]*>[\s\S]*?<\/at>\s*/i);
+    if (atTag) {
+      current = trimmedStart.slice(atTag[0].length);
+      changed = true;
+      continue;
+    }
+
+    // remove mention keys emitted by Feishu, e.g. @_user_1
+    const matchedKey = normalizedKeys.find((key) => trimmedStart.startsWith(key));
+    if (matchedKey) {
+      current = trimmedStart.slice(matchedKey.length).trimStart();
+      changed = true;
+    }
+  }
+
+  return current;
+}
+
+function normalizeFeishuInboundText(rawText: string, mentionKeys: string[]): string {
+  const noInvisible = rawText.replace(/\u200b/g, " ");
+  const withoutMentions = stripLeadingFeishuMentions(noInvisible, mentionKeys);
+  return normalizeLeadingCommandSlash(withoutMentions).trim();
+}
+
+function extractFeishuInlineMentionKeys(rawText: string): string[] {
+  if (!rawText) {
+    return [];
+  }
+  const matches = rawText.match(/@_user_\d+/g) ?? [];
+  return Array.from(new Set(matches.map((item) => item.trim()).filter(Boolean)));
+}
+
+function decodeHtmlEntity(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function extractFeishuAtTags(rawText: string): FeishuAtTagEntry[] {
+  if (!rawText) {
+    return [];
+  }
+
+  const results: FeishuAtTagEntry[] = [];
+  const seen = new Set<string>();
+  const pattern = /<at\b([^>]*)>([\s\S]*?)<\/at>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(rawText)) !== null) {
+    const attrs = match[1] ?? "";
+    const body = match[2] ?? "";
+
+    let id = "";
+    let key = "";
+    const attrPattern = /([a-zA-Z_][\w:-]*)\s*=\s*(['"])(.*?)\2/g;
+    let attrMatch: RegExpExecArray | null;
+    while ((attrMatch = attrPattern.exec(attrs)) !== null) {
+      const name = (attrMatch[1] ?? "").trim().toLowerCase();
+      const value = decodeHtmlEntity((attrMatch[3] ?? "").trim());
+      if (!value) {
+        continue;
+      }
+      if (name === "user_id" || name === "open_id" || name === "id") {
+        id = value;
+      }
+      if (name === "key" || name === "mention_key") {
+        key = value;
+      }
+    }
+
+    const name = decodeHtmlEntity(body.replace(/<[^>]*>/g, "").trim());
+    const dedupKey = `${key}|${id}|${name}`;
+    if (seen.has(dedupKey)) {
+      continue;
+    }
+    seen.add(dedupKey);
+    results.push({ key, id, name });
+  }
+
+  return results;
+}
+
+function extractFeishuMentions(messageObj: Record<string, unknown>, contentObj: Record<string, unknown>): FeishuMentionEntry[] {
+  const mentions: FeishuMentionEntry[] = [];
+  const seen = new Set<string>();
+  const collect = (value: unknown): void => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    for (const item of value) {
+      const mentionObj = toObject(item);
+      const mentionIdObj = toObject(mentionObj.id);
+      const key = toString(mentionObj.key).trim();
+      const name = toString(mentionObj.name, toString(mentionObj.user_name)).trim();
+      const openId = toString(mentionIdObj.open_id, toString(mentionObj.open_id)).trim();
+      const userId = toString(mentionIdObj.user_id, toString(mentionObj.user_id)).trim();
+      if (!key && !name && !openId && !userId) {
+        continue;
+      }
+      const dedupKey = `${key}|${name}|${openId}|${userId}`;
+      if (seen.has(dedupKey)) {
+        continue;
+      }
+      seen.add(dedupKey);
+      mentions.push({
+        key,
+        name,
+        openId,
+        userId,
+      });
+    }
+  };
+  collect(messageObj.mentions);
+  collect(contentObj.mentions);
+  return mentions;
+}
+
+function mentionKeys(entries: FeishuMentionEntry[]): string[] {
+  return entries
+    .map((entry) => entry.key.trim())
+    .filter(Boolean);
+}
+
+function isFeishuMessageMentionedToBot(
+  entries: FeishuMentionEntry[],
+  botOpenId: string,
+  botName: string,
+  appId: string,
+  options?: {
+    atTags?: FeishuAtTagEntry[];
+    mentionKeys?: string[];
+  },
+): boolean {
+  const atTags = options?.atTags ?? [];
+  const inlineMentionKeys = options?.mentionKeys ?? [];
+  if (entries.length === 0) {
+    if (atTags.length === 0) {
+      const hasFallbackInlineMention = inlineMentionKeys.length === 1 && inlineMentionKeys[0] === "@_user_0";
+      if (!botOpenId.trim() && !botName.trim() && hasFallbackInlineMention) {
+        return true;
+      }
+      return false;
+    }
+  }
+
+  const normalizedBotOpenId = botOpenId.trim();
+  const normalizedBotName = botName.trim();
+  const normalizedAppId = appId.trim();
+  for (const entry of entries) {
+    if (normalizedBotOpenId && (entry.openId === normalizedBotOpenId || entry.userId === normalizedBotOpenId)) {
+      return true;
+    }
+    if (normalizedBotName && entry.name && (entry.name === normalizedBotName || entry.name.includes(normalizedBotName))) {
+      return true;
+    }
+    if (normalizedAppId && (entry.openId === normalizedAppId || entry.userId === normalizedAppId)) {
+      return true;
+    }
+  }
+
+  for (const entry of atTags) {
+    const atId = entry.id.trim();
+    if (normalizedBotOpenId && atId === normalizedBotOpenId) {
+      return true;
+    }
+    if (normalizedAppId && atId === normalizedAppId) {
+      return true;
+    }
+    if (normalizedBotName && entry.name && (entry.name === normalizedBotName || entry.name.includes(normalizedBotName))) {
+      return true;
+    }
+  }
+
+  if (!normalizedBotOpenId && !normalizedBotName && entries.length === 1 && entries[0]?.key === "@_user_0") {
+    return true;
+  }
+  if (!normalizedBotOpenId && !normalizedBotName && atTags.length === 1) {
+    return true;
+  }
+
+  return false;
+}
+
+function replaceFeishuMentionTokens(
+  rawText: string,
+  entries: FeishuMentionEntry[],
+  botOpenId: string,
+  botName: string,
+): string {
+  let output = rawText.replace(/\u200b/g, " ").replace(/@_all/g, "@全体成员");
+  const normalizedBotOpenId = botOpenId.trim();
+  const normalizedBotName = botName.trim();
+
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) {
+      continue;
+    }
+    const isBotMention =
+      (normalizedBotOpenId.length > 0 && (entry.openId === normalizedBotOpenId || entry.userId === normalizedBotOpenId))
+      || (normalizedBotName.length > 0 && entry.name.length > 0
+        && (entry.name === normalizedBotName || entry.name.includes(normalizedBotName)));
+    if (isBotMention) {
+      output = output.replace(new RegExp(`${escapeRegExp(key)}\\s*`, "g"), "");
+      continue;
+    }
+    if (entry.name) {
+      output = output.split(key).join(`@${entry.name}`);
+    }
+  }
+
+  return output
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n +/g, "\n")
+    .trim();
+}
+
+function buildFeishuResourceHint(messageType: string, contentObj: Record<string, unknown>, messageId: string): string {
+  const normalizedType = messageType.trim().toLowerCase();
+  if (!["image", "file", "media", "video", "audio"].includes(normalizedType)) {
+    return "";
+  }
+
+  let fileKey = "";
+  let name = "";
+  if (normalizedType === "image") {
+    fileKey = toString(contentObj.image_key).trim();
+    name = toString(contentObj.image_name, `image_${messageId || "unknown"}.png`).trim();
+  } else {
+    fileKey = toString(contentObj.file_key, toString(contentObj.media_id)).trim();
+    name = toString(contentObj.file_name, toString(contentObj.file, `${normalizedType}_${messageId || "unknown"}`)).trim();
+  }
+
+  const parts = [
+    `[附件待取] 类型: ${normalizedType}`,
+    `文件名: ${name || "未命名"}`,
+    `message_id: ${messageId || "unknown"}`,
+  ];
+  if (fileKey) {
+    parts.push(`file_key: ${fileKey}`);
+  }
+  parts.push("下载提示: 调用 download_message_resource 获取并解析内容");
+  return parts.join(" | ");
 }
 
 function mergeNoProxyHosts(hosts: string[]): void {
@@ -358,6 +712,100 @@ function describeSdkError(error: unknown): string {
   }
 
   return parts.join(" | ");
+}
+
+function joinHttpUrl(baseUrl: string, pathValue: string): string {
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  const pathPart = pathValue.trim();
+  if (!base) {
+    return pathPart;
+  }
+  if (!pathPart) {
+    return base;
+  }
+  if (pathPart.startsWith("http://") || pathPart.startsWith("https://")) {
+    return pathPart;
+  }
+  return `${base}/${pathPart.replace(/^\/+/, "")}`;
+}
+
+class NexChatBridgeClient {
+  readonly enabled: boolean;
+
+  constructor(private readonly config: NexChatBotConfig) {
+    this.enabled = config.enabled && config.baseUrl.trim().length > 0;
+  }
+
+  private endpointUrl(): string {
+    return joinHttpUrl(this.config.baseUrl, this.config.runPath);
+  }
+
+  async run(request: NexChatBridgeRequest): Promise<string> {
+    if (!this.enabled) {
+      throw new Error("nexchatbot bridge is disabled");
+    }
+
+    const timeoutMs = Math.max(1000, this.config.timeoutMs);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+      };
+      const apiKey = this.config.apiKey.trim();
+      if (apiKey) {
+        headers["x-api-key"] = apiKey;
+        headers.authorization = `Bearer ${apiKey}`;
+      }
+
+      const response = await fetch(this.endpointUrl(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+      const responseText = await response.text();
+
+      let payload: Record<string, unknown> = {};
+      if (responseText) {
+        try {
+          payload = toObject(JSON.parse(responseText));
+        } catch {
+          payload = {};
+        }
+      }
+
+      if (!response.ok) {
+        const detail = toString(payload.detail) || toString(payload.error) || responseText.slice(0, 300);
+        throw new Error(`http ${response.status}: ${detail || response.statusText}`);
+      }
+
+      const status = toString(payload.status).trim().toLowerCase();
+      if (status && status !== "ok") {
+        const detail = toString(payload.error) || toString(payload.detail) || "unknown error";
+        throw new Error(`bridge status=${status}: ${detail}`);
+      }
+
+      const reply = toString(payload.reply).trim();
+      if (reply) {
+        return reply;
+      }
+
+      const detail = toString(payload.error) || toString(payload.detail);
+      if (detail) {
+        throw new Error(detail);
+      }
+      return "(nexchatbot returned empty reply)";
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(`request timeout after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function renderTerminalStream(raw: string): RenderedTerminalOutput {
@@ -501,6 +949,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
   }
 
   const rawRelay = toObject(rawConfig.relay);
+  const rawNexChatBot = toObject(rawConfig.nexchatbot);
   const rawChannels = toObject(rawConfig.channels);
 
   const rawFeishu = toObject(rawChannels.feishu);
@@ -520,6 +969,15 @@ function loadGatewayConfig(): LoadedGatewayConfig {
   const rawSlack = toObject(rawChannels.slack);
   const rawQq = toObject(rawChannels.qq);
 
+  const nexChatBotEnabledFallback = toBoolean(process.env.TFCLAW_NEXCHATBOT_ENABLED, false);
+  const nexChatBotBaseUrl = toString(rawNexChatBot.baseUrl, process.env.TFCLAW_NEXCHATBOT_BASE_URL ?? "http://127.0.0.1:8094");
+  const nexChatBotRunPath = toString(rawNexChatBot.runPath, process.env.TFCLAW_NEXCHATBOT_RUN_PATH ?? "/v1/main-agent/feishu-bridge");
+  const nexChatBotApiKey = toString(rawNexChatBot.apiKey, process.env.TFCLAW_NEXCHATBOT_API_KEY ?? "");
+  const nexChatBotTimeoutMs = Math.max(
+    1000,
+    Math.min(10 * 60 * 1000, toNumber(rawNexChatBot.timeoutMs, toNumber(process.env.TFCLAW_NEXCHATBOT_TIMEOUT_MS, 90_000))),
+  );
+
   const relayToken = toString(rawRelay.token, process.env.TFCLAW_TOKEN ?? "");
   if (!relayToken) {
     throw new Error("missing relay token. set relay.token in config.json or TFCLAW_TOKEN in env.");
@@ -529,6 +987,13 @@ function loadGatewayConfig(): LoadedGatewayConfig {
     relay: {
       token: relayToken,
       url: toString(rawRelay.url, process.env.TFCLAW_RELAY_URL ?? "ws://127.0.0.1:8787"),
+    },
+    nexchatbot: {
+      enabled: toBoolean(rawNexChatBot.enabled, nexChatBotEnabledFallback),
+      baseUrl: nexChatBotBaseUrl,
+      runPath: nexChatBotRunPath,
+      apiKey: nexChatBotApiKey,
+      timeoutMs: nexChatBotTimeoutMs,
     },
     channels: {
       whatsapp: {
@@ -958,10 +1423,13 @@ class TfclawCommandRouter {
   private chatPassthroughEnabled = new Map<string, boolean>();
   private chatCaptureSelections = new Map<string, ChatCaptureSelection>();
   private chatModes = new Map<string, ChatInteractionMode>();
+  private groupMessageBuffer = new Map<string, GroupBufferedMessage[]>();
   private progressSessions = new Map<string, TerminalProgressSession>();
   private commandProgressSessions = new Map<string, CommandProgressSession>();
   private activeCommandRequestBySelection = new Map<string, string>();
   private readonly progressPollMs = 1200;
+  private readonly groupBufferTtlMs = 30_000;
+  private readonly groupBufferMaxPerSender = 10;
   private readonly progressRecallDelayMs = Math.max(
     80,
     Math.min(2000, toNumber(process.env.TFCLAW_PROGRESS_RECALL_DELAY_MS, 350)),
@@ -969,7 +1437,10 @@ class TfclawCommandRouter {
   private readonly progressIdleTimeoutMs = 10 * 60 * 1000;
   private readonly progressMaxLifetimeMs = 30 * 60 * 1000;
 
-  constructor(private readonly relay: RelayBridge) {}
+  constructor(
+    private readonly relay: RelayBridge,
+    private readonly nexChatBridge: NexChatBridgeClient,
+  ) {}
 
   private selectionKey(channel: ChannelName, chatId: string): string {
     return `${channel}:${chatId}`;
@@ -1028,6 +1499,161 @@ class TfclawCommandRouter {
     }
     const selectedId = this.chatTerminalSelection.get(selectionKey);
     return selectedId ? `terminal:${selectedId}` : "terminal";
+  }
+
+  private isTmuxMode(selectionKey: string): boolean {
+    const mode = this.getMode(selectionKey);
+    const passthroughEnabled = Boolean(this.chatPassthroughEnabled.get(selectionKey));
+    return mode === "terminal" || passthroughEnabled;
+  }
+
+  private senderBufferKey(ctx: InboundTextContext): string {
+    return (ctx.senderUserId || ctx.senderOpenId || ctx.senderId || "unknown").trim() || "unknown";
+  }
+
+  private isGroupChat(ctx: InboundTextContext): boolean {
+    return ctx.chatType.trim().toLowerCase() === "group";
+  }
+
+  private hasPendingCaptureSelection(selectionKey: string): boolean {
+    return this.chatCaptureSelections.has(selectionKey);
+  }
+
+  private isTmuxControlCommand(text: string): boolean {
+    const trimmed = text.trim().toLowerCase();
+    if (!trimmed) {
+      return false;
+    }
+    if (trimmed.startsWith("/tmux") || trimmed.startsWith("/passthrough") || trimmed.startsWith("/pt")) {
+      return true;
+    }
+    const firstToken = trimmed.split(/\s+/, 1)[0] ?? "";
+    return TMUX_SHORT_ALIAS_COMMANDS.has(firstToken);
+  }
+
+  private pruneGroupBuffer(selectionKey: string): void {
+    const current = this.groupMessageBuffer.get(selectionKey);
+    if (!current || current.length === 0) {
+      return;
+    }
+    const now = Date.now();
+    const next = current.filter((item) => now - item.at <= this.groupBufferTtlMs);
+    if (next.length === 0) {
+      this.groupMessageBuffer.delete(selectionKey);
+      return;
+    }
+    if (next.length !== current.length) {
+      this.groupMessageBuffer.set(selectionKey, next);
+    }
+  }
+
+  private bufferGroupMessage(selectionKey: string, senderId: string, text: string): void {
+    const content = text.trim();
+    if (!content) {
+      return;
+    }
+
+    this.pruneGroupBuffer(selectionKey);
+    const list = this.groupMessageBuffer.get(selectionKey) ?? [];
+    const last = list[list.length - 1];
+    if (last && last.senderId === senderId && last.text === content) {
+      return;
+    }
+    list.push({
+      senderId,
+      text: content,
+      at: Date.now(),
+    });
+
+    let senderCount = 0;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      if (list[i]?.senderId !== senderId) {
+        continue;
+      }
+      senderCount += 1;
+      if (senderCount > this.groupBufferMaxPerSender) {
+        list.splice(i, 1);
+      }
+    }
+
+    this.groupMessageBuffer.set(selectionKey, list);
+  }
+
+  private consumeGroupBufferedMessages(selectionKey: string, senderId: string): string[] {
+    this.pruneGroupBuffer(selectionKey);
+    const list = this.groupMessageBuffer.get(selectionKey);
+    if (!list || list.length === 0) {
+      return [];
+    }
+
+    const mine: string[] = [];
+    const others: GroupBufferedMessage[] = [];
+    for (const item of list) {
+      if (item.senderId === senderId) {
+        mine.push(item.text);
+      } else {
+        others.push(item);
+      }
+    }
+
+    if (others.length > 0) {
+      this.groupMessageBuffer.set(selectionKey, others);
+    } else {
+      this.groupMessageBuffer.delete(selectionKey);
+    }
+
+    return mine;
+  }
+
+  private toHistorySeed(texts: string[]): HistorySeedEntry[] | undefined {
+    if (!texts || texts.length === 0) {
+      return undefined;
+    }
+    return texts
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => ({
+        role: "user" as const,
+        content: item,
+      }));
+  }
+
+  private isTfclawPresetCommand(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    const lowered = trimmed.toLowerCase();
+    if (lowered.startsWith("/tmux") || lowered.startsWith("/passthrough") || lowered.startsWith("/pt")) {
+      return true;
+    }
+
+    const firstToken = lowered.split(/\s+/, 1)[0] ?? "";
+    if (TMUX_SHORT_ALIAS_COMMANDS.has(firstToken)) {
+      return true;
+    }
+
+    if (trimmed.startsWith("/")) {
+      return /^\/(?:help|state|list|new|capture|attach|key|ctrlc|ctrld|use|close)(?:\s+|$)/i.test(trimmed);
+    }
+
+    if (["help", "state", "list", "new", "capture", "ctrlc", "ctrld"].includes(lowered)) {
+      return true;
+    }
+    if (/^(?:attach|key|use|close)\s+\S+/i.test(trimmed)) {
+      return true;
+    }
+
+    const colonIndex = trimmed.indexOf(":");
+    if (colonIndex > 0) {
+      const maybeTerminalRef = trimmed.slice(0, colonIndex).trim();
+      if (maybeTerminalRef && this.resolveTerminal(maybeTerminalRef)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private normalizeCommandLine(line: string): string {
@@ -2038,42 +2664,11 @@ class TfclawCommandRouter {
     await this.replyWithMode(chatId, responder, key, this.formatCaptureOptions(sources));
   }
 
-  async handleTextMessage(ctx: InboundTextContext): Promise<void> {
-    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
-    if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
-      await ctx.responder.replyText(ctx.chatId, "not allowed");
-      return;
-    }
-
-    const text = ctx.text.replace(/\r/g, "").trim();
-    if (!text) {
-      return;
-    }
-
-    const captureSelectionConsumed = await this.handleCaptureSelection(
-      ctx.channel,
-      ctx.chatId,
-      text,
-      ctx.responder,
-    );
-    if (captureSelectionConsumed) {
-      return;
-    }
-
-    const lowered = text.toLowerCase();
-    if (lowered === "/capture" || lowered === "capture") {
-      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
-      return;
-    }
-
-    const mode = this.getMode(selectionKey);
-    const passthroughEnabled = Boolean(this.chatPassthroughEnabled.get(selectionKey));
-    const isSlashCommand = text.startsWith("/");
-    const isDotControl = text.startsWith(".");
-    const outboundText = (mode === "terminal" || passthroughEnabled) && !isSlashCommand && !isDotControl
-      ? `/tmux send ${text}`
-      : text;
-
+  private async executeTfclawCommandRequest(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    outboundText: string,
+  ): Promise<void> {
     const requestId = this.relay.command({
       command: "tfclaw.command",
       text: outboundText,
@@ -2113,10 +2708,163 @@ class TfclawCommandRouter {
         selectionKey,
         `command failed: ${message}`,
       );
-      return;
     } finally {
       this.stopCommandProgressSession(requestId, false);
     }
+  }
+
+  private async routeToNexChatBot(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    options?: { text?: string; historySeed?: HistorySeedEntry[] },
+  ): Promise<void> {
+    if (!this.nexChatBridge.enabled) {
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        "nexchatbot bridge is disabled. set `nexchatbot.enabled=true` and `nexchatbot.baseUrl` in gateway config.",
+      );
+      return;
+    }
+
+    try {
+      const text = (options?.text ?? ctx.llmText ?? ctx.text).trim();
+      const reply = await this.nexChatBridge.run({
+        source: "tfclaw_feishu_gateway",
+        channel: ctx.channel,
+        selectionKey,
+        chatId: ctx.chatId,
+        senderId: ctx.senderId,
+        senderOpenId: ctx.senderOpenId,
+        senderUserId: ctx.senderUserId,
+        messageId: ctx.messageId,
+        eventId: ctx.eventId,
+        messageType: ctx.messageType,
+        text,
+        contentRaw: ctx.contentRaw,
+        contentObj: ctx.contentObj,
+        feishuEvent: ctx.rawEvent,
+        historySeed: options?.historySeed,
+      });
+      await ctx.responder.replyText(ctx.chatId, reply);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `nexchatbot bridge failed: ${message}`);
+    }
+  }
+
+  async handleInboundMessage(ctx: InboundTextContext): Promise<void> {
+    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
+    if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
+      await ctx.responder.replyText(ctx.chatId, "not allowed");
+      return;
+    }
+
+    const isGroupChat = this.isGroupChat(ctx);
+    const senderBufferKey = this.senderBufferKey(ctx);
+    const isTmuxMode = this.isTmuxMode(selectionKey);
+    let text = ctx.text.replace(/\r/g, "").trim();
+    let llmText = (ctx.llmText || text).replace(/\r/g, "").trim();
+
+    const allowGroupMessageWithoutMention = this.hasPendingCaptureSelection(selectionKey);
+
+    if (isGroupChat && !ctx.isMentioned && !allowGroupMessageWithoutMention) {
+      const buffered = llmText || text;
+      if (buffered) {
+        this.bufferGroupMessage(selectionKey, senderBufferKey, buffered);
+      }
+      if (FEISHU_DEBUG_INBOUND) {
+        console.log(
+          `[gateway] group message buffered (not mentioned): chat_id=${ctx.chatId} sender=${senderBufferKey} mode=${isTmuxMode ? "tmux" : "tfclaw"} text=${JSON.stringify((buffered || "").slice(0, 160))}`,
+        );
+      }
+      return;
+    }
+
+    if (isTmuxMode && ctx.messageType !== "text") {
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        `tmux mode only accepts text. current message_type=${ctx.messageType || "unknown"}`,
+      );
+      return;
+    }
+
+    if (ctx.messageType !== "text") {
+      await this.routeToNexChatBot(ctx, selectionKey);
+      return;
+    }
+
+    if (!text) {
+      if (!isGroupChat || !ctx.isMentioned) {
+        return;
+      }
+      const bufferedTexts = this.consumeGroupBufferedMessages(selectionKey, senderBufferKey);
+      const fallbackText = (llmText || bufferedTexts[bufferedTexts.length - 1] || "").trim();
+      if (!fallbackText) {
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          "我收到了 @，但没有识别到具体指令。请直接发送要执行的任务。",
+        );
+        return;
+      }
+      await this.routeToNexChatBot(
+        {
+          ...ctx,
+          text: fallbackText,
+          llmText: fallbackText,
+        },
+        selectionKey,
+        {
+          text: fallbackText,
+          historySeed: this.toHistorySeed(bufferedTexts),
+        },
+      );
+      return;
+    }
+
+    const captureSelectionConsumed = await this.handleCaptureSelection(
+      ctx.channel,
+      ctx.chatId,
+      text,
+      ctx.responder,
+    );
+    if (captureSelectionConsumed) {
+      return;
+    }
+
+    const lowered = text.toLowerCase();
+    if (lowered === "/capture" || lowered === "capture") {
+      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
+      return;
+    }
+
+    if (!isTmuxMode && !this.isTfclawPresetCommand(text)) {
+      const bufferedTexts = isGroupChat ? this.consumeGroupBufferedMessages(selectionKey, senderBufferKey) : [];
+      const nexchatText = (llmText || text).trim();
+      await this.routeToNexChatBot(
+        {
+          ...ctx,
+          text: nexchatText,
+          llmText: nexchatText,
+        },
+        selectionKey,
+        {
+          text: nexchatText,
+          historySeed: this.toHistorySeed(bufferedTexts),
+        },
+      );
+      return;
+    }
+
+    const isSlashCommand = text.startsWith("/");
+    const isDotControl = text.startsWith(".");
+    const outboundText = isTmuxMode && !isSlashCommand && !isDotControl ? `/tmux send ${text}` : text;
+    await this.executeTfclawCommandRequest(ctx, selectionKey, outboundText);
   }
 }
 // SECTION: chat apps
@@ -2125,6 +2873,8 @@ class FeishuChatApp implements ChatApp, MessageResponder {
   readonly enabled: boolean;
   private wsClient: Lark.WSClient | undefined;
   private larkClient: Lark.Client | undefined;
+  private botOpenId = "";
+  private botName = "";
   private readonly recentInboundKeys = new Map<string, number>();
   private readonly inboundDedupTtlMs = 5 * 60 * 1000;
 
@@ -2153,6 +2903,7 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       appId: this.config.appId,
       appSecret: this.config.appSecret,
     });
+    await this.initBotIdentity();
 
     this.wsClient = new Lark.WSClient({
       appId: this.config.appId,
@@ -2166,7 +2917,7 @@ class FeishuChatApp implements ChatApp, MessageResponder {
         verificationToken: this.config.verificationToken,
       }).register({
         "im.message.receive_v1": async (data: unknown) => {
-          await this.handleTextEvent(data);
+          await this.handleInboundEvent(data);
         },
       }),
     });
@@ -2189,6 +2940,97 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     this.wsClient = undefined;
   }
 
+  private async parseJsonResponse(response: { text: () => Promise<string> }): Promise<Record<string, unknown>> {
+    const raw = await response.text();
+    if (!raw) {
+      return {};
+    }
+    try {
+      return toObject(JSON.parse(raw));
+    } catch {
+      return {};
+    }
+  }
+
+  private async initBotIdentity(): Promise<void> {
+    const envOpenId = toString(process.env.BOT_OPEN_ID).trim();
+    const envName = toString(process.env.BOT_NAME).trim();
+    if (envOpenId) {
+      this.botOpenId = envOpenId;
+    }
+    if (envName) {
+      this.botName = envName;
+    }
+
+    try {
+      const authResponse = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          app_id: this.config.appId,
+          app_secret: this.config.appSecret,
+        }),
+      });
+      const authPayload = await this.parseJsonResponse(authResponse);
+      if (!authResponse.ok || toNumber(authPayload.code, -1) !== 0) {
+        throw new Error(`auth failed: code=${toString(authPayload.code, "unknown")} msg=${toString(authPayload.msg, "")}`);
+      }
+      const tenantToken = toString(authPayload.tenant_access_token).trim();
+      if (!tenantToken) {
+        throw new Error("tenant_access_token is empty");
+      }
+
+      const botResponse = await fetch("https://open.feishu.cn/open-apis/bot/v3/info", {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${tenantToken}`,
+        },
+      });
+      const botPayload = await this.parseJsonResponse(botResponse);
+      if (!botResponse.ok || toNumber(botPayload.code, -1) !== 0) {
+        throw new Error(`bot info failed: code=${toString(botPayload.code, "unknown")} msg=${toString(botPayload.msg, "")}`);
+      }
+      const botObj = toObject(botPayload.bot);
+      const openId = toString(botObj.open_id).trim();
+      const name = toString(botObj.app_name, toString(botObj.name)).trim();
+      if (openId) {
+        this.botOpenId = openId;
+      }
+      if (name) {
+        this.botName = name;
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`[gateway] failed to init bot identity via api: ${msg}`);
+    }
+
+    if (this.botOpenId || this.botName) {
+      console.log(`[gateway] bot identity: open_id=${this.botOpenId || "unknown"} name=${this.botName || "unknown"}`);
+    } else {
+      console.warn("[gateway] bot identity unavailable, group mention detection may be less accurate");
+    }
+  }
+
+  private isOtherBotSender(senderUserId: string, senderOpenId: string): boolean {
+    const userId = senderUserId.trim();
+    const openId = senderOpenId.trim();
+    if (!userId && !openId) {
+      return false;
+    }
+    if (this.botOpenId && (userId === this.botOpenId || openId === this.botOpenId)) {
+      return false;
+    }
+    if (userId === this.config.appId || openId === this.config.appId) {
+      return false;
+    }
+    if (userId.startsWith("cli_") || openId.startsWith("cli_")) {
+      return true;
+    }
+    return false;
+  }
+
   private isDuplicateInbound(key: string): boolean {
     const now = Date.now();
     for (const [storedKey, seenAt] of this.recentInboundKeys.entries()) {
@@ -2203,9 +3045,41 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     return false;
   }
 
-  private async sendTextMessage(chatId: string, text: string): Promise<{ messageId?: string }> {
+  private async sendTextMessage(
+    chatId: string,
+    text: string,
+    options?: {
+      chatType?: string;
+      replyToMessageId?: string;
+    },
+  ): Promise<{ messageId?: string }> {
     if (!this.larkClient) {
       throw new Error("feishu client not initialized");
+    }
+
+    const normalizedChatType = toString(options?.chatType).trim().toLowerCase();
+    const replyToMessageId = toString(options?.replyToMessageId).trim();
+    if (normalizedChatType === "group" && replyToMessageId) {
+      try {
+        const replyResult = await this.larkClient.im.v1.message.reply({
+          path: {
+            message_id: replyToMessageId,
+          },
+          data: {
+            msg_type: "text",
+            content: JSON.stringify({ text }),
+          },
+        });
+        const replyObj = toObject(replyResult);
+        const replyDataObj = toObject(replyObj.data);
+        return {
+          messageId: toString(replyDataObj.message_id) || toString(replyObj.message_id),
+        };
+      } catch (error) {
+        console.warn(
+          `[gateway] feishu group reply failed, fallback to chat send: ${describeSdkError(error)} | chat_id=${chatId} source_message_id=${replyToMessageId}`,
+        );
+      }
     }
 
     const result = await this.larkClient.im.v1.message.create({
@@ -2232,6 +3106,29 @@ class FeishuChatApp implements ChatApp, MessageResponder {
 
   async replyTextWithMeta(chatId: string, text: string): Promise<{ messageId?: string }> {
     return this.sendTextMessage(chatId, text);
+  }
+
+  private buildInboundResponder(chatType: string, sourceMessageId?: string): MessageResponder {
+    return {
+      replyText: async (chatId: string, text: string): Promise<void> => {
+        await this.sendTextMessage(chatId, text, {
+          chatType,
+          replyToMessageId: sourceMessageId,
+        });
+      },
+      replyTextWithMeta: async (chatId: string, text: string): Promise<{ messageId?: string }> => {
+        return this.sendTextMessage(chatId, text, {
+          chatType,
+          replyToMessageId: sourceMessageId,
+        });
+      },
+      replyImage: async (chatId: string, imageBase64: string): Promise<void> => {
+        await this.replyImage(chatId, imageBase64);
+      },
+      deleteMessage: async (messageId: string): Promise<void> => {
+        await this.deleteMessage(messageId);
+      },
+    };
   }
 
   async deleteMessage(messageId: string): Promise<void> {
@@ -2334,15 +3231,19 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     }
   }
 
-  private async handleTextEvent(data: unknown): Promise<void> {
+  private async handleInboundEvent(data: unknown): Promise<void> {
     const root = toObject(data);
-    const message = toObject(root.message);
-    const messageType = toString(message.message_type);
-    if (messageType !== "text") {
+    const eventPayload = toObject(root.event);
+    const inboundPayload = Object.keys(eventPayload).length > 0 ? eventPayload : root;
+    const message = toObject(inboundPayload.message);
+    const messageType = toString(message.message_type).trim().toLowerCase();
+    if (!messageType) {
       return;
     }
 
-    const eventHeader = toObject(root.header);
+    const rootHeader = toObject(root.header);
+    const payloadHeader = toObject(inboundPayload.header);
+    const eventHeader = Object.keys(rootHeader).length > 0 ? rootHeader : payloadHeader;
     const messageId = toString(message.message_id);
     const eventId = toString(eventHeader.event_id);
     const dedupKey = messageId || eventId;
@@ -2356,19 +3257,54 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       return;
     }
 
-    const rawContent = toString(message.content);
-    let text = "";
-    if (rawContent) {
-      try {
-        const contentObj = toObject(JSON.parse(rawContent));
-        text = toString(contentObj.text);
-      } catch {
-        text = rawContent;
+    const chatType = toString(message.chat_type).trim().toLowerCase() || "unknown";
+    const senderIdObj = toObject(toObject(inboundPayload.sender).sender_id);
+    const senderOpenId = toString(senderIdObj.open_id);
+    const senderUserId = toString(senderIdObj.user_id);
+    const normalizedSenderId = senderOpenId || senderUserId;
+    if (chatType === "group" && this.isOtherBotSender(senderUserId, senderOpenId)) {
+      if (FEISHU_DEBUG_INBOUND) {
+        console.log(
+          `[gateway] feishu group message ignored (other bot sender): chat_id=${chatId} sender_open_id=${senderOpenId || "unknown"} sender_user_id=${senderUserId || "unknown"}`,
+        );
       }
+      return;
     }
 
-    const sender = toObject(toObject(root.sender).sender_id);
-    const senderOpenId = toString(sender.open_id);
+    const rawContent = toString(message.content);
+    let contentObj: Record<string, unknown> = {};
+    if (rawContent) {
+      try {
+        contentObj = toObject(JSON.parse(rawContent));
+      } catch {
+        contentObj = {};
+      }
+    }
+    const rawText = messageType === "text" ? toString(contentObj.text, rawContent) : "";
+    const mentions = extractFeishuMentions(message, contentObj);
+    const inlineMentionKeys = messageType === "text" ? extractFeishuInlineMentionKeys(rawText) : [];
+    const mentionKeyList = Array.from(new Set([...mentionKeys(mentions), ...inlineMentionKeys]));
+    const atTags = messageType === "text" ? extractFeishuAtTags(rawText) : [];
+    const resourceHint = buildFeishuResourceHint(messageType, contentObj, messageId);
+    const text = messageType === "text" ? normalizeFeishuInboundText(rawText, mentionKeyList) : "";
+    const llmText = messageType === "text"
+      ? normalizeFeishuInboundText(
+        replaceFeishuMentionTokens(rawText, mentions, this.botOpenId, this.botName),
+        mentionKeyList,
+      )
+      : resourceHint;
+    const isMentioned = chatType !== "group"
+      ? true
+      : isFeishuMessageMentionedToBot(mentions, this.botOpenId, this.botName, this.config.appId, {
+        atTags,
+        mentionKeys: mentionKeyList,
+      });
+
+    if (FEISHU_DEBUG_INBOUND) {
+      console.log(
+        `[gateway] feishu inbound: message_id=${messageId || "unknown"} chat_id=${chatId} chat_type=${chatType} message_type=${messageType} mentioned=${isMentioned} mentions=${mentionKeyList.length} at_tags=${atTags.length} text=${JSON.stringify(text).slice(0, 220)}`,
+      );
+    }
 
     if (messageId && FEISHU_ACK_REACTION_ENABLED) {
       void this.addReaction(messageId).catch((error) => {
@@ -2377,18 +3313,35 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       });
     }
 
+    const responder = this.buildInboundResponder(chatType, messageId || undefined);
     try {
-      await this.router.handleTextMessage({
+      await this.router.handleInboundMessage({
         channel: "feishu",
         chatId,
-        senderId: senderOpenId || undefined,
+        chatType,
+        isMentioned,
+        senderId: normalizedSenderId || undefined,
+        senderOpenId: senderOpenId || undefined,
+        senderUserId: senderUserId || undefined,
+        messageId: messageId || undefined,
+        eventId: eventId || undefined,
+        messageType,
+        contentRaw: rawContent,
+        contentObj,
         text,
+        llmText: llmText || text,
+        rawEvent: inboundPayload,
         allowFrom: this.config.allowFrom,
-        responder: this,
+        responder,
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      await this.replyText(chatId, `failed to process message: ${msg}`);
+      try {
+        await responder.replyText(chatId, `failed to process message: ${msg}`);
+      } catch (replyError) {
+        const fallbackMsg = replyError instanceof Error ? replyError.message : String(replyError);
+        console.error(`[gateway] feishu failed to send error reply: ${fallbackMsg}`);
+      }
     }
   }
 }
@@ -2599,7 +3552,8 @@ async function bootstrap(): Promise<void> {
   }
 
   const relay = new RelayBridge(loaded.config.relay.url, loaded.config.relay.token, "feishu");
-  const router = new TfclawCommandRouter(relay);
+  const nexChatBridge = new NexChatBridgeClient(loaded.config.nexchatbot);
+  const router = new TfclawCommandRouter(relay, nexChatBridge);
   const chatApps = new ChatAppManager(loaded.config, router);
 
   relay.connect();
@@ -2609,6 +3563,13 @@ async function bootstrap(): Promise<void> {
   console.log("[gateway] TFClaw gateway started");
   console.log(`[gateway] config: ${loaded.configPath}${loaded.fromFile ? "" : " (env fallback)"}`);
   console.log(`[gateway] enabled channels: ${enabledChannels.length > 0 ? enabledChannels.join(", ") : "(none)"}`);
+  if (nexChatBridge.enabled) {
+    console.log(
+      `[gateway] nexchatbot bridge: enabled -> ${joinHttpUrl(loaded.config.nexchatbot.baseUrl, loaded.config.nexchatbot.runPath)}`,
+    );
+  } else {
+    console.log("[gateway] nexchatbot bridge: disabled");
+  }
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

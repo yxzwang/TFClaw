@@ -18,6 +18,9 @@ cp config.example.json config.json
 
 - `relay.token`
 - `relay.url`
+- `nexchatbot.enabled`
+- `nexchatbot.baseUrl`
+- `nexchatbot.runPath`（默认 `/v1/main-agent/feishu-bridge`）
 - `channels.feishu.enabled`
 - `channels.feishu.appId`
 - `channels.feishu.appSecret`
@@ -44,6 +47,19 @@ npm run start:gateway
 - `TFCLAW_TOKEN`
 - `TFCLAW_RELAY_URL`
 - `FEISHU_ALLOW_FROM`
+- `TFCLAW_NEXCHATBOT_ENABLED`
+- `TFCLAW_NEXCHATBOT_BASE_URL`
+- `TFCLAW_NEXCHATBOT_RUN_PATH`
+- `TFCLAW_NEXCHATBOT_API_KEY`
+- `TFCLAW_NEXCHATBOT_TIMEOUT_MS`
+
+## 模式分流规则
+
+- `tmux` 模式（terminal/passthrough）：仅接受 `text`，内容直通 tmux（保持原行为）
+- `tfclaw` 模式：
+  - 预设命令（`/tmux`、`/pt`、`/capture`、`/list`、`/new` 等）走 TFClaw 原流程
+  - 非预设消息（包括非 text）走 NexChatBot 桥接流程
+  - 返回给用户的内容直接使用 NexChatBot 的 `reply`
 
 ## Feishu 命令
 
