@@ -187,6 +187,8 @@ interface CommandProgressSession {
   queue: Promise<void>;
   lastProgressMessageId?: string;
   lastProgressBody?: string;
+  streamMode?: "auto" | "on" | "off";
+  streamOffIntroSent?: boolean;
 }
 
 interface ChatApp {
@@ -955,6 +957,7 @@ class RelayBridge {
 class TfclawCommandRouter {
   private chatTerminalSelection = new Map<string, string>();
   private chatTmuxTarget = new Map<string, string>();
+  private chatTmuxStreamMode = new Map<string, "auto" | "on" | "off">();
   private chatPassthroughEnabled = new Map<string, boolean>();
   private chatCaptureSelections = new Map<string, ChatCaptureSelection>();
   private chatModes = new Map<string, ChatInteractionMode>();
@@ -1061,11 +1064,34 @@ class TfclawCommandRouter {
     return undefined;
   }
 
+  private extractTmuxStreamMode(output: string): "auto" | "on" | "off" | undefined {
+    const source = output.trim();
+    if (!source) {
+      return undefined;
+    }
+
+    const statusMode = source.match(/- stream_mode:\s*(auto|on|off)\b/i);
+    if (statusMode?.[1]) {
+      return statusMode[1].toLowerCase() as "auto" | "on" | "off";
+    }
+
+    const setMode = source.match(/stream_mode set to\s+(auto|on|off)\b/i);
+    if (setMode?.[1]) {
+      return setMode[1].toLowerCase() as "auto" | "on" | "off";
+    }
+
+    return undefined;
+  }
+
   private updateModeFromResult(selectionKey: string, rawCommand: string, output: string): void {
     const command = this.normalizeCommandLine(rawCommand);
     const target = this.extractTmuxTarget(output);
     if (target) {
       this.chatTmuxTarget.set(selectionKey, target);
+    }
+    const streamMode = this.extractTmuxStreamMode(output);
+    if (streamMode) {
+      this.chatTmuxStreamMode.set(selectionKey, streamMode);
     }
 
     const passthroughOnCommand =
@@ -1206,6 +1232,8 @@ class TfclawCommandRouter {
       chatId,
       responder,
       queue: Promise.resolve(),
+      streamMode: this.chatTmuxStreamMode.get(selectionKey),
+      streamOffIntroSent: false,
     });
   }
 
@@ -1248,6 +1276,22 @@ class TfclawCommandRouter {
           return;
         }
         if (active.lastProgressBody === nextBody) {
+          return;
+        }
+
+        if (active.streamMode === "off") {
+          if (active.streamOffIntroSent) {
+            return;
+          }
+          await this.replyWithModeMeta(active.chatId, active.responder, active.selectionKey, nextBody);
+          await this.replyWithModeMeta(
+            active.chatId,
+            active.responder,
+            active.selectionKey,
+            "Tfclaw is waiting for Generating...",
+          );
+          active.streamOffIntroSent = true;
+          active.lastProgressBody = nextBody;
           return;
         }
 
