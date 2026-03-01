@@ -40,8 +40,8 @@ const UI_SCALE_DEFAULT_PERCENT = 50;
 const CONTENT_FONT_SCALES = [1, 1.2, 1.4] as const;
 const CONTENT_FONT_LABELS = ["M", "L", "XL"] as const;
 const UI_SCALE_MIN_PERCENT = 10;
-const UI_SCALE_MAX_PERCENT = 300;
-const UI_SCALE_STEPS = [10, 25, 50, 75, 100, 115, 130, 160, 200] as const;
+const UI_SCALE_MAX_PERCENT = 130;
+const UI_SCALE_STEPS = [10, 25, 50, 75, 100, 115, 130] as const;
 const TMUX_KEY_SHORTCUTS: Array<{ label: string; token: string }> = [
   { label: "^C", token: "^C" },
   { label: "Enter", token: "enter" },
