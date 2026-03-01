@@ -1,6 +1,10 @@
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AppState,
+  Clipboard,
+  Dimensions,
+  GestureResponderEvent,
   KeyboardAvoidingView,
   Keyboard,
   LayoutChangeEvent,
@@ -33,6 +37,8 @@ const DEFAULT_RELAY_URL = process.env.EXPO_PUBLIC_TFCLAW_RELAY_URL ?? "ws://127.
 const DEFAULT_TOKEN = process.env.EXPO_PUBLIC_TFCLAW_TOKEN ?? "demo-token";
 const LOGIN_PREFS_STORAGE_KEY = "@tfclaw/mobile/login-prefs";
 const UI_SCALE_DEFAULT_PERCENT = 50;
+const CONTENT_FONT_SCALES = [1, 1.2, 1.4] as const;
+const CONTENT_FONT_LABELS = ["M", "L", "XL"] as const;
 const UI_SCALE_MIN_PERCENT = 10;
 const UI_SCALE_MAX_PERCENT = 300;
 const UI_SCALE_STEPS = [10, 25, 50, 75, 100, 115, 130, 160, 200] as const;
@@ -43,6 +49,15 @@ const TMUX_KEY_SHORTCUTS: Array<{ label: string; token: string }> = [
   { label: "Up", token: "up" },
   { label: "Down", token: "down" },
 ];
+const TEXT_ACTION_MENU_BUTTONS = [
+  { id: "copy", label: "Copy", enabled: true },
+  { id: "save", label: "Save", enabled: false },
+  { id: "delete", label: "Delete", enabled: false },
+  { id: "quote", label: "Quote", enabled: false },
+  { id: "remind", label: "Remind", enabled: false },
+  { id: "translate", label: "Translate", enabled: false },
+  { id: "search", label: "Search", enabled: false },
+] as const;
 
 interface AgentDescriptor {
   agentId: string;
@@ -120,6 +135,15 @@ interface SavedLoginPrefs {
   remember: boolean;
   relayUrl?: string;
   token?: string;
+}
+
+interface TextActionMenuState {
+  visible: boolean;
+  text: string;
+  x: number;
+  y: number;
+  sourceType: "message" | "tmux";
+  sourceId?: string;
 }
 
 function randomId(prefix: string): string {
@@ -237,20 +261,35 @@ export default function App() {
   const [ignoreTopPanels, setIgnoreTopPanels] = useState(false);
   const [uiScalePercent, setUiScalePercent] = useState(UI_SCALE_DEFAULT_PERCENT);
   const [uiScaleInput, setUiScaleInput] = useState(String(UI_SCALE_DEFAULT_PERCENT));
+  const [contentFontStep, setContentFontStep] = useState(0);
   const [tmuxKeyPanelOpen, setTmuxKeyPanelOpen] = useState(false);
   const [agent, setAgent] = useState<AgentDescriptor | undefined>(undefined);
   const [inputText, setInputText] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tmuxRenderByTarget, setTmuxRenderByTarget] = useState<Record<string, string>>({});
   const [tmuxLiveProgressByTarget, setTmuxLiveProgressByTarget] = useState<Record<string, string>>({});
+  const [selectedTextMessageId, setSelectedTextMessageId] = useState("");
+  const [terminalTextSelected, setTerminalTextSelected] = useState(false);
+  const [textActionMenu, setTextActionMenu] = useState<TextActionMenuState>({
+    visible: false,
+    text: "",
+    x: 12,
+    y: 12,
+    sourceType: "message",
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
   const workModeRef = useRef<WorkMode>("tfclaw");
+  const stageRef = useRef<AppStage>("login");
+  const connectionStateRef = useRef<ConnectionState>("offline");
+  const appStateRef = useRef(AppState.currentState);
+  const keepConnectionRef = useRef(false);
   const selectedTmuxTargetRef = useRef("");
   const tmuxProgressRequestTargetRef = useRef<Map<string, string>>(new Map());
   const pendingMapRef = useRef<Map<string, PendingCommandState>>(new Map());
   const silentRequestIdsRef = useRef<Set<string>>(new Set());
   const closeSwitchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatScrollRef = useRef<ScrollView | null>(null);
   const terminalScrollRef = useRef<ScrollView | null>(null);
   const tmuxLinesTrackWidthRef = useRef(1);
@@ -261,9 +300,12 @@ export default function App() {
   const uiScaleValue = clampUiScalePercent(uiScalePercent);
   const uiScale = uiScaleValue / 100;
   const uiScaleLabel = `${uiScaleValue}%`;
+  const contentFontScale = CONTENT_FONT_SCALES[contentFontStep] ?? CONTENT_FONT_SCALES[0];
+  const contentFontLabel = CONTENT_FONT_LABELS[contentFontStep] ?? CONTENT_FONT_LABELS[0];
 
   const dynamicUi = useMemo(() => {
     const scaled = (value: number, min = 1) => Math.max(min, Math.round(value * uiScale));
+    const contentScaled = (value: number, min = 1) => Math.max(min, Math.round(value * uiScale * contentFontScale));
     return {
       title: { fontSize: scaled(21, 6) },
       subtitle: { fontSize: scaled(12, 4) },
@@ -294,16 +336,16 @@ export default function App() {
       targetPickerText: { fontSize: scaled(12, 5) },
       targetMenuItemText: { fontSize: scaled(12, 5) },
       terminalText: {
-        fontSize: scaled(12, 5),
-        lineHeight: scaled(18, 8),
+        fontSize: contentScaled(12, 5),
+        lineHeight: contentScaled(18, 8),
       },
       msgName: { fontSize: scaled(11, 4) },
       msgText: {
-        fontSize: scaled(13, 5),
-        lineHeight: scaled(18, 8),
+        fontSize: contentScaled(13, 5),
+        lineHeight: contentScaled(18, 8),
       },
-      msgSystemText: { fontSize: scaled(12, 4) },
-      emptyText: { fontSize: scaled(12, 4) },
+      msgSystemText: { fontSize: contentScaled(12, 4) },
+      emptyText: { fontSize: contentScaled(12, 4) },
       keyPanelBtn: {
         minWidth: scaled(68, 34),
         paddingHorizontal: scaled(10, 4),
@@ -327,8 +369,14 @@ export default function App() {
         paddingVertical: scaled(6, 3),
       },
       dialogTitle: { fontSize: scaled(16, 6) },
+      textActionBtn: {
+        borderRadius: scaled(8, 4),
+        paddingHorizontal: scaled(10, 4),
+        paddingVertical: scaled(8, 4),
+      },
+      textActionBtnText: { fontSize: scaled(12, 5) },
     };
-  }, [uiScale]);
+  }, [contentFontScale, uiScale]);
 
   const statusText = useMemo(() => {
     if (connectionState === "online") {
@@ -704,11 +752,40 @@ export default function App() {
       return;
     }
 
-    if (parsed.type === "relay.ack" && !parsed.payload.ok) {
+  if (parsed.type === "relay.ack" && !parsed.payload.ok) {
       const ackText = parsed.payload.message ? `Request failed: ${parsed.payload.message}` : "Request failed";
       appendSystemText(ackText);
     }
   };
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  };
+
+  function scheduleAutoReconnect(delayMs = 900): void {
+    if (reconnectTimerRef.current) {
+      return;
+    }
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (!keepConnectionRef.current) {
+        return;
+      }
+      if (appStateRef.current !== "active") {
+        return;
+      }
+      if (stageRef.current !== "chat") {
+        return;
+      }
+      if (connectionStateRef.current === "online" || connectionStateRef.current === "connecting") {
+        return;
+      }
+      connectWithToken();
+    }, Math.max(0, delayMs));
+  }
 
   const connectWithToken = () => {
     const urlText = relayUrl.trim() || DEFAULT_RELAY_URL;
@@ -716,6 +793,8 @@ export default function App() {
     if (isConnecting) {
       return;
     }
+    keepConnectionRef.current = true;
+    clearReconnectTimer();
     void (async () => {
       try {
         if (rememberLogin) {
@@ -758,6 +837,9 @@ export default function App() {
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) {
+        return;
+      }
       setConnectionState("online");
       const connectedText = "Connected.";
       appendSystemText(connectedText);
@@ -774,15 +856,24 @@ export default function App() {
     };
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) {
+        return;
+      }
       handleIncoming(String(event.data));
     };
 
     ws.onerror = () => {
+      if (wsRef.current !== ws) {
+        return;
+      }
       const errorText = "Socket error. Check relay URL/token and network.";
       appendSystemText(errorText);
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) {
+        return;
+      }
       setConnectionState("offline");
       setAgent(undefined);
       wsRef.current = null;
@@ -801,10 +892,15 @@ export default function App() {
       clearTmuxProgress();
       const disconnectedText = "Disconnected.";
       appendSystemText(disconnectedText);
+      if (keepConnectionRef.current && appStateRef.current === "active") {
+        scheduleAutoReconnect(900);
+      }
     };
   };
 
   const backToLogin = () => {
+    keepConnectionRef.current = false;
+    clearReconnectTimer();
     wsRef.current?.close();
     wsRef.current = null;
     setConnectionState("offline");
@@ -927,6 +1023,67 @@ export default function App() {
       return;
     }
     applyUiScalePercent(parsed);
+  };
+
+  const handleCycleContentFont = () => {
+    setContentFontStep((prev) => (prev + 1) % CONTENT_FONT_SCALES.length);
+  };
+
+  const closeTextActionMenu = () => {
+    setTextActionMenu((prev) => ({
+      ...prev,
+      visible: false,
+    }));
+    setSelectedTextMessageId("");
+    setTerminalTextSelected(false);
+  };
+
+  const openTextActionMenu = (
+    event: GestureResponderEvent,
+    text: string,
+    sourceType: "message" | "tmux",
+    sourceId?: string,
+  ) => {
+    const safeText = String(text ?? "");
+    if (!safeText.trim()) {
+      return;
+    }
+    const screen = Dimensions.get("window");
+    const menuWidth = Math.min(360, Math.max(260, screen.width - 24));
+    const menuHeight = 172;
+    const x = Math.max(10, Math.min(event.nativeEvent.pageX - menuWidth / 2, screen.width - menuWidth - 10));
+    const y = Math.max(10, Math.min(event.nativeEvent.pageY - menuHeight - 12, screen.height - menuHeight - 10));
+
+    if (sourceType === "message") {
+      setSelectedTextMessageId(sourceId ?? "");
+      setTerminalTextSelected(false);
+    } else {
+      setSelectedTextMessageId("");
+      setTerminalTextSelected(true);
+    }
+
+    setTextActionMenu({
+      visible: true,
+      text: safeText,
+      x,
+      y,
+      sourceType,
+      sourceId,
+    });
+  };
+
+  const handleCopySelectedText = () => {
+    const text = textActionMenu.text;
+    if (!text) {
+      closeTextActionMenu();
+      return;
+    }
+    Clipboard.setString(text);
+    closeTextActionMenu();
+  };
+
+  const handleUnimplementedTextAction = () => {
+    closeTextActionMenu();
   };
 
   const handleToggleIgnoreTopPanels = () => {
@@ -1160,12 +1317,46 @@ export default function App() {
 
   useEffect(() => {
     return () => {
+      keepConnectionRef.current = false;
+      clearReconnectTimer();
       wsRef.current?.close();
       silentRequestIdsRef.current.clear();
       if (closeSwitchTimerRef.current) {
         clearTimeout(closeSwitchTimerRef.current);
         closeSwitchTimerRef.current = null;
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    stageRef.current = stage;
+    if (stage !== "chat") {
+      keepConnectionRef.current = false;
+      clearReconnectTimer();
+    }
+  }, [stage]);
+
+  useEffect(() => {
+    connectionStateRef.current = connectionState;
+  }, [connectionState]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      appStateRef.current = nextState;
+      if (nextState !== "active") {
+        return;
+      }
+      if (!keepConnectionRef.current || stageRef.current !== "chat") {
+        return;
+      }
+      if (connectionStateRef.current === "online" || connectionStateRef.current === "connecting") {
+        return;
+      }
+      scheduleAutoReconnect(180);
+    });
+
+    return () => {
+      subscription.remove();
     };
   }, []);
 
@@ -1278,9 +1469,23 @@ export default function App() {
             msg.progress ? styles.msgProgress : undefined,
           ]}
         >
-          <Text style={[styles.msgText, dynamicUi.msgText, isSystem ? styles.msgSystemText : undefined, dynamicUi.msgSystemText]}>
-            {msg.text}
-          </Text>
+          <TextInput
+            value={msg.text}
+            editable
+            multiline
+            scrollEnabled={false}
+            contextMenuHidden={false}
+            selectTextOnFocus
+            showSoftInputOnFocus={false}
+            onChangeText={() => {}}
+            style={[
+              styles.msgText,
+              styles.msgTextSelectableInput,
+              dynamicUi.msgText,
+              isSystem ? styles.msgSystemText : undefined,
+              isSystem ? dynamicUi.msgSystemText : undefined,
+            ]}
+          />
         </View>
       </View>
     );
@@ -1303,6 +1508,9 @@ export default function App() {
               </Text>
             </View>
             <View style={styles.headerActions}>
+              <Pressable style={[styles.headerActionBtn, dynamicUi.headerActionBtn]} onPress={handleCycleContentFont}>
+                <Text style={[styles.headerActionBtnText, dynamicUi.btnText]}>T {contentFontLabel}</Text>
+              </Pressable>
               <Pressable style={[styles.headerActionBtn, dynamicUi.headerActionBtn]} onPress={handleCycleUiScale}>
                 <Text style={[styles.headerActionBtnText, dynamicUi.btnText]}>A {uiScaleLabel}</Text>
               </Pressable>
@@ -1541,7 +1749,19 @@ export default function App() {
                   keyboardShouldPersistTaps="handled"
                   onContentSizeChange={() => terminalScrollRef.current?.scrollToEnd({ animated: true })}
                 >
-                  <Text style={[styles.terminalText, dynamicUi.terminalText]}>{terminalDisplay}</Text>
+                  <View>
+                    <TextInput
+                      value={terminalDisplay}
+                      editable
+                      multiline
+                      scrollEnabled={false}
+                      contextMenuHidden={false}
+                      selectTextOnFocus
+                      showSoftInputOnFocus={false}
+                      onChangeText={() => {}}
+                      style={[styles.terminalText, styles.terminalTextSelectableInput, dynamicUi.terminalText]}
+                    />
+                  </View>
                 </ScrollView>
               </View>
             ) : null}
@@ -1586,6 +1806,41 @@ export default function App() {
             ) : null}
           </View>
         )}
+        <Modal
+          visible={textActionMenu.visible}
+          transparent
+          animationType="fade"
+          onRequestClose={closeTextActionMenu}
+        >
+          <View style={styles.textActionBackdrop}>
+            <Pressable style={StyleSheet.absoluteFill} onPress={closeTextActionMenu} />
+            <View
+              style={[
+                styles.textActionCard,
+                {
+                  left: textActionMenu.x,
+                  top: textActionMenu.y,
+                },
+              ]}
+            >
+              <View style={styles.textActionRow}>
+                {TEXT_ACTION_MENU_BUTTONS.map((item) => (
+                  <Pressable
+                    key={item.id}
+                    style={[
+                      styles.textActionBtn,
+                      dynamicUi.textActionBtn,
+                      item.enabled ? styles.textActionBtnEnabled : styles.textActionBtnDisabled,
+                    ]}
+                    onPress={item.id === "copy" ? handleCopySelectedText : handleUnimplementedTextAction}
+                  >
+                    <Text style={[styles.textActionBtnText, dynamicUi.textActionBtnText]}>{item.label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          </View>
+        </Modal>
         <Modal
           visible={tmuxNewDialogOpen}
           transparent
@@ -2015,6 +2270,21 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     fontFamily: Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" }),
   },
+  terminalTextSelectableInput: {
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    margin: 0,
+    borderWidth: 0,
+    backgroundColor: "transparent",
+    textAlignVertical: "top",
+  },
+  terminalSelected: {
+    borderWidth: 1,
+    borderColor: "#5fa673",
+    borderRadius: 8,
+    backgroundColor: "#102016",
+    padding: 6,
+  },
   msgWrap: {
     maxWidth: "100%",
   },
@@ -2058,10 +2328,27 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#4f7888",
   },
+  msgSelected: {
+    borderWidth: 1,
+    borderColor: "#9bc6d6",
+    shadowColor: "#9bc6d6",
+    shadowOpacity: 0.28,
+    shadowRadius: 7,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 2,
+  },
   msgText: {
     color: "#e7f4fb",
     fontSize: 13,
     lineHeight: 18,
+  },
+  msgTextSelectableInput: {
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    margin: 0,
+    borderWidth: 0,
+    backgroundColor: "transparent",
+    textAlignVertical: "top",
   },
   msgSystemText: {
     color: "#9cc7d4",
@@ -2145,6 +2432,49 @@ const styles = StyleSheet.create({
   dialogConfirmBtn: {
     backgroundColor: "#4f7f4c",
     borderColor: "#79b078",
+  },
+  textActionBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(4, 8, 11, 0.42)",
+  },
+  textActionCard: {
+    position: "absolute",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#335362",
+    backgroundColor: "#0f1d24",
+    padding: 8,
+    width: 320,
+    maxWidth: "94%",
+  },
+  textActionRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  textActionBtn: {
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    minWidth: 64,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  textActionBtnEnabled: {
+    backgroundColor: "#47697a",
+    borderWidth: 1,
+    borderColor: "#76a3b8",
+  },
+  textActionBtnDisabled: {
+    backgroundColor: "#273943",
+    borderWidth: 1,
+    borderColor: "#3a5461",
+    opacity: 0.7,
+  },
+  textActionBtnText: {
+    color: "#d9ecf5",
+    fontSize: 12,
+    fontWeight: "700",
   },
   sendInput: {
     flex: 1,
