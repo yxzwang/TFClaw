@@ -34,17 +34,24 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP，并提供对应的app
 - gateway（Feishu 通道）支持：
     - `/tmux help查看所有支持命令`
     - `/tmux status|sessions|panes|new|target|close|socket|lines|wait|stream|capture|key|send`
+    - `/tmux fileget <path>`（从 agent 下载文件并回传飞书）
+    - `/tfileget <path>`（`/tmux fileget` 别名）
+    - 直接发送飞书文件消息给机器人（自动上传到 agent 侧）
     - `/t<subcommand>` 别名（例如 `/tkey` `/ttarget` `/tcapture`）
     - `/passthrough on|off|status` 与 `/pt on|off|status`
   - passthrough 开启后，普通消息持续直通 tmux（直到 `/pt off`）
   - `/capture` 返回“屏幕/窗口编号列表”，回复数字后回传对应图片
   - tmux 流式输出会实时回推 progress，并在飞书端新消息发出后自动撤回上一条 progress（防堆叠）
   - 收到用户消息后会先给原消息添加 reaction（默认 `OnIt`）
+  - 飞书文件上传与 `/tmux fileget` 的相对路径均基于当前 `tmux target` 对应 pane 路径；若目标路径不可用则回退到 `tfclaw-files` 根目录
+  - 飞书收到文件消息与 `/tmux fileget` 命令时，会先自动回复 reaction 再处理请求
 - mobile（Expo）支持以下以及和gateway相同的/tmux, /passthrough命令：
   - 连接 relay
   - 查看 terminal 列表并切换
   - 查看输出、输入命令、快捷键
   - 新建/关闭 terminal
+  - 发送本地文件到 terminal-agent（分片上传，保存到 agent 侧 `tfclaw-files/` 目录，或由环境变量覆盖）
+  - 从 terminal-agent 下载文件到手机本地应用目录（分片下载，保存到 `documentDirectory/tfclaw-downloads/`）
   - 触发截图并显示最新图片（仅限windows端。）(使用 `/capture` 命令然后选择窗口号)
 
 
@@ -283,4 +290,3 @@ gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
 - 目前飞书端动态窗口的跟踪还是没有做到预设的24h，原因未知。可以手动/tcapture查看目前运行情况。
 - 窗口枚举/窗口截图当前仅在 Windows agent 上实现；Linux/macOS 暂仅屏幕截图。
 - 使用手机app需要server连接公网，注意安全。
-

@@ -2,6 +2,11 @@
 
 Android-first React Native app (Expo) for TFClaw.
 
+## File Transfer
+
+- `Send File`: pick a local file and upload to terminal-agent (`file.upload.*` chunked protocol).
+- `Get File`: request a remote path from terminal-agent (`file.download`) and save to `documentDirectory/tfclaw-downloads/`.
+
 ## Env
 
 Create `.env` from `.env.example`:

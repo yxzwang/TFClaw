@@ -5,6 +5,7 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import {
+  type AgentFileTransfer,
   type CaptureSource,
   type ClientCommand,
   type RelayMessage,
@@ -131,6 +132,33 @@ interface PendingCommandResult {
   onProgress?: (output: string, source?: string) => void | Promise<void>;
 }
 
+interface DownloadedFilePayload {
+  requestId: string;
+  transferId: string;
+  fileName: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  data: Buffer;
+}
+
+interface PendingFileDownloadTransfer {
+  transferId: string;
+  fileName: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  totalChunks: number;
+  chunks: string[];
+}
+
+interface PendingFileDownload {
+  resolve: (payload: DownloadedFilePayload) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+  transfer?: PendingFileDownloadTransfer;
+}
+
 interface EarlyCommandProgress {
   output: string;
   progressSource?: string;
@@ -153,6 +181,7 @@ interface RenderedTerminalOutput {
 interface MessageResponder {
   replyText(chatId: string, text: string): Promise<void>;
   replyImage(chatId: string, imageBase64: string): Promise<void>;
+  replyFile?(chatId: string, fileName: string, fileData: Buffer, mimeType?: string): Promise<void>;
   replyTextWithMeta?(chatId: string, text: string): Promise<{ messageId?: string }>;
   deleteMessage?(messageId: string): Promise<void>;
 }
@@ -162,6 +191,17 @@ interface InboundTextContext {
   chatId: string;
   senderId?: string;
   text: string;
+  allowFrom: string[];
+  responder: MessageResponder;
+}
+
+interface InboundFileContext {
+  channel: ChannelName;
+  chatId: string;
+  senderId?: string;
+  fileName: string;
+  mimeType?: string;
+  fileData: Buffer;
   allowFrom: string[];
   responder: MessageResponder;
 }
@@ -189,6 +229,8 @@ interface CommandProgressSession {
   lastProgressBody?: string;
   streamMode?: "auto" | "on" | "off";
   streamOffIntroSent?: boolean;
+  streamOffFinalSent?: boolean;
+  streamOffFinalizeTimer?: NodeJS.Timeout;
 }
 
 interface ChatApp {
@@ -245,6 +287,19 @@ const COMMAND_RESULT_TIMEOUT_MS = Math.max(
   1000,
   Math.min(24 * 60 * 60 * 1000, toNumber(process.env.TFCLAW_COMMAND_RESULT_TIMEOUT_MS, 24 * 60 * 60 * 1000)),
 );
+const FILE_TRANSFER_WAIT_TIMEOUT_MS = Math.max(
+  10_000,
+  Math.min(10 * 60 * 1000, toNumber(process.env.TFCLAW_FILE_TRANSFER_WAIT_TIMEOUT_MS, 120_000)),
+);
+const FILE_TRANSFER_CHUNK_BASE64_CHARS = Math.max(
+  4000,
+  Math.min(120_000, toNumber(process.env.TFCLAW_FILE_TRANSFER_CHUNK_BASE64_CHARS, 88_000)),
+);
+const FILE_TRANSFER_MAX_BYTES = Math.max(
+  1 * 1024 * 1024,
+  Math.min(100 * 1024 * 1024, toNumber(process.env.TFCLAW_FILE_TRANSFER_MAX_BYTES, 50 * 1024 * 1024)),
+);
+const FEISHU_MAX_UPLOAD_FILE_BYTES = 30 * 1024 * 1024;
 const FEISHU_ACK_REACTION = toString(process.env.TFCLAW_FEISHU_ACK_REACTION, "OnIt").trim() || "OnIt";
 const FEISHU_ACK_REACTION_ENABLED = toBoolean(process.env.TFCLAW_FEISHU_ACK_REACTION_ENABLED, true);
 
@@ -324,6 +379,24 @@ function trimRenderedLine(line: string): string {
     .replace(/\u0000/g, "")
     .replace(/[\u0001-\u0008\u000b-\u001f\u007f-\u009f]/g, "")
     .trimEnd();
+}
+
+function sanitizeInboundFileName(fileName: string): string {
+  const cleaned = fileName
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
+  return cleaned || `file-${Date.now()}.bin`;
+}
+
+function splitBase64Chunks(base64: string): string[] {
+  const chunkChars = Math.max(4, FILE_TRANSFER_CHUNK_BASE64_CHARS - (FILE_TRANSFER_CHUNK_BASE64_CHARS % 4));
+  const chunks: string[] = [];
+  for (let offset = 0; offset < base64.length; offset += chunkChars) {
+    chunks.push(base64.slice(offset, offset + chunkChars));
+  }
+  return chunks.length > 0 ? chunks : [""];
 }
 
 function describeSdkError(error: unknown): string {
@@ -621,6 +694,7 @@ class RelayBridge {
   private pendingCaptures = new Map<string, PendingCapture>();
   private pendingCaptureSourceLists = new Map<string, PendingCaptureSourceList>();
   private pendingCommandResults = new Map<string, PendingCommandResult>();
+  private pendingFileDownloads = new Map<string, PendingFileDownload>();
   private earlyCommandOutcomes = new Map<string, { ok: boolean; value: string; at: number }>();
   private earlyCommandProgress = new Map<string, EarlyCommandProgress[]>();
   private readonly earlyCommandOutcomeTtlMs = 60_000;
@@ -688,12 +762,16 @@ class RelayBridge {
 
   command(payload: ClientCommand["payload"]): string {
     const requestId = randomId();
+    this.commandWithRequestId(requestId, payload);
+    return requestId;
+  }
+
+  commandWithRequestId(requestId: string, payload: ClientCommand["payload"]): void {
     this.send({
       type: "client.command",
       requestId,
       payload,
     });
-    return requestId;
   }
 
   waitForCapture(requestId: string, timeoutMs = 20000): Promise<ScreenCapture> {
@@ -719,6 +797,21 @@ class RelayBridge {
       }, timeoutMs);
 
       this.pendingCaptureSourceLists.set(requestId, {
+        resolve,
+        reject,
+        timer,
+      });
+    });
+  }
+
+  waitForFileDownload(requestId: string, timeoutMs = FILE_TRANSFER_WAIT_TIMEOUT_MS): Promise<DownloadedFilePayload> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingFileDownloads.delete(requestId);
+        reject(new Error("file download timeout"));
+      }, timeoutMs);
+
+      this.pendingFileDownloads.set(requestId, {
         resolve,
         reject,
         timer,
@@ -766,6 +859,36 @@ class RelayBridge {
       }
       this.earlyCommandProgress.delete(requestId);
     });
+  }
+
+  async drainLateCommandProgress(
+    requestId: string,
+    onProgress?: (output: string, source?: string) => void | Promise<void>,
+    waitMs = 0,
+  ): Promise<void> {
+    if (!requestId) {
+      return;
+    }
+
+    const delayMs = Math.max(0, waitMs);
+    if (delayMs > 0) {
+      await delay(delayMs);
+    }
+
+    this.pruneEarlyCommandProgress();
+    const items = this.earlyCommandProgress.get(requestId) ?? [];
+    this.earlyCommandProgress.delete(requestId);
+    if (!onProgress || items.length === 0) {
+      return;
+    }
+
+    for (const item of items) {
+      try {
+        await onProgress(item.output, item.progressSource);
+      } catch (error) {
+        console.warn(`[gateway] progress callback failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   private handleRelayMessage(raw: string): void {
@@ -822,6 +945,11 @@ class RelayBridge {
       return;
     }
 
+    if (parsed.type === "agent.file_transfer") {
+      this.handleFileTransferMessage(parsed);
+      return;
+    }
+
     if (parsed.type === "agent.command_result") {
       if (parsed.payload.requestId) {
         const isProgress = Boolean(parsed.payload.progress);
@@ -865,6 +993,14 @@ class RelayBridge {
         return;
       }
 
+      const pendingFile = this.pendingFileDownloads.get(parsed.payload.requestId);
+      if (pendingFile) {
+        clearTimeout(pendingFile.timer);
+        this.pendingFileDownloads.delete(parsed.payload.requestId);
+        pendingFile.reject(new Error(`${parsed.payload.code}: ${parsed.payload.message}`));
+        return;
+      }
+
       const pendingCommand = this.pendingCommandResults.get(parsed.payload.requestId);
       if (pendingCommand) {
         clearTimeout(pendingCommand.timer);
@@ -876,6 +1012,78 @@ class RelayBridge {
       this.earlyCommandProgress.delete(parsed.payload.requestId);
       this.saveEarlyCommandOutcome(parsed.payload.requestId, false, `${parsed.payload.code}: ${parsed.payload.message}`);
     }
+  }
+
+  private handleFileTransferMessage(message: AgentFileTransfer): void {
+    const payload = message.payload;
+    if (payload.direction !== "download" || !payload.requestId) {
+      return;
+    }
+    const pending = this.pendingFileDownloads.get(payload.requestId);
+    if (!pending) {
+      return;
+    }
+
+    if (payload.stage === "start") {
+      const totalChunks = Math.max(1, Math.trunc(payload.totalChunks));
+      pending.transfer = {
+        transferId: payload.transferId,
+        fileName: sanitizeInboundFileName(payload.fileName),
+        path: payload.path,
+        mimeType: payload.mimeType || "application/octet-stream",
+        size: Math.max(0, Math.trunc(payload.size)),
+        totalChunks,
+        chunks: new Array(totalChunks).fill(""),
+      };
+      return;
+    }
+
+    const transfer = pending.transfer;
+    if (!transfer) {
+      return;
+    }
+    if (transfer.transferId !== payload.transferId) {
+      return;
+    }
+
+    if (payload.stage === "chunk") {
+      if (payload.totalChunks !== transfer.totalChunks) {
+        clearTimeout(pending.timer);
+        this.pendingFileDownloads.delete(payload.requestId);
+        pending.reject(new Error("file transfer chunk count mismatch"));
+        return;
+      }
+      const index = Math.trunc(payload.chunkIndex);
+      if (index < 0 || index >= transfer.totalChunks) {
+        clearTimeout(pending.timer);
+        this.pendingFileDownloads.delete(payload.requestId);
+        pending.reject(new Error(`invalid file transfer chunk index: ${payload.chunkIndex}`));
+        return;
+      }
+      transfer.chunks[index] = payload.chunkBase64;
+      return;
+    }
+
+    const missingChunk = transfer.chunks.findIndex((chunk) => chunk.length === 0);
+    if (missingChunk >= 0) {
+      clearTimeout(pending.timer);
+      this.pendingFileDownloads.delete(payload.requestId);
+      pending.reject(new Error(`file transfer incomplete: missing chunk ${missingChunk + 1}`));
+      return;
+    }
+
+    const data = Buffer.from(transfer.chunks.join(""), "base64");
+    clearTimeout(pending.timer);
+    this.pendingFileDownloads.delete(payload.requestId);
+    pending.resolve({
+      requestId: payload.requestId,
+      transferId: transfer.transferId,
+      fileName: transfer.fileName,
+      path: transfer.path,
+      mimeType: transfer.mimeType,
+      size: transfer.size,
+      data,
+    });
   }
 
   private rejectAllPending(error: Error): void {
@@ -894,6 +1102,12 @@ class RelayBridge {
     for (const [requestId, pending] of this.pendingCommandResults.entries()) {
       clearTimeout(pending.timer);
       this.pendingCommandResults.delete(requestId);
+      pending.reject(error);
+    }
+
+    for (const [requestId, pending] of this.pendingFileDownloads.entries()) {
+      clearTimeout(pending.timer);
+      this.pendingFileDownloads.delete(requestId);
       pending.reject(error);
     }
 
@@ -968,6 +1182,14 @@ class TfclawCommandRouter {
   private readonly progressRecallDelayMs = Math.max(
     80,
     Math.min(2000, toNumber(process.env.TFCLAW_PROGRESS_RECALL_DELAY_MS, 350)),
+  );
+  private readonly streamOffFinalIdleMs = Math.max(
+    300,
+    Math.min(15000, toNumber(process.env.TFCLAW_STREAM_OFF_FINAL_IDLE_MS, 1800)),
+  );
+  private readonly streamOffFinalMaxWaitMs = Math.max(
+    this.streamOffFinalIdleMs,
+    Math.min(180000, toNumber(process.env.TFCLAW_STREAM_OFF_FINAL_MAX_WAIT_MS, 45000)),
   );
   private readonly progressIdleTimeoutMs = 10 * 60 * 1000;
   private readonly progressMaxLifetimeMs = 30 * 60 * 1000;
@@ -1234,7 +1456,50 @@ class TfclawCommandRouter {
       queue: Promise.resolve(),
       streamMode: this.chatTmuxStreamMode.get(selectionKey),
       streamOffIntroSent: false,
+      streamOffFinalSent: false,
     });
+  }
+
+  private clearCommandProgressStreamOffTimer(session: CommandProgressSession): void {
+    if (!session.streamOffFinalizeTimer) {
+      return;
+    }
+    clearTimeout(session.streamOffFinalizeTimer);
+    session.streamOffFinalizeTimer = undefined;
+  }
+
+  private scheduleStreamOffFinalMessage(requestId: string): void {
+    const session = this.commandProgressSessions.get(requestId);
+    if (!session) {
+      return;
+    }
+
+    this.clearCommandProgressStreamOffTimer(session);
+    session.streamOffFinalizeTimer = setTimeout(() => {
+      const queued = this.commandProgressSessions.get(requestId);
+      if (!queued) {
+        return;
+      }
+      queued.streamOffFinalizeTimer = undefined;
+      queued.queue = queued.queue
+        .catch(() => undefined)
+        .then(async () => {
+          const active = this.commandProgressSessions.get(requestId);
+          if (!active) {
+            return;
+          }
+          if (this.activeCommandRequestBySelection.get(active.selectionKey) !== requestId) {
+            return;
+          }
+          const effectiveStreamMode = active.streamMode ?? this.chatTmuxStreamMode.get(active.selectionKey);
+          if (effectiveStreamMode !== "off" || !active.streamOffIntroSent || !active.lastProgressBody) {
+            return;
+          }
+          await this.replyWithModeMeta(active.chatId, active.responder, active.selectionKey, active.lastProgressBody);
+          active.streamOffFinalSent = true;
+        })
+        .catch((error) => console.warn(`[gateway] stream-off final send failed: ${error instanceof Error ? error.message : String(error)}`));
+    }, this.streamOffFinalIdleMs);
   }
 
   private stopCommandProgressSession(requestId: string, recallLastMessage: boolean): void {
@@ -1242,6 +1507,7 @@ class TfclawCommandRouter {
     if (!session) {
       return;
     }
+    this.clearCommandProgressStreamOffTimer(session);
     this.commandProgressSessions.delete(requestId);
 
     if (this.activeCommandRequestBySelection.get(session.selectionKey) === requestId) {
@@ -1275,23 +1541,29 @@ class TfclawCommandRouter {
         if (this.activeCommandRequestBySelection.get(active.selectionKey) !== requestId) {
           return;
         }
+        const effectiveStreamMode = active.streamMode ?? this.chatTmuxStreamMode.get(active.selectionKey);
         if (active.lastProgressBody === nextBody) {
+          if (effectiveStreamMode === "off" && active.streamOffIntroSent) {
+            this.scheduleStreamOffFinalMessage(requestId);
+          }
           return;
         }
 
-        if (active.streamMode === "off") {
-          if (active.streamOffIntroSent) {
-            return;
-          }
-          await this.replyWithModeMeta(active.chatId, active.responder, active.selectionKey, nextBody);
-          await this.replyWithModeMeta(
-            active.chatId,
-            active.responder,
-            active.selectionKey,
-            "Tfclaw is waiting for Generating...",
-          );
-          active.streamOffIntroSent = true;
+        if (effectiveStreamMode === "off") {
+          active.streamMode = "off";
           active.lastProgressBody = nextBody;
+          active.streamOffFinalSent = false;
+          if (!active.streamOffIntroSent) {
+            await this.replyWithModeMeta(active.chatId, active.responder, active.selectionKey, nextBody);
+            await this.replyWithModeMeta(
+              active.chatId,
+              active.responder,
+              active.selectionKey,
+              "TFClaw is generating...",
+            );
+            active.streamOffIntroSent = true;
+          }
+          this.scheduleStreamOffFinalMessage(requestId);
           return;
         }
 
@@ -1328,14 +1600,108 @@ class TfclawCommandRouter {
     responder: MessageResponder,
     selectionKey: string,
     body: string,
+    options?: { preferLatestProgress?: boolean },
   ): Promise<void> {
     await this.flushCommandProgressSession(requestId);
     const progressSession = this.commandProgressSessions.get(requestId);
+    if (progressSession) {
+      this.clearCommandProgressStreamOffTimer(progressSession);
+    }
+    const preferLatestProgress = Boolean(options?.preferLatestProgress);
+    const effectiveStreamMode =
+      progressSession?.streamMode
+      ?? (progressSession ? this.chatTmuxStreamMode.get(progressSession.selectionKey) : undefined);
+    if (preferLatestProgress && effectiveStreamMode === "off" && progressSession?.streamOffFinalSent) {
+      return;
+    }
+    const finalBody =
+      preferLatestProgress
+      && effectiveStreamMode === "off"
+      && progressSession?.streamOffIntroSent
+      && progressSession?.lastProgressBody
+        ? progressSession.lastProgressBody
+        : body;
     const previousProgressMessageId = progressSession?.lastProgressMessageId;
-    const meta = await this.replyWithModeMeta(chatId, responder, selectionKey, body);
+    const meta = await this.replyWithModeMeta(chatId, responder, selectionKey, finalBody);
     if (previousProgressMessageId && (!meta.messageId || meta.messageId !== previousProgressMessageId)) {
       this.scheduleDeleteMessage(progressSession?.responder ?? responder, previousProgressMessageId);
     }
+  }
+
+  private shouldDeferStreamOffCommand(commandText: string): boolean {
+    const command = this.normalizeCommandLine(commandText);
+    return (
+      command.startsWith("/tmux send ")
+      || command.startsWith("/tsend ")
+      || command.startsWith("/tmux key ")
+      || command.startsWith("/tmux keys ")
+      || command.startsWith("/tkey ")
+      || command.startsWith("/tkeys ")
+      || command.startsWith("/tmux sendkey ")
+      || command.startsWith("/tmux sendkeys ")
+      || command.startsWith("/tmux send-keys ")
+    );
+  }
+
+  private async sendStreamOffGeneratingAndFinal(
+    requestId: string,
+    chatId: string,
+    responder: MessageResponder,
+    selectionKey: string,
+    terminalId: string,
+    baselineOutput: string,
+    fallbackBody: string,
+  ): Promise<void> {
+    const session = this.commandProgressSessions.get(requestId);
+    if (!session || session.streamOffFinalSent) {
+      return;
+    }
+
+    await this.replyWithModeMeta(chatId, responder, selectionKey, "TFClaw is generating...");
+    session.streamOffIntroSent = true;
+    session.streamOffFinalSent = false;
+
+    const pollMs = 350;
+    let latest = this.relay.cache.snapshots.get(terminalId)?.output ?? baselineOutput;
+    let lastChangedAt = Date.now();
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < this.streamOffFinalMaxWaitMs) {
+      await delay(pollMs);
+      const active = this.commandProgressSessions.get(requestId);
+      if (!active) {
+        return;
+      }
+      if (this.activeCommandRequestBySelection.get(active.selectionKey) !== requestId) {
+        return;
+      }
+
+      const current = this.relay.cache.snapshots.get(terminalId)?.output ?? latest;
+      if (current !== latest) {
+        latest = current;
+        lastChangedAt = Date.now();
+        continue;
+      }
+
+      if (Date.now() - lastChangedAt >= this.streamOffFinalIdleMs) {
+        break;
+      }
+    }
+
+    const active = this.commandProgressSessions.get(requestId);
+    if (!active || this.activeCommandRequestBySelection.get(active.selectionKey) !== requestId) {
+      return;
+    }
+
+    const delta = latest.startsWith(baselineOutput) ? latest.slice(baselineOutput.length) : latest;
+    let finalBody = this.renderOutputForChat(delta, 1800);
+    if (!finalBody || finalBody === "(no output yet)") {
+      finalBody = fallbackBody;
+    }
+
+    active.lastProgressBody = finalBody;
+    await this.replyWithModeMeta(chatId, responder, selectionKey, finalBody);
+    active.streamOffFinalSent = true;
   }
 
   private startOrRefreshProgressSession(
@@ -2082,6 +2448,157 @@ class TfclawCommandRouter {
     await this.replyWithMode(chatId, responder, key, this.formatCaptureOptions(sources));
   }
 
+  private fileCommandHelpText(): string {
+    return [
+      "file commands:",
+      "- /tmux fileget <path>  下载文件并回传到聊天",
+      "- /tfileget <path>  /tmux fileget 的别名",
+      "- path 为相对路径时，基于当前 tmux target 的 pane 路径解析",
+      "- 直接发送一个飞书文件消息给机器人: 自动上传到当前 tmux target pane 路径",
+    ].join("\n");
+  }
+
+  private async uploadInboundFileToAgent(ctx: InboundFileContext): Promise<void> {
+    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
+    if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
+      await ctx.responder.replyText(ctx.chatId, "not allowed");
+      return;
+    }
+
+    if (ctx.fileData.byteLength <= 0) {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "file upload failed: empty file.");
+      return;
+    }
+    if (ctx.fileData.byteLength > FILE_TRANSFER_MAX_BYTES) {
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        `file upload failed: size ${ctx.fileData.byteLength} exceeds limit ${FILE_TRANSFER_MAX_BYTES}.`,
+      );
+      return;
+    }
+
+    const fileName = sanitizeInboundFileName(ctx.fileName);
+    const transferId = `feishu-upload-${randomId()}`;
+    const base64 = ctx.fileData.toString("base64");
+    const chunks = splitBase64Chunks(base64);
+    const totalChunks = chunks.length;
+
+    await this.replyWithMode(
+      ctx.chatId,
+      ctx.responder,
+      selectionKey,
+      `[file] uploading ${fileName} (${ctx.fileData.byteLength} bytes, chunks=${totalChunks}) ...`,
+    );
+
+    const startRequestId = randomId();
+    const startWait = this.relay.waitForCommandResult(startRequestId, FILE_TRANSFER_WAIT_TIMEOUT_MS);
+    this.relay.commandWithRequestId(startRequestId, {
+      command: "file.upload.start",
+      transferId,
+      fileName,
+      size: ctx.fileData.byteLength,
+      totalChunks,
+      mimeType: ctx.mimeType,
+      sessionKey: selectionKey,
+    });
+
+    await startWait;
+
+    for (let index = 0; index < chunks.length; index += 1) {
+      this.relay.command({
+        command: "file.upload.chunk",
+        transferId,
+        chunkIndex: index,
+        totalChunks,
+        chunkBase64: chunks[index],
+      });
+      if (index > 0 && index % 6 === 0) {
+        await delay(300);
+      }
+    }
+
+    const completeRequestId = randomId();
+    const completeWait = this.relay.waitForCommandResult(completeRequestId, FILE_TRANSFER_WAIT_TIMEOUT_MS);
+    this.relay.commandWithRequestId(completeRequestId, {
+      command: "file.upload.complete",
+      transferId,
+      totalChunks,
+    });
+    const completeOutput = await completeWait;
+    await this.replyWithMode(
+      ctx.chatId,
+      ctx.responder,
+      selectionKey,
+      completeOutput || `[file] upload finished: ${fileName}`,
+    );
+  }
+
+  async handleFileMessage(ctx: InboundFileContext): Promise<void> {
+    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
+    try {
+      await this.uploadInboundFileToAgent(ctx);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `file upload failed: ${msg}`);
+    }
+  }
+
+  private async handleTmuxFileGetCommand(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    remotePathRaw: string,
+  ): Promise<void> {
+    const remotePath = remotePathRaw.trim();
+    if (!remotePath) {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /tmux fileget <path>");
+      return;
+    }
+    if (typeof ctx.responder.replyFile !== "function") {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "current channel does not support file replies.");
+      return;
+    }
+
+    const requestId = randomId();
+    const downloadPromise = this.relay.waitForFileDownload(requestId, FILE_TRANSFER_WAIT_TIMEOUT_MS);
+    this.relay.commandWithRequestId(requestId, {
+      command: "file.download",
+      path: remotePath,
+      sessionKey: selectionKey,
+    });
+
+    await this.replyWithMode(
+      ctx.chatId,
+      ctx.responder,
+      selectionKey,
+      `[file] downloading from tmux target path: ${remotePath} ...`,
+    );
+
+    const downloaded = await downloadPromise;
+    if (downloaded.data.byteLength <= 0) {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "file download failed: empty file.");
+      return;
+    }
+    if (downloaded.data.byteLength > FEISHU_MAX_UPLOAD_FILE_BYTES) {
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        `file downloaded from agent, but too large for Feishu upload (> ${FEISHU_MAX_UPLOAD_FILE_BYTES} bytes).`,
+      );
+      return;
+    }
+
+    await ctx.responder.replyFile(ctx.chatId, downloaded.fileName, downloaded.data, downloaded.mimeType);
+    await this.replyWithMode(
+      ctx.chatId,
+      ctx.responder,
+      selectionKey,
+      `[file] delivered: ${downloaded.fileName} (${downloaded.data.byteLength} bytes)`,
+    );
+  }
+
   async handleTextMessage(ctx: InboundTextContext): Promise<void> {
     const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
     if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
@@ -2110,6 +2627,38 @@ class TfclawCommandRouter {
       return;
     }
 
+    if (
+      lowered === "/tmux fileget"
+      || lowered === "/tfileget"
+      || lowered === "/download"
+      || lowered === "/file"
+      || lowered === "/file help"
+      || lowered === "/file ?"
+    ) {
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.fileCommandHelpText());
+      return;
+    }
+
+    if (lowered.startsWith("/tmux fileget ")) {
+      await this.handleTmuxFileGetCommand(ctx, selectionKey, text.slice("/tmux fileget ".length));
+      return;
+    }
+
+    if (lowered.startsWith("/tfileget ")) {
+      await this.handleTmuxFileGetCommand(ctx, selectionKey, text.slice("/tfileget ".length));
+      return;
+    }
+
+    if (lowered.startsWith("/file get ")) {
+      await this.handleTmuxFileGetCommand(ctx, selectionKey, text.slice("/file get ".length));
+      return;
+    }
+
+    if (lowered.startsWith("/download ")) {
+      await this.handleTmuxFileGetCommand(ctx, selectionKey, text.slice("/download ".length));
+      return;
+    }
+
     const mode = this.getMode(selectionKey);
     const passthroughEnabled = Boolean(this.chatPassthroughEnabled.get(selectionKey));
     const isSlashCommand = text.startsWith("/");
@@ -2117,6 +2666,12 @@ class TfclawCommandRouter {
     const outboundText = (mode === "terminal" || passthroughEnabled) && !isSlashCommand && !isDotControl
       ? `/tmux send ${text}`
       : text;
+    const streamOffFollowEnabled = this.shouldDeferStreamOffCommand(outboundText);
+    const selectedBeforeCommand = this.selectedTerminal(selectionKey, true);
+    const streamOffFollowTerminalId = selectedBeforeCommand?.terminalId;
+    const streamOffFollowBaseline = streamOffFollowTerminalId
+      ? this.relay.cache.snapshots.get(streamOffFollowTerminalId)?.output ?? ""
+      : "";
 
     const requestId = this.relay.command({
       command: "tfclaw.command",
@@ -2124,30 +2679,65 @@ class TfclawCommandRouter {
       sessionKey: selectionKey,
     });
     this.beginCommandProgressSession(selectionKey, requestId, ctx.chatId, ctx.responder);
+    const handleProgress = (progressOutput: string, progressSource?: string): void => {
+      const source = (progressSource ?? "").trim().toLowerCase();
+      if (source && source !== "tmux") {
+        return;
+      }
+      const reply = this.normalizeLegacyErrorMessage(progressOutput);
+      if (!reply) {
+        return;
+      }
+      this.queueCommandProgressUpdate(requestId, reply);
+    };
 
     try {
       const output = await this.relay.waitForCommandResult(
         requestId,
         COMMAND_RESULT_TIMEOUT_MS,
-        (progressOutput, progressSource) => {
-          const source = (progressSource ?? "").trim().toLowerCase();
-          if (source && source !== "tmux") {
-            return;
-          }
-          const reply = this.normalizeLegacyErrorMessage(progressOutput);
-          if (!reply) {
-            return;
-          }
-          this.queueCommandProgressUpdate(requestId, reply);
-        },
+        handleProgress,
       );
+      const progressSession = this.commandProgressSessions.get(requestId);
+      const effectiveStreamMode = progressSession?.streamMode ?? this.chatTmuxStreamMode.get(selectionKey);
+      const lateProgressWaitMs = effectiveStreamMode === "off" ? 450 : 0;
+      await this.relay.drainLateCommandProgress(requestId, handleProgress, lateProgressWaitMs);
       this.updateModeFromResult(selectionKey, outboundText, output);
+      const effectiveStreamModeAfter = progressSession?.streamMode ?? this.chatTmuxStreamMode.get(selectionKey);
       const reply = this.normalizeLegacyErrorMessage(output);
-      if (!reply) {
-        await this.replyWithModeReplacingCommandProgress(requestId, ctx.chatId, ctx.responder, selectionKey, "(no output)");
+      const finalReply = reply || "(no output)";
+      if (
+        effectiveStreamModeAfter === "off"
+        && streamOffFollowEnabled
+        && streamOffFollowTerminalId
+        && !progressSession?.streamOffIntroSent
+      ) {
+        await this.replyWithModeReplacingCommandProgress(
+          requestId,
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          finalReply,
+          { preferLatestProgress: true },
+        );
+        await this.sendStreamOffGeneratingAndFinal(
+          requestId,
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          streamOffFollowTerminalId,
+          streamOffFollowBaseline,
+          finalReply,
+        );
         return;
       }
-      await this.replyWithModeReplacingCommandProgress(requestId, ctx.chatId, ctx.responder, selectionKey, reply);
+      await this.replyWithModeReplacingCommandProgress(
+        requestId,
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        finalReply,
+        { preferLatestProgress: true },
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.replyWithModeReplacingCommandProgress(
@@ -2309,6 +2899,59 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     });
   }
 
+  private inferFeishuFileType(fileName: string, mimeType?: string): "opus" | "mp4" | "pdf" | "doc" | "xls" | "ppt" | "stream" {
+    const ext = path.extname(fileName).toLowerCase();
+    if (ext === ".opus" || (mimeType ?? "").toLowerCase() === "audio/opus") {
+      return "opus";
+    }
+    if (ext === ".mp4" || (mimeType ?? "").toLowerCase() === "video/mp4") {
+      return "mp4";
+    }
+    if (ext === ".pdf") {
+      return "pdf";
+    }
+    if (ext === ".doc" || ext === ".docx") {
+      return "doc";
+    }
+    if (ext === ".xls" || ext === ".xlsx" || ext === ".csv") {
+      return "xls";
+    }
+    if (ext === ".ppt" || ext === ".pptx") {
+      return "ppt";
+    }
+    return "stream";
+  }
+
+  private async readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const rawChunk of stream as AsyncIterable<unknown>) {
+      if (Buffer.isBuffer(rawChunk)) {
+        chunks.push(rawChunk);
+      } else if (typeof rawChunk === "string") {
+        chunks.push(Buffer.from(rawChunk));
+      } else if (rawChunk && typeof rawChunk === "object" && rawChunk instanceof Uint8Array) {
+        chunks.push(Buffer.from(rawChunk));
+      }
+    }
+    return Buffer.concat(chunks);
+  }
+
+  private async downloadMessageResourceFile(messageId: string, fileKey: string): Promise<Buffer> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+    const result = await this.larkClient.im.v1.messageResource.get({
+      path: {
+        message_id: messageId,
+        file_key: fileKey,
+      },
+      params: {
+        type: "file",
+      },
+    });
+    return this.readStreamToBuffer(result.getReadableStream());
+  }
+
   async replyImage(chatId: string, imageBase64: string): Promise<void> {
     if (!this.larkClient) {
       throw new Error("feishu client not initialized");
@@ -2378,13 +3021,79 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     }
   }
 
+  async replyFile(chatId: string, fileName: string, fileData: Buffer, mimeType?: string): Promise<void> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+    if (fileData.byteLength <= 0) {
+      throw new Error("empty file");
+    }
+    if (fileData.byteLength > FEISHU_MAX_UPLOAD_FILE_BYTES) {
+      throw new Error(`file too large (>${FEISHU_MAX_UPLOAD_FILE_BYTES} bytes)`);
+    }
+
+    const safeFileName = sanitizeInboundFileName(fileName);
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `tfclaw-feishu-${Date.now()}-${Math.random().toString(16).slice(2)}-${safeFileName}`,
+    );
+    fs.writeFileSync(tmpPath, fileData);
+
+    let uploadResult: unknown;
+    let fileStream: fs.ReadStream | undefined;
+    try {
+      fileStream = fs.createReadStream(tmpPath);
+      uploadResult = await this.larkClient.im.v1.file.create({
+        data: {
+          file_type: this.inferFeishuFileType(safeFileName, mimeType),
+          file_name: safeFileName,
+          file: fileStream,
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu file upload failed: ${describeSdkError(error)}`);
+    } finally {
+      try {
+        fileStream?.destroy();
+      } catch {
+        // no-op
+      }
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // no-op
+      }
+    }
+
+    const uploadObj = toObject(uploadResult);
+    const uploadData = toObject(uploadObj.data);
+    const fileKey = toString(uploadObj.file_key) || toString(uploadData.file_key);
+    if (!fileKey) {
+      const code = toString(uploadObj.code);
+      const msg = toString(uploadObj.msg);
+      throw new Error(`failed to upload file${code || msg ? `: code=${code || "unknown"} msg=${msg || "unknown"}` : ""}`);
+    }
+
+    try {
+      await this.larkClient.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: "file",
+          content: JSON.stringify({ file_key: fileKey }),
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu file message send failed: ${describeSdkError(error)} | file_key=${fileKey}`);
+    }
+  }
+
   private async handleTextEvent(data: unknown): Promise<void> {
     const root = toObject(data);
     const message = toObject(root.message);
     const messageType = toString(message.message_type);
-    if (messageType !== "text") {
-      return;
-    }
 
     const eventHeader = toObject(root.header);
     const messageId = toString(message.message_id);
@@ -2400,26 +3109,67 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       return;
     }
 
-    const rawContent = toString(message.content);
-    let text = "";
-    if (rawContent) {
-      try {
-        const contentObj = toObject(JSON.parse(rawContent));
-        text = toString(contentObj.text);
-      } catch {
-        text = rawContent;
-      }
-    }
-
     const sender = toObject(toObject(root.sender).sender_id);
     const senderOpenId = toString(sender.open_id);
 
-    if (messageId && FEISHU_ACK_REACTION_ENABLED) {
+    const rawContent = toString(message.content);
+    let contentObj: Record<string, unknown> = {};
+    if (rawContent) {
+      try {
+        contentObj = toObject(JSON.parse(rawContent));
+      } catch {
+        contentObj = {};
+      }
+    }
+
+    const textPreview = toString(contentObj.text, rawContent).trim().toLowerCase();
+    const forceAckForFileTransfer = messageType === "file"
+      || textPreview.startsWith("/tmux fileget ")
+      || textPreview === "/tmux fileget"
+      || textPreview.startsWith("/tfileget ")
+      || textPreview === "/tfileget"
+      || textPreview.startsWith("/file get ")
+      || textPreview === "/file get"
+      || textPreview.startsWith("/download ")
+      || textPreview === "/download";
+
+    if (messageId && (FEISHU_ACK_REACTION_ENABLED || forceAckForFileTransfer)) {
       void this.addReaction(messageId).catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
         console.warn(`[gateway] feishu add reaction failed: ${msg}`);
       });
     }
+
+    if (messageType === "file") {
+      const fileKey = toString(contentObj.file_key);
+      const fileName = sanitizeInboundFileName(toString(contentObj.file_name, "upload.bin"));
+      if (!messageId || !fileKey) {
+        await this.replyText(chatId, "failed to process file message: missing message_id or file_key");
+        return;
+      }
+      try {
+        const fileData = await this.downloadMessageResourceFile(messageId, fileKey);
+        await this.router.handleFileMessage({
+          channel: "feishu",
+          chatId,
+          senderId: senderOpenId || undefined,
+          fileName,
+          fileData,
+          allowFrom: this.config.allowFrom,
+          responder: this,
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        await this.replyText(chatId, `failed to process file: ${msg}`);
+      }
+      return;
+    }
+
+    if (messageType !== "text") {
+      return;
+    }
+
+    const text = toString(contentObj.text, rawContent);
 
     try {
       await this.router.handleTextMessage({

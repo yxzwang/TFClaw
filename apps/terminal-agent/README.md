@@ -28,6 +28,14 @@ On Windows, supports screen and window source listing/capture.
 - `TFCLAW_TMUX_BOOTSTRAP_WINDOW` (default `__tfclaw_bootstrap__`)
 - `TFCLAW_TMUX_RESET_ON_BOOT` (default `1`, recreate session on startup)
 - `TFCLAW_TMUX_PERSIST_SESSION_ON_SHUTDOWN` (default `0`)
+- `TFCLAW_FILE_TRANSFER_ROOT` (default `${TFCLAW_DEFAULT_CWD}/tfclaw-files`)
+- `TFCLAW_FILE_TRANSFER_CHUNK_BYTES` (default `65536`)
+- `TFCLAW_FILE_TRANSFER_MAX_BYTES` (default `52428800`)
+- `TFCLAW_FILE_UPLOAD_TIMEOUT_MS` (default `600000`)
+
+File transfer path behavior:
+- If `file.upload.start` / `file.download` carries `sessionKey` and the corresponding tmux target exists, relative paths and default upload destination follow that target pane current path.
+- Otherwise it falls back to `TFCLAW_FILE_TRANSFER_ROOT`.
 
 When `TFCLAW_TMUX_COMMAND` is `wsl.exe`, Windows paths like `C:\work\repo` are auto-converted to `/mnt/c/work/repo` for tmux `-c`.
 

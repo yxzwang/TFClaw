@@ -21,6 +21,8 @@ import {
   View,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 
 type PlatformName = "windows" | "macos" | "linux" | "unknown";
 type AppStage = "login" | "chat";
@@ -42,6 +44,8 @@ const CONTENT_FONT_LABELS = ["M", "L", "XL"] as const;
 const UI_SCALE_MIN_PERCENT = 10;
 const UI_SCALE_MAX_PERCENT = 130;
 const UI_SCALE_STEPS = [10, 25, 50, 75, 100, 115, 130] as const;
+const FILE_TRANSFER_CHUNK_BASE64_CHARS = 88_000;
+const FILE_DOWNLOAD_DIRECTORY_NAME = "tfclaw-downloads";
 const TMUX_KEY_SHORTCUTS: Array<{ label: string; token: string }> = [
   { label: "^C", token: "^C" },
   { label: "Enter", token: "enter" },
@@ -112,11 +116,43 @@ interface AgentErrorMessage {
   };
 }
 
+interface AgentFileTransferMessage {
+  type: "agent.file_transfer";
+  payload:
+    | {
+        direction: "download";
+        stage: "start";
+        requestId?: string;
+        transferId: string;
+        fileName: string;
+        path: string;
+        mimeType: string;
+        size: number;
+        totalChunks: number;
+      }
+    | {
+        direction: "download";
+        stage: "chunk";
+        requestId?: string;
+        transferId: string;
+        chunkIndex: number;
+        totalChunks: number;
+        chunkBase64: string;
+      }
+    | {
+        direction: "download";
+        stage: "complete";
+        requestId?: string;
+        transferId: string;
+      };
+}
+
 type IncomingMessage =
   | RelayStateMessage
   | RelayAckMessage
   | AgentCommandResultMessage
   | AgentTerminalOutputMessage
+  | AgentFileTransferMessage
   | AgentErrorMessage;
 
 interface ChatMessage {
@@ -144,6 +180,17 @@ interface TextActionMenuState {
   y: number;
   sourceType: "message" | "tmux";
   sourceId?: string;
+}
+
+interface IncomingDownloadTransfer {
+  transferId: string;
+  requestId?: string;
+  fileName: string;
+  sourcePath: string;
+  mimeType: string;
+  size: number;
+  totalChunks: number;
+  chunks: string[];
 }
 
 function randomId(prefix: string): string {
@@ -243,6 +290,39 @@ function parseTmuxLinesValue(output: string): number | undefined {
   return undefined;
 }
 
+function sanitizeDownloadFileName(input: string): string {
+  const cleaned = String(input ?? "")
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
+  return cleaned || `download-${Date.now()}.bin`;
+}
+
+function fileNameFromPath(inputPath: string): string {
+  const normalized = String(inputPath ?? "").replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? "download.bin";
+}
+
+function base64ByteLength(base64: string): number {
+  const sanitized = base64.replace(/\s+/g, "");
+  if (!sanitized) {
+    return 0;
+  }
+  const padding = sanitized.endsWith("==") ? 2 : sanitized.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((sanitized.length * 3) / 4) - padding);
+}
+
+function splitBase64Chunks(base64: string, chunkChars = FILE_TRANSFER_CHUNK_BASE64_CHARS): string[] {
+  const safeChunkChars = Math.max(4, chunkChars - (chunkChars % 4));
+  const chunks: string[] = [];
+  for (let offset = 0; offset < base64.length; offset += safeChunkChars) {
+    chunks.push(base64.slice(offset, offset + safeChunkChars));
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
+
 export default function App() {
   const [stage, setStage] = useState<AppStage>("login");
   const [relayUrl, setRelayUrl] = useState("");
@@ -268,6 +348,9 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tmuxRenderByTarget, setTmuxRenderByTarget] = useState<Record<string, string>>({});
   const [tmuxLiveProgressByTarget, setTmuxLiveProgressByTarget] = useState<Record<string, string>>({});
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const [downloadDialogOpen, setDownloadDialogOpen] = useState(false);
+  const [downloadPathInput, setDownloadPathInput] = useState("");
   const [selectedTextMessageId, setSelectedTextMessageId] = useState("");
   const [terminalTextSelected, setTerminalTextSelected] = useState(false);
   const [textActionMenu, setTextActionMenu] = useState<TextActionMenuState>({
@@ -288,6 +371,7 @@ export default function App() {
   const tmuxProgressRequestTargetRef = useRef<Map<string, string>>(new Map());
   const pendingMapRef = useRef<Map<string, PendingCommandState>>(new Map());
   const silentRequestIdsRef = useRef<Set<string>>(new Set());
+  const incomingDownloadTransfersRef = useRef<Map<string, IncomingDownloadTransfer>>(new Map());
   const closeSwitchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatScrollRef = useRef<ScrollView | null>(null);
@@ -723,6 +807,11 @@ export default function App() {
       return;
     }
 
+    if (parsed.type === "agent.file_transfer") {
+      handleIncomingFileTransfer(parsed);
+      return;
+    }
+
     if (parsed.type === "agent.error") {
       const requestId = parsed.payload.requestId;
       const isSilent = Boolean(requestId && silentRequestIdsRef.current.has(requestId));
@@ -752,7 +841,7 @@ export default function App() {
       return;
     }
 
-  if (parsed.type === "relay.ack" && !parsed.payload.ok) {
+    if (parsed.type === "relay.ack" && !parsed.payload.ok) {
       const ackText = parsed.payload.message ? `Request failed: ${parsed.payload.message}` : "Request failed";
       appendSystemText(ackText);
     }
@@ -817,10 +906,14 @@ export default function App() {
     clearTmuxProgress();
     setTmuxRenderByTarget({});
     setTmuxLiveProgressByTarget({});
+    clearIncomingDownloadTransfers();
+    setUploadingFile(false);
     tmuxProgressRequestTargetRef.current.clear();
     selectedTmuxTargetRef.current = "";
     setTmuxNewDialogOpen(false);
     setTmuxNewNameInput("");
+    setDownloadDialogOpen(false);
+    setDownloadPathInput("");
     silentRequestIdsRef.current.clear();
     if (closeSwitchTimerRef.current) {
       clearTimeout(closeSwitchTimerRef.current);
@@ -880,9 +973,13 @@ export default function App() {
       pendingMapRef.current.clear();
       setTmuxNewDialogOpen(false);
       setTmuxNewNameInput("");
+      setDownloadDialogOpen(false);
+      setDownloadPathInput("");
       silentRequestIdsRef.current.clear();
       setTmuxRenderByTarget({});
       setTmuxLiveProgressByTarget({});
+      clearIncomingDownloadTransfers();
+      setUploadingFile(false);
       tmuxProgressRequestTargetRef.current.clear();
       selectedTmuxTargetRef.current = "";
       if (closeSwitchTimerRef.current) {
@@ -908,9 +1005,13 @@ export default function App() {
     pendingMapRef.current.clear();
     setTmuxNewDialogOpen(false);
     setTmuxNewNameInput("");
+    setDownloadDialogOpen(false);
+    setDownloadPathInput("");
     silentRequestIdsRef.current.clear();
     setTmuxRenderByTarget({});
     setTmuxLiveProgressByTarget({});
+    clearIncomingDownloadTransfers();
+    setUploadingFile(false);
     tmuxProgressRequestTargetRef.current.clear();
     selectedTmuxTargetRef.current = "";
     if (closeSwitchTimerRef.current) {
@@ -997,6 +1098,235 @@ export default function App() {
 
   const handleTCapture = () => {
     void sendCommandText("/tcapture");
+  };
+
+  const clearIncomingDownloadTransfers = () => {
+    incomingDownloadTransfersRef.current.clear();
+  };
+
+  const ensureDownloadDirectoryUri = async (): Promise<string> => {
+    const baseUri = FileSystem.documentDirectory;
+    if (!baseUri) {
+      throw new Error("Document directory is unavailable on this device.");
+    }
+    const targetDir = `${baseUri}${FILE_DOWNLOAD_DIRECTORY_NAME}/`;
+    await FileSystem.makeDirectoryAsync(targetDir, { intermediates: true });
+    return targetDir;
+  };
+
+  const ensureUniqueDownloadUri = async (dirUri: string, fileName: string): Promise<string> => {
+    const safeFileName = sanitizeDownloadFileName(fileName);
+    const dotIndex = safeFileName.lastIndexOf(".");
+    const baseName = dotIndex > 0 ? safeFileName.slice(0, dotIndex) : safeFileName;
+    const extension = dotIndex > 0 ? safeFileName.slice(dotIndex) : "";
+
+    let index = 0;
+    while (index < 5000) {
+      const suffix = index === 0 ? "" : `-${index}`;
+      const uri = `${dirUri}${baseName}${suffix}${extension}`;
+      const info = await FileSystem.getInfoAsync(uri);
+      if (!info.exists) {
+        return uri;
+      }
+      index += 1;
+    }
+
+    return `${dirUri}${baseName}-${Date.now()}${extension}`;
+  };
+
+  const finalizeIncomingDownloadTransfer = async (transfer: IncomingDownloadTransfer) => {
+    const missingIndex = transfer.chunks.findIndex((chunk) => chunk.length === 0);
+    if (missingIndex >= 0) {
+      appendSystemText(
+        `[file] download incomplete: missing chunk ${missingIndex + 1}/${transfer.totalChunks} for ${transfer.fileName}`,
+      );
+      return;
+    }
+
+    const mergedBase64 = transfer.chunks.join("");
+    const fileName = sanitizeDownloadFileName(transfer.fileName || fileNameFromPath(transfer.sourcePath));
+    const dirUri = await ensureDownloadDirectoryUri();
+    const targetUri = await ensureUniqueDownloadUri(dirUri, fileName);
+    await FileSystem.writeAsStringAsync(targetUri, mergedBase64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    const size = base64ByteLength(mergedBase64);
+    appendSystemText(`[file] received ${fileName} (${size} bytes) -> ${targetUri}`);
+  };
+
+  const handleIncomingFileTransfer = (message: AgentFileTransferMessage) => {
+    const payload = message.payload;
+    if (payload.direction !== "download") {
+      return;
+    }
+
+    if (payload.stage === "start") {
+      const totalChunks = Math.max(1, Math.trunc(payload.totalChunks));
+      incomingDownloadTransfersRef.current.set(payload.transferId, {
+        transferId: payload.transferId,
+        requestId: payload.requestId,
+        fileName: payload.fileName,
+        sourcePath: payload.path,
+        mimeType: payload.mimeType,
+        size: Math.max(0, Math.trunc(payload.size)),
+        totalChunks,
+        chunks: new Array(totalChunks).fill(""),
+      });
+      appendSystemText(
+        `[file] receiving ${payload.fileName || fileNameFromPath(payload.path)} (${payload.size} bytes, chunks=${totalChunks})`,
+      );
+      return;
+    }
+
+    const transfer = incomingDownloadTransfersRef.current.get(payload.transferId);
+    if (!transfer) {
+      appendSystemText(`[file] transfer not found: ${payload.transferId}`);
+      return;
+    }
+
+    if (payload.stage === "chunk") {
+      const index = Math.trunc(payload.chunkIndex);
+      if (payload.totalChunks !== transfer.totalChunks) {
+        appendSystemText(`[file] chunk count mismatch for ${transfer.fileName}.`);
+        return;
+      }
+      if (index < 0 || index >= transfer.totalChunks) {
+        appendSystemText(`[file] invalid chunk index ${payload.chunkIndex} for ${transfer.fileName}.`);
+        return;
+      }
+      transfer.chunks[index] = payload.chunkBase64;
+      return;
+    }
+
+    incomingDownloadTransfersRef.current.delete(payload.transferId);
+    void finalizeIncomingDownloadTransfer(transfer).catch((error) => {
+      const messageText = error instanceof Error ? error.message : String(error);
+      appendSystemText(`[file] save failed: ${messageText}`);
+    });
+  };
+
+  const handleSendFile = () => {
+    void (async () => {
+      if (uploadingFile) {
+        return;
+      }
+      if (!isOnline) {
+        appendSystemText("[file] not connected.");
+        return;
+      }
+
+      setUploadingFile(true);
+      try {
+        const picked = await DocumentPicker.getDocumentAsync({
+          type: "*/*",
+          multiple: false,
+          copyToCacheDirectory: true,
+        });
+        if (picked.canceled || !picked.assets || picked.assets.length === 0) {
+          return;
+        }
+
+        const asset = picked.assets[0];
+        const fileName = sanitizeDownloadFileName(asset.name || `upload-${Date.now()}.bin`);
+        const fileBase64 = await FileSystem.readAsStringAsync(asset.uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+
+        const chunks = splitBase64Chunks(fileBase64, FILE_TRANSFER_CHUNK_BASE64_CHARS);
+        const transferId = randomId("file-upload");
+        const totalChunks = chunks.length;
+        const fileSize = typeof asset.size === "number" && asset.size >= 0 ? asset.size : base64ByteLength(fileBase64);
+        const startRequestId = randomId("file-upload-start");
+        const completeRequestId = randomId("file-upload-complete");
+
+        const started = sendJson({
+          type: "client.command",
+          requestId: startRequestId,
+          payload: {
+            command: "file.upload.start",
+            transferId,
+            fileName,
+            size: fileSize,
+            totalChunks,
+            mimeType: asset.mimeType ?? "application/octet-stream",
+          },
+        });
+        if (!started) {
+          return;
+        }
+
+        for (let index = 0; index < chunks.length; index += 1) {
+          const ok = sendJson({
+            type: "client.command",
+            payload: {
+              command: "file.upload.chunk",
+              transferId,
+              chunkIndex: index,
+              totalChunks,
+              chunkBase64: chunks[index],
+            },
+          });
+          if (!ok) {
+            appendSystemText(`[file] upload interrupted at chunk ${index + 1}/${totalChunks}.`);
+            return;
+          }
+          if (index > 0 && index % 12 === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+        }
+
+        const completed = sendJson({
+          type: "client.command",
+          requestId: completeRequestId,
+          payload: {
+            command: "file.upload.complete",
+            transferId,
+            totalChunks,
+          },
+        });
+
+        if (completed) {
+          appendSystemText(`[file] uploading ${fileName} (${fileSize} bytes, chunks=${totalChunks})`);
+        }
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : String(error);
+        appendSystemText(`[file] upload failed: ${messageText}`);
+      } finally {
+        setUploadingFile(false);
+      }
+    })();
+  };
+
+  const openDownloadDialog = () => {
+    setDownloadPathInput("");
+    setDownloadDialogOpen(true);
+  };
+
+  const closeDownloadDialog = () => {
+    setDownloadDialogOpen(false);
+    setDownloadPathInput("");
+  };
+
+  const handleRequestFileDownload = () => {
+    const remotePath = downloadPathInput.trim();
+    if (!remotePath) {
+      appendSystemText("[file] remote path is required.");
+      return;
+    }
+    const requestId = randomId("file-download");
+    const sent = sendJson({
+      type: "client.command",
+      requestId,
+      payload: {
+        command: "file.download",
+        path: remotePath,
+      },
+    });
+    if (!sent) {
+      return;
+    }
+    appendSystemText(`[file] download requested: ${remotePath}`);
+    closeDownloadDialog();
   };
 
   const applyUiScalePercent = (value: number) => {
@@ -1321,6 +1651,7 @@ export default function App() {
       clearReconnectTimer();
       wsRef.current?.close();
       silentRequestIdsRef.current.clear();
+      incomingDownloadTransfersRef.current.clear();
       if (closeSwitchTimerRef.current) {
         clearTimeout(closeSwitchTimerRef.current);
         closeSwitchTimerRef.current = null;
@@ -1333,6 +1664,7 @@ export default function App() {
     if (stage !== "chat") {
       keepConnectionRef.current = false;
       clearReconnectTimer();
+      clearIncomingDownloadTransfers();
     }
   }, [stage]);
 
@@ -1366,6 +1698,7 @@ export default function App() {
       setTmuxKeyPanelOpen(false);
       setTmuxNewDialogOpen(false);
       setTmuxNewNameInput("");
+      setDownloadDialogOpen(false);
       setTmuxLiveProgressByTarget({});
       tmuxProgressRequestTargetRef.current.clear();
     }
@@ -1611,6 +1944,19 @@ export default function App() {
                       <Text style={[styles.btnText, dynamicUi.btnText]}>/tcapture</Text>
                     </Pressable>
                     <Pressable
+                      style={[styles.btn, dynamicUi.btn, styles.topBtn, dynamicUi.topBtn, styles.topBtnFileSend]}
+                      onPress={handleSendFile}
+                      disabled={uploadingFile}
+                    >
+                      <Text style={[styles.btnText, dynamicUi.btnText]}>{uploadingFile ? "Sending..." : "Send File"}</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.btn, dynamicUi.btn, styles.topBtn, dynamicUi.topBtn, styles.topBtnFileGet]}
+                      onPress={openDownloadDialog}
+                    >
+                      <Text style={[styles.btnText, dynamicUi.btnText]}>Get File</Text>
+                    </Pressable>
+                    <Pressable
                       style={[styles.btn, dynamicUi.btn, styles.topBtn, dynamicUi.topBtn, styles.topBtnBright]}
                       onPress={connectWithToken}
                       disabled={isConnecting}
@@ -1842,6 +2188,42 @@ export default function App() {
           </View>
         </Modal>
         <Modal
+          visible={downloadDialogOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={closeDownloadDialog}
+        >
+          <View style={styles.dialogBackdrop}>
+            <View style={styles.dialogCard}>
+              <Text style={[styles.dialogTitle, dynamicUi.dialogTitle]}>Download remote file</Text>
+              <Text style={[styles.metaText, dynamicUi.metaText]}>remote path:</Text>
+              <TextInput
+                style={[styles.input, dynamicUi.input]}
+                value={downloadPathInput}
+                onChangeText={setDownloadPathInput}
+                placeholder="e.g. /home/user/output.zip"
+                placeholderTextColor="#6f878f"
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoFocus
+                returnKeyType="done"
+                onSubmitEditing={handleRequestFileDownload}
+              />
+              <View style={styles.dialogActions}>
+                <Pressable style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn, styles.dialogCancelBtn]} onPress={closeDownloadDialog}>
+                  <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Cancel</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.linesApplyBtn, dynamicUi.linesApplyBtn, styles.dialogConfirmBtn]}
+                  onPress={handleRequestFileDownload}
+                >
+                  <Text style={[styles.linesApplyBtnText, dynamicUi.linesApplyBtnText]}>Download</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
+        <Modal
           visible={tmuxNewDialogOpen}
           transparent
           animationType="fade"
@@ -2047,6 +2429,16 @@ const styles = StyleSheet.create({
     backgroundColor: "#4f7b51",
     borderWidth: 1,
     borderColor: "#7ab27d",
+  },
+  topBtnFileSend: {
+    backgroundColor: "#6a6b99",
+    borderWidth: 1,
+    borderColor: "#989ad3",
+  },
+  topBtnFileGet: {
+    backgroundColor: "#4a6f8d",
+    borderWidth: 1,
+    borderColor: "#7ea6c8",
   },
   btnText: {
     color: "#081114",

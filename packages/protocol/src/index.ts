@@ -45,6 +45,7 @@ export type RelayMessage =
   | AgentScreenCapture
   | AgentCaptureSources
   | AgentCommandResult
+  | AgentFileTransfer
   | AgentError
   | ClientHello
   | ClientCommand
@@ -93,6 +94,39 @@ export interface AgentCommandResult {
     progress?: boolean;
     progressSource?: string;
   };
+}
+
+export type FileTransferDirection = "download";
+
+export interface AgentFileTransfer {
+  type: "agent.file_transfer";
+  payload:
+    | {
+        direction: FileTransferDirection;
+        stage: "start";
+        requestId?: string;
+        transferId: string;
+        fileName: string;
+        path: string;
+        mimeType: string;
+        size: number;
+        totalChunks: number;
+      }
+    | {
+        direction: FileTransferDirection;
+        stage: "chunk";
+        requestId?: string;
+        transferId: string;
+        chunkIndex: number;
+        totalChunks: number;
+        chunkBase64: string;
+      }
+    | {
+        direction: FileTransferDirection;
+        stage: "complete";
+        requestId?: string;
+        transferId: string;
+      };
 }
 
 export interface AgentError {
@@ -144,6 +178,34 @@ export interface ClientCommand {
     | {
         command: "tfclaw.command";
         text: string;
+        sessionKey?: string;
+      }
+    | {
+        command: "file.upload.start";
+        transferId: string;
+        fileName: string;
+        size: number;
+        totalChunks: number;
+        mimeType?: string;
+        destinationPath?: string;
+        overwrite?: boolean;
+        sessionKey?: string;
+      }
+    | {
+        command: "file.upload.chunk";
+        transferId: string;
+        chunkIndex: number;
+        totalChunks: number;
+        chunkBase64: string;
+      }
+    | {
+        command: "file.upload.complete";
+        transferId: string;
+        totalChunks: number;
+      }
+    | {
+        command: "file.download";
+        path: string;
         sessionKey?: string;
       };
   requestId?: string;

@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { URL } from "node:url";
 import {
@@ -75,6 +77,18 @@ interface TmuxPaneRow {
   activity: string;
 }
 
+interface PendingUploadTransfer {
+  transferId: string;
+  fileName: string;
+  mimeType: string;
+  destinationPath?: string;
+  overwrite: boolean;
+  size: number;
+  totalChunks: number;
+  chunks: string[];
+  createdAt: number;
+}
+
 function sanitizeTmuxName(name: string): string {
   return name
     .trim()
@@ -125,6 +139,19 @@ const TMUX_STREAM_WINDOW_MS = Number.parseInt(process.env.TFCLAW_TMUX_STREAM_WIN
 const TMUX_BOOTSTRAP_WINDOW = sanitizeTmuxName(process.env.TFCLAW_TMUX_BOOTSTRAP_WINDOW ?? "__tfclaw_bootstrap__");
 const TMUX_RESET_ON_BOOT = parseBoolean(process.env.TFCLAW_TMUX_RESET_ON_BOOT, true);
 const TMUX_PERSIST_SESSION_ON_SHUTDOWN = parseBoolean(process.env.TFCLAW_TMUX_PERSIST_SESSION_ON_SHUTDOWN, false);
+const FILE_TRANSFER_ROOT = path.resolve(process.env.TFCLAW_FILE_TRANSFER_ROOT ?? path.join(DEFAULT_CWD, "tfclaw-files"));
+const FILE_TRANSFER_CHUNK_BYTES = Math.max(
+  16 * 1024,
+  Math.min(200 * 1024, Number.parseInt(process.env.TFCLAW_FILE_TRANSFER_CHUNK_BYTES ?? "65536", 10) || 65536),
+);
+const FILE_TRANSFER_MAX_BYTES = Math.max(
+  1 * 1024 * 1024,
+  Math.min(512 * 1024 * 1024, Number.parseInt(process.env.TFCLAW_FILE_TRANSFER_MAX_BYTES ?? "52428800", 10) || 52428800),
+);
+const FILE_UPLOAD_TIMEOUT_MS = Math.max(
+  60_000,
+  Math.min(30 * 60_000, Number.parseInt(process.env.TFCLAW_FILE_UPLOAD_TIMEOUT_MS ?? "600000", 10) || 600000),
+);
 
 if (!TOKEN) {
   console.error("Missing TFCLAW_TOKEN. Example: TFCLAW_TOKEN=demo-token npm run dev --workspace @tfclaw/terminal-agent");
@@ -139,6 +166,7 @@ let syncLoopBusy = false;
 let syncTimer: NodeJS.Timeout | undefined;
 const captureErrorAt = new Map<string, number>();
 const tmuxControlStateBySession = new Map<string, TmuxControlState>();
+const uploadTransfers = new Map<string, PendingUploadTransfer>();
 
 const TMUX_STREAM_COMMANDS = new Set([
   "bun",
@@ -1113,6 +1141,311 @@ function sendCommandResult(
   });
 }
 
+function randomTransferId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+}
+
+function sanitizeFileName(name: string): string {
+  const next = name
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
+  return next || `file-${Date.now()}`;
+}
+
+function inferMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeByExt: Record<string, string> = {
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".js": "text/javascript",
+    ".ts": "text/typescript",
+    ".tsx": "text/typescript",
+    ".jsx": "text/javascript",
+    ".yml": "text/yaml",
+    ".yaml": "text/yaml",
+    ".xml": "application/xml",
+    ".csv": "text/csv",
+    ".log": "text/plain",
+    ".pdf": "application/pdf",
+    ".zip": "application/zip",
+    ".gz": "application/gzip",
+    ".tar": "application/x-tar",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+  };
+  return mimeByExt[ext] ?? "application/octet-stream";
+}
+
+function pruneUploadTransfers(): void {
+  const now = Date.now();
+  for (const [transferId, pending] of uploadTransfers.entries()) {
+    if (now - pending.createdAt > FILE_UPLOAD_TIMEOUT_MS) {
+      uploadTransfers.delete(transferId);
+    }
+  }
+}
+
+function resolveUploadDestinationPath(transfer: PendingUploadTransfer): string {
+  const destinationRaw = (transfer.destinationPath ?? "").trim();
+  if (!destinationRaw) {
+    return path.resolve(FILE_TRANSFER_ROOT, sanitizeFileName(transfer.fileName));
+  }
+
+  const resolved = path.isAbsolute(destinationRaw)
+    ? path.resolve(destinationRaw)
+    : path.resolve(FILE_TRANSFER_ROOT, destinationRaw);
+
+  if (destinationRaw.endsWith("/") || destinationRaw.endsWith("\\")) {
+    return path.join(resolved, sanitizeFileName(transfer.fileName));
+  }
+  return resolved;
+}
+
+async function resolveTmuxTargetPath(sessionKeyRaw?: string): Promise<string | undefined> {
+  const state = getTmuxControlState(sessionKeyRaw);
+  const target = state.target.trim();
+  if (!target) {
+    return undefined;
+  }
+
+  const result = await runTmuxRawWithSocket(
+    ["display-message", "-p", "-t", target, "#{pane_current_path}"],
+    state.socket || undefined,
+  );
+  if (result.spawnError || result.code !== 0) {
+    return undefined;
+  }
+
+  const next = result.stdout.trim();
+  return next || undefined;
+}
+
+async function resolveDownloadPath(inputPath: string, sessionKeyRaw?: string): Promise<string> {
+  const value = inputPath.trim();
+  if (!value) {
+    throw new Error("file path is required");
+  }
+  if (path.isAbsolute(value)) {
+    return path.resolve(value);
+  }
+  const tmuxPath = await resolveTmuxTargetPath(sessionKeyRaw);
+  if (tmuxPath) {
+    return path.resolve(tmuxPath, value);
+  }
+  return path.resolve(FILE_TRANSFER_ROOT, value);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveUploadOutputPath(filePath: string, overwrite: boolean): Promise<string> {
+  if (overwrite || !await fileExists(filePath)) {
+    return filePath;
+  }
+
+  const parsed = path.parse(filePath);
+  for (let index = 1; index <= 10_000; index += 1) {
+    const candidate = path.join(parsed.dir, `${parsed.name}-${index}${parsed.ext}`);
+    if (!await fileExists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return path.join(parsed.dir, `${parsed.name}-${Date.now()}${parsed.ext}`);
+}
+
+async function handleFileUploadStart(
+  payload: Extract<ClientCommand["payload"], { command: "file.upload.start" }>,
+  requestId?: string,
+): Promise<void> {
+  pruneUploadTransfers();
+  const transferId = payload.transferId.trim();
+  if (!transferId) {
+    throw new Error("file upload start requires a transferId");
+  }
+  if (uploadTransfers.has(transferId)) {
+    throw new Error(`upload transfer already exists: ${transferId}`);
+  }
+
+  const totalChunks = Math.max(1, Math.min(100_000, Math.trunc(payload.totalChunks)));
+  const expectedSize = Math.max(0, Math.trunc(payload.size));
+  if (!Number.isFinite(payload.totalChunks) || payload.totalChunks < 1) {
+    throw new Error("file upload start requires totalChunks >= 1");
+  }
+  if (!Number.isFinite(payload.size) || payload.size < 0) {
+    throw new Error("file upload start requires size >= 0");
+  }
+  if (expectedSize > FILE_TRANSFER_MAX_BYTES) {
+    throw new Error(`file too large, max ${FILE_TRANSFER_MAX_BYTES} bytes`);
+  }
+
+  let destinationPath = payload.destinationPath;
+  if (!destinationPath || destinationPath.trim().length === 0) {
+    const tmuxPath = await resolveTmuxTargetPath(payload.sessionKey);
+    if (tmuxPath) {
+      destinationPath = path.join(tmuxPath, sanitizeFileName(payload.fileName));
+    }
+  }
+
+  uploadTransfers.set(transferId, {
+    transferId,
+    fileName: sanitizeFileName(payload.fileName),
+    mimeType: (payload.mimeType ?? "application/octet-stream").trim() || "application/octet-stream",
+    destinationPath,
+    overwrite: Boolean(payload.overwrite),
+    size: expectedSize,
+    totalChunks,
+    chunks: new Array(totalChunks).fill(""),
+    createdAt: Date.now(),
+  });
+
+  if (requestId) {
+    sendCommandResult(
+      `[file] upload started: ${payload.fileName} (${expectedSize} bytes, chunks=${totalChunks})`,
+      requestId,
+    );
+  }
+}
+
+async function handleFileUploadChunk(
+  payload: Extract<ClientCommand["payload"], { command: "file.upload.chunk" }>,
+): Promise<void> {
+  pruneUploadTransfers();
+  const transferId = payload.transferId.trim();
+  const transfer = uploadTransfers.get(transferId);
+  if (!transfer) {
+    throw new Error(`upload transfer not found: ${transferId}`);
+  }
+  if (payload.totalChunks !== transfer.totalChunks) {
+    throw new Error(`upload chunk total mismatch: expected ${transfer.totalChunks}, got ${payload.totalChunks}`);
+  }
+
+  const index = Math.trunc(payload.chunkIndex);
+  if (!Number.isFinite(payload.chunkIndex) || index < 0 || index >= transfer.totalChunks) {
+    throw new Error(`invalid upload chunk index: ${payload.chunkIndex}`);
+  }
+  if (!payload.chunkBase64) {
+    throw new Error(`empty upload chunk: ${index}`);
+  }
+  transfer.chunks[index] = payload.chunkBase64;
+  transfer.createdAt = Date.now();
+}
+
+async function handleFileUploadComplete(
+  payload: Extract<ClientCommand["payload"], { command: "file.upload.complete" }>,
+  requestId?: string,
+): Promise<void> {
+  pruneUploadTransfers();
+  const transferId = payload.transferId.trim();
+  const transfer = uploadTransfers.get(transferId);
+  if (!transfer) {
+    throw new Error(`upload transfer not found: ${transferId}`);
+  }
+  if (payload.totalChunks !== transfer.totalChunks) {
+    throw new Error(`upload complete total mismatch: expected ${transfer.totalChunks}, got ${payload.totalChunks}`);
+  }
+
+  const missingIndex = transfer.chunks.findIndex((chunk) => chunk.length === 0);
+  if (missingIndex >= 0) {
+    throw new Error(`missing upload chunk ${missingIndex + 1}/${transfer.totalChunks}`);
+  }
+
+  const fileBuffer = Buffer.from(transfer.chunks.join(""), "base64");
+  if (fileBuffer.byteLength > FILE_TRANSFER_MAX_BYTES) {
+    throw new Error(`file too large, max ${FILE_TRANSFER_MAX_BYTES} bytes`);
+  }
+
+  const destinationPath = resolveUploadDestinationPath(transfer);
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  const outputPath = await resolveUploadOutputPath(destinationPath, transfer.overwrite);
+  await fs.writeFile(outputPath, fileBuffer);
+  uploadTransfers.delete(transferId);
+
+  sendCommandResult(
+    `[file] upload complete: ${outputPath} (${fileBuffer.byteLength} bytes, mime=${transfer.mimeType})`,
+    requestId,
+  );
+}
+
+async function handleFileDownload(
+  payload: Extract<ClientCommand["payload"], { command: "file.download" }>,
+  requestId?: string,
+): Promise<void> {
+  const targetPath = await resolveDownloadPath(payload.path, payload.sessionKey);
+  const fileStat = await fs.stat(targetPath);
+  if (!fileStat.isFile()) {
+    throw new Error(`not a file: ${targetPath}`);
+  }
+  if (fileStat.size > FILE_TRANSFER_MAX_BYTES) {
+    throw new Error(`file too large, max ${FILE_TRANSFER_MAX_BYTES} bytes`);
+  }
+
+  const fileBuffer = await fs.readFile(targetPath);
+  const transferId = randomTransferId("download");
+  const totalChunks = Math.max(1, Math.ceil(fileBuffer.byteLength / FILE_TRANSFER_CHUNK_BYTES));
+  const fileName = path.basename(targetPath);
+
+  send({
+    type: "agent.file_transfer",
+    payload: {
+      direction: "download",
+      stage: "start",
+      requestId,
+      transferId,
+      fileName,
+      path: targetPath,
+      mimeType: inferMimeType(targetPath),
+      size: fileBuffer.byteLength,
+      totalChunks,
+    },
+  });
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+    const start = chunkIndex * FILE_TRANSFER_CHUNK_BYTES;
+    const end = Math.min(fileBuffer.byteLength, start + FILE_TRANSFER_CHUNK_BYTES);
+    const chunkBase64 = fileBuffer.subarray(start, end).toString("base64");
+    send({
+      type: "agent.file_transfer",
+      payload: {
+        direction: "download",
+        stage: "chunk",
+        requestId,
+        transferId,
+        chunkIndex,
+        totalChunks,
+        chunkBase64,
+      },
+    });
+  }
+
+  send({
+    type: "agent.file_transfer",
+    payload: {
+      direction: "download",
+      stage: "complete",
+      requestId,
+      transferId,
+    },
+  });
+
+  sendCommandResult(
+    `[file] download sent: ${targetPath} (${fileBuffer.byteLength} bytes, chunks=${totalChunks})`,
+    requestId,
+  );
+}
+
 function normalizeControlSessionKey(input: string | undefined): string {
   const trimmed = (input ?? "").trim();
   return trimmed || "default";
@@ -2038,13 +2371,33 @@ async function handleCommand(command: ClientCommand): Promise<void> {
         sendCommandResult(output, command.requestId);
         return;
       }
+      case "file.upload.start": {
+        await handleFileUploadStart(payload, command.requestId);
+        return;
+      }
+      case "file.upload.chunk": {
+        await handleFileUploadChunk(payload);
+        return;
+      }
+      case "file.upload.complete": {
+        await handleFileUploadComplete(payload, command.requestId);
+        return;
+      }
+      case "file.download": {
+        await handleFileDownload(payload, command.requestId);
+        return;
+      }
       default: {
         console.error("Unknown command payload:", payload);
       }
     }
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    const code = payload.command.startsWith("terminal.") ? "TMUX_COMMAND_FAILED" : "AGENT_COMMAND_FAILED";
+    const code = payload.command.startsWith("terminal.")
+      ? "TMUX_COMMAND_FAILED"
+      : payload.command.startsWith("file.")
+        ? "FILE_TRANSFER_FAILED"
+        : "AGENT_COMMAND_FAILED";
     sendError(code, msg, command.requestId);
   }
 }
@@ -2110,6 +2463,7 @@ async function shutdown(): Promise<void> {
   ws?.close();
   ws = undefined;
   terminals.clear();
+  uploadTransfers.clear();
 
   if (!TMUX_PERSIST_SESSION_ON_SHUTDOWN) {
     await killTmuxSessionSilently();

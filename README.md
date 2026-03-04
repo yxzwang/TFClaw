@@ -47,12 +47,16 @@ TFClaw is a **“terminal-oriented remote desktop” MVP**, with a companion mob
 
 - `/tmux help` – View all supported commands
 - `/tmux status|sessions|panes|new|target|close|socket|lines|wait|stream|capture|key|send`
+- `/tmux fileget <path>` and `/tfileget <path>` – Download a file from agent and send it back to Feishu
 - `/t<subcommand>` alias (e.g., `/tkey`, `/ttarget`, `/tcapture`)
 - `/passthrough on|off|status` and `/pt on|off|status`
 - Passthrough mode: normal messages continuously sent to tmux until `/pt off`
 - `/capture` returns screen/window ID list; reply with number to receive image
 - Streaming output auto-pushes progress updates and recalls previous progress message upon new Feishu message (prevents stacking)
 - Adds reaction (default `OnIt`) to user message before processing
+- Supports Feishu file message upload to agent (chunked transfer)
+- For Feishu file upload and `/tmux fileget` relative paths, gateway binds to current `tmux target` pane path; falls back to `tfclaw-files` root if target path is unavailable
+- For Feishu file message and `/tmux fileget` command, reaction is sent first before processing
 
 ### Mobile (Expo) Supports
 
@@ -332,4 +336,3 @@ Recommended architecture:
 * Feishu dynamic window tracking does not maintain expected 24h persistence (cause unknown). Use `/tcapture` manually if needed.
 * Window enumeration/screenshot only supported on Windows agent; Linux/macOS support screen capture only.
 * Mobile app requires public server exposure — pay attention to security.
-
