@@ -10,6 +10,25 @@
     "apiKey": "",
     "timeoutMs": 90000
   },
+  "openclawBridge": {
+    "enabled": false,
+    "openclawRoot": "../openclaw",
+    "stateDir": ".runtime/openclaw_bridge",
+    "sharedSkillsDir": "../openclaw/skills",
+    "userHomeRoot": "/inspire/hdd/project/cq-scientific-cooperation-zone/ky26016/.home",
+    "userPrefix": "tfoc_",
+    "tmuxSessionPrefix": "tfoc-",
+    "gatewayHost": "127.0.0.1",
+    "gatewayPortBase": 19000,
+    "gatewayPortMax": 19999,
+    "startupTimeoutMs": 45000,
+    "requestTimeoutMs": 180000,
+    "sessionKey": "main",
+    "nodePath": "/usr/bin/node",
+    "configTemplatePath": "",
+    "autoBuildDist": false,
+    "allowAutoCreateUser": true
+  },
   "channels": {
     "feishu": {
       "enabled": true,

@@ -21,10 +21,37 @@ cp config.example.json config.json
 - `nexchatbot.enabled`
 - `nexchatbot.baseUrl`
 - `nexchatbot.runPath`（默认 `/v1/main-agent/feishu-bridge`）
+- `openclawBridge.enabled`
+- `openclawBridge.openclawRoot`
+- `openclawBridge.stateDir`
+- `openclawBridge.sharedSkillsDir`（公用 skills 目录）
+- `openclawBridge.userHomeRoot`（子用户 home 根目录）
+- `openclawBridge.userPrefix`
+- `openclawBridge.tmuxSessionPrefix`
+- `openclawBridge.gatewayPortBase`
+- `openclawBridge.gatewayPortMax`
+- `openclawBridge.sessionKey`
+- `openclawBridge.allowAutoCreateUser`
 - `channels.feishu.enabled`
 - `channels.feishu.appId`
 - `channels.feishu.appSecret`
 - `channels.feishu.disableProxy`（默认建议 `true`，避免本机代理拦截长连接初始化）
+
+### OpenClaw per-user bridge（飞书用户 -> Linux 用户 -> 独立 OpenClaw）
+
+当 `openclawBridge.enabled=true` 时：
+
+1. 每个飞书用户会映射到一个本地 Linux 用户（默认前缀 `tfoc_`）。
+2. 若 Linux 用户不存在，网关会自动创建（要求网关进程具备 root 权限，且 `allowAutoCreateUser=true`）。
+3. 网关会在该 Linux 用户下复用/拉起 tmux session，并在该 session 中启动独立 OpenClaw Gateway 进程。
+4. TFClaw 收到的飞书消息会转发为 OpenClaw `chat.send`，等待 `chat` final 事件后，把回复再发回飞书。
+5. 会强制写入该用户的 OpenClaw 运行配置，禁用 OpenClaw 自带 Feishu 通道（由 TFClaw 统一收发）。
+
+注意：
+
+- 需要系统可用：`tmux`、`useradd`、`runuser`/`sudo`/`su`。
+- 需要 OpenClaw 已可运行（至少存在 `openclaw.mjs` 与 `dist/entry.js`）。  
+  若 `openclawBridge.autoBuildDist=true`，网关会尝试自动执行 `pnpm exec tsdown --no-clean`。
 
 ## 启动
 
@@ -52,14 +79,32 @@ npm run start:gateway
 - `TFCLAW_NEXCHATBOT_RUN_PATH`
 - `TFCLAW_NEXCHATBOT_API_KEY`
 - `TFCLAW_NEXCHATBOT_TIMEOUT_MS`
+- `TFCLAW_OPENCLAW_ENABLED`
+- `TFCLAW_OPENCLAW_ROOT`
+- `TFCLAW_OPENCLAW_STATE_DIR`
+- `TFCLAW_OPENCLAW_SHARED_SKILLS_DIR`
+- `TFCLAW_OPENCLAW_USER_HOME_ROOT`
+- `TFCLAW_OPENCLAW_USER_PREFIX`
+- `TFCLAW_OPENCLAW_TMUX_SESSION_PREFIX`
+- `TFCLAW_OPENCLAW_GATEWAY_HOST`
+- `TFCLAW_OPENCLAW_GATEWAY_PORT_BASE`
+- `TFCLAW_OPENCLAW_GATEWAY_PORT_MAX`
+- `TFCLAW_OPENCLAW_STARTUP_TIMEOUT_MS`
+- `TFCLAW_OPENCLAW_REQUEST_TIMEOUT_MS`
+- `TFCLAW_OPENCLAW_SESSION_KEY`
+- `TFCLAW_OPENCLAW_NODE_PATH`
+- `TFCLAW_OPENCLAW_CONFIG_TEMPLATE_PATH`
+- `TFCLAW_OPENCLAW_AUTO_BUILD_DIST`
+- `TFCLAW_OPENCLAW_ALLOW_AUTO_CREATE_USER`
 
 ## 模式分流规则
 
 - `tmux` 模式（terminal/passthrough）：仅接受 `text`，内容直通 tmux（保持原行为）
 - `tfclaw` 模式：
   - 预设命令（`/tmux`、`/pt`、`/capture`、`/list`、`/new` 等）走 TFClaw 原流程
-  - 非预设消息（包括非 text）走 NexChatBot 桥接流程
-  - 返回给用户的内容直接使用 NexChatBot 的 `reply`
+  - 非预设消息（包括非 text）优先走 OpenClaw bridge（启用时）
+  - 若 OpenClaw bridge 未启用，则回退到 NexChatBot bridge
+  - 返回给用户的内容使用对应 bridge 的最终回复
 
 ## Feishu 命令
 

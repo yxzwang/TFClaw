@@ -1,8 +1,12 @@
 import fs from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
+import { URL } from "node:url";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import {
   type CaptureSource,
@@ -104,9 +108,30 @@ interface NexChatBotConfig {
   timeoutMs: number;
 }
 
+interface OpenClawBridgeConfig {
+  enabled: boolean;
+  openclawRoot: string;
+  stateDir: string;
+  sharedSkillsDir: string;
+  userHomeRoot: string;
+  userPrefix: string;
+  tmuxSessionPrefix: string;
+  gatewayHost: string;
+  gatewayPortBase: number;
+  gatewayPortMax: number;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  sessionKey: string;
+  nodePath: string;
+  configTemplatePath: string;
+  autoBuildDist: boolean;
+  allowAutoCreateUser: boolean;
+}
+
 interface GatewayConfig {
   relay: RelayConfig;
   nexchatbot: NexChatBotConfig;
+  openclawBridge: OpenClawBridgeConfig;
   channels: ChannelsConfig;
 }
 
@@ -222,6 +247,21 @@ interface NexChatBridgeRequest {
   historySeed?: HistorySeedEntry[];
 }
 
+interface OpenClawBridgeRequest {
+  source: "tfclaw_feishu_gateway";
+  channel: ChannelName;
+  selectionKey: string;
+  chatId: string;
+  senderId?: string;
+  senderOpenId?: string;
+  senderUserId?: string;
+  messageId?: string;
+  eventId?: string;
+  messageType: string;
+  text: string;
+  historySeed?: HistorySeedEntry[];
+}
+
 interface TerminalProgressSession {
   selectionKey: string;
   chatId: string;
@@ -260,6 +300,14 @@ interface ChatApp {
 
 function randomId(): string {
   return `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+}
+
+function sanitizeTmuxName(name: string): string {
+  return name
+    .trim()
+    .replace(/[^\w-]/g, "_")
+    .replace(/_{2,}/g, "_")
+    .slice(0, 64);
 }
 
 const REALTIME_FOREGROUND_COMMANDS = new Set([
@@ -652,6 +700,23 @@ function mergeNoProxyHosts(hosts: string[]): void {
   process.env.no_proxy = value;
 }
 
+function hostFromUrl(raw: string): string {
+  const text = raw.trim();
+  if (!text) {
+    return "";
+  }
+  try {
+    return new URL(text).hostname.trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isLocalNoProxyHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "0.0.0.0";
+}
+
 function isAnsiCsiFinal(ch: string | undefined): boolean {
   if (!ch) {
     return false;
@@ -808,6 +873,1115 @@ class NexChatBridgeClient {
   }
 }
 
+interface CommandRunResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  spawnError?: Error;
+}
+
+interface LinuxUserAccount {
+  username: string;
+  uid: number;
+  gid: number;
+  home: string;
+  shell: string;
+}
+
+interface OpenClawUserBinding {
+  linuxUser: string;
+  gatewayPort: number;
+  gatewayToken: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface OpenClawUserMapFile {
+  version: 1;
+  users: Record<string, OpenClawUserBinding>;
+}
+
+interface OpenClawResolvedUserBinding extends OpenClawUserBinding {
+  userKey: string;
+  account: LinuxUserAccount;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+const OPENCLAW_BRIDGE_FORCED_MODEL_ID = "nex/nex-n1.1";
+const OPENCLAW_BRIDGE_WORKDIR_CONST_NAME = "TFCLAW_USER_WORKDIR";
+const OPENCLAW_BRIDGE_WORKDIR_SEPARATOR = "——————————————————————";
+const OPENCLAW_BRIDGE_FORCED_PROVIDER = {
+  baseUrl: "https://nex-deepseek-long-context.openapi-qb-ai.sii.edu.cn/v1",
+  apiKey: "XncN/r7Uvu0PfmM9jwA0+0WRjTL4wE5RQa9qbUFnAM8=",
+  api: "openai-completions",
+  models: [
+    {
+      id: OPENCLAW_BRIDGE_FORCED_MODEL_ID,
+      name: OPENCLAW_BRIDGE_FORCED_MODEL_ID,
+    },
+  ],
+};
+
+class OpenClawPerUserBridge {
+  readonly enabled: boolean;
+
+  private readonly mapFilePath: string;
+  private readonly openclawEntryPath: string;
+  private readonly distEntryCandidates: string[];
+
+  private mapLock: Promise<void> = Promise.resolve();
+  private runAsModePromise: Promise<"runuser" | "sudo" | "su"> | undefined;
+  private distChecked = false;
+
+  constructor(private readonly config: OpenClawBridgeConfig) {
+    const root = path.resolve(config.openclawRoot || ".");
+    this.config.openclawRoot = root;
+    this.enabled = config.enabled && root.trim().length > 0;
+    this.mapFilePath = path.join(path.resolve(config.stateDir), "feishu-user-map.json");
+    this.openclawEntryPath = path.join(root, "openclaw.mjs");
+    this.distEntryCandidates = [
+      path.join(root, "dist", "entry.js"),
+      path.join(root, "dist", "entry.mjs"),
+    ];
+  }
+
+  async run(request: OpenClawBridgeRequest): Promise<string> {
+    if (!this.enabled) {
+      throw new Error("openclaw bridge is disabled");
+    }
+
+    await this.ensureOpenClawEntry();
+    const binding = await this.ensureUserBinding(request);
+    const runtime = this.prepareUserRuntime(binding);
+    await this.ensureTmuxOpenClawProcess(binding, runtime);
+
+    const prompt = this.composePrompt(
+      request.text,
+      request.historySeed,
+      runtime.workspaceConstDeclaration,
+    );
+    const reply = await this.callGatewayChat({
+      gatewayUrl: `ws://${this.config.gatewayHost}:${binding.gatewayPort}`,
+      gatewayToken: binding.gatewayToken,
+      message: prompt,
+    });
+    const normalized = reply.trim();
+    if (!normalized) {
+      return "(openclaw returned empty reply)";
+    }
+    if (normalized.toUpperCase() === "NO_REPLY") {
+      return "(openclaw returned NO_REPLY)";
+    }
+    return normalized;
+  }
+
+  private composePrompt(
+    text: string,
+    historySeed?: HistorySeedEntry[],
+    workspaceConstDeclaration?: string,
+  ): string {
+    const current = text.trim();
+    const workdirPrefix = workspaceConstDeclaration
+      ? [
+          `您的工作目录是：${workspaceConstDeclaration}`,
+          OPENCLAW_BRIDGE_WORKDIR_SEPARATOR,
+          "如涉及文件或目录操作，请默认在该工作目录内执行，除非用户明确指定其他路径。",
+          "你可以直接执行 shell 命令（exec 工具可用）；不要假设自己没有 shell 权限。",
+          "",
+        ]
+      : [];
+    const items = (historySeed ?? []).map((item) => item.content.trim()).filter(Boolean);
+    if (items.length === 0) {
+      return [...workdirPrefix, current].join("\n");
+    }
+    return [
+      ...workdirPrefix,
+      "以下是同一用户在本轮 @ 之前发送的上下文消息（按时间顺序）：",
+      ...items.map((item, idx) => `${idx + 1}. ${item}`),
+      "",
+      "当前消息：",
+      current,
+    ].join("\n");
+  }
+
+  private buildWorkspaceConstDeclaration(workspaceDir: string): string {
+    return `const ${OPENCLAW_BRIDGE_WORKDIR_CONST_NAME} = ${JSON.stringify(workspaceDir)};`;
+  }
+
+  private resolveRequestUserKey(request: OpenClawBridgeRequest): string {
+    return (request.senderOpenId || request.senderUserId || request.senderId || "").trim();
+  }
+
+  private deriveLinuxUser(userKey: string): string {
+    const hash = createHash("sha1").update(userKey).digest("hex");
+    const rawPrefix = this.config.userPrefix.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    const safePrefix = rawPrefix && /^[a-z_]/.test(rawPrefix) ? rawPrefix : "tfoc_";
+    const candidate = `${safePrefix}${hash.slice(0, 16)}`.replace(/[^a-z0-9_-]/g, "_");
+    const limited = candidate.slice(0, 31);
+    return /^[a-z_]/.test(limited) ? limited : `u${limited.slice(1)}`;
+  }
+
+  private buildRandomToken(): string {
+    return randomBytes(24).toString("hex");
+  }
+
+  private async withMapLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.mapLock;
+    let release: (() => void) | undefined;
+    this.mapLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release?.();
+    }
+  }
+
+  private async loadUserMap(): Promise<OpenClawUserMapFile> {
+    if (!fs.existsSync(this.mapFilePath)) {
+      return { version: 1, users: {} };
+    }
+    try {
+      const rawText = fs.readFileSync(this.mapFilePath, "utf8");
+      const parsed = toObject(JSON.parse(rawText));
+      const rawUsers = toObject(parsed.users);
+      const users: Record<string, OpenClawUserBinding> = {};
+      for (const [key, value] of Object.entries(rawUsers)) {
+        const item = toObject(value);
+        const linuxUser = toString(item.linuxUser).trim();
+        const gatewayPort = toNumber(item.gatewayPort, 0);
+        const gatewayToken = toString(item.gatewayToken).trim();
+        if (!linuxUser || gatewayPort <= 0) {
+          continue;
+        }
+        users[key] = {
+          linuxUser,
+          gatewayPort,
+          gatewayToken,
+          createdAt: toString(item.createdAt, new Date().toISOString()),
+          updatedAt: toString(item.updatedAt, new Date().toISOString()),
+        };
+      }
+      return { version: 1, users };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`failed to parse openclaw user map: ${msg}`);
+    }
+  }
+
+  private async saveUserMap(map: OpenClawUserMapFile): Promise<void> {
+    const dir = path.dirname(this.mapFilePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = `${this.mapFilePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpPath, `${JSON.stringify(map, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, this.mapFilePath);
+  }
+
+  private async commandExists(command: string): Promise<boolean> {
+    const probe = await this.runCommand("bash", ["-lc", `command -v ${shellQuote(command)} >/dev/null 2>&1`], {
+      timeoutMs: 3000,
+    });
+    return probe.code === 0;
+  }
+
+  private async resolveRunAsMode(): Promise<"runuser" | "sudo" | "su"> {
+    this.runAsModePromise ??= (async () => {
+      if (await this.commandExists("runuser")) {
+        return "runuser";
+      }
+      if (await this.commandExists("sudo")) {
+        return "sudo";
+      }
+      if (await this.commandExists("su")) {
+        return "su";
+      }
+      throw new Error("neither runuser/sudo/su is available on this host");
+    })();
+    return await this.runAsModePromise;
+  }
+
+  private async runAsUser(
+    username: string,
+    command: string,
+    args: string[],
+    options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
+  ): Promise<CommandRunResult> {
+    const mergedEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(options?.env ?? {}),
+    };
+    delete mergedEnv.TMUX;
+    delete mergedEnv.TMUX_PANE;
+
+    const runOptions = {
+      cwd: options?.cwd,
+      env: mergedEnv,
+      timeoutMs: options?.timeoutMs,
+    };
+
+    const mode = await this.resolveRunAsMode();
+    if (mode === "runuser") {
+      return await this.runCommand("runuser", ["-u", username, "--", command, ...args], runOptions);
+    }
+    if (mode === "sudo") {
+      return await this.runCommand("sudo", ["-u", username, "--", command, ...args], runOptions);
+    }
+    const cmdline = [command, ...args].map(shellQuote).join(" ");
+    return await this.runCommand("su", ["-s", "/bin/bash", "-", username, "-c", cmdline], runOptions);
+  }
+
+  private parsePasswdLine(line: string): LinuxUserAccount | undefined {
+    const parts = line.split(":");
+    if (parts.length < 7) {
+      return undefined;
+    }
+    const username = (parts[0] ?? "").trim();
+    const uid = Number.parseInt(parts[2] ?? "", 10);
+    const gid = Number.parseInt(parts[3] ?? "", 10);
+    const home = (parts[5] ?? "").trim();
+    const shell = (parts[6] ?? "").trim();
+    if (!username || !Number.isFinite(uid) || !Number.isFinite(gid)) {
+      return undefined;
+    }
+    return {
+      username,
+      uid,
+      gid,
+      home: home || path.join(this.config.userHomeRoot, username),
+      shell: shell || "/bin/bash",
+    };
+  }
+
+  private ensureLinuxHomePermissions(account: LinuxUserAccount): void {
+    const homeRoot = path.resolve(this.config.userHomeRoot);
+    fs.mkdirSync(homeRoot, { recursive: true });
+    try {
+      fs.chmodSync(homeRoot, 0o711);
+    } catch {
+      // Ignore mode errors and continue.
+    }
+    fs.mkdirSync(account.home, { recursive: true });
+    this.ensurePathOwnerAndMode(account.home, account.uid, account.gid, 0o700);
+  }
+
+  private async queryLinuxUser(username: string): Promise<LinuxUserAccount | undefined> {
+    const result = await this.runCommand("getent", ["passwd", username], { timeoutMs: 5000 });
+    if (result.code !== 0) {
+      return undefined;
+    }
+    const line = result.stdout
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .find((item) => item.startsWith(`${username}:`));
+    if (!line) {
+      return undefined;
+    }
+    return this.parsePasswdLine(line);
+  }
+
+  private async ensureLinuxUser(username: string): Promise<LinuxUserAccount> {
+    const existing = await this.queryLinuxUser(username);
+    if (existing) {
+      this.ensureLinuxHomePermissions(existing);
+      return existing;
+    }
+    if (!this.config.allowAutoCreateUser) {
+      throw new Error(`linux user ${username} does not exist and auto-create is disabled`);
+    }
+    const uid = process.getuid?.();
+    if (uid !== 0) {
+      throw new Error(`linux user ${username} does not exist. run gateway as root to auto-create users`);
+    }
+    const homeDir = path.join(path.resolve(this.config.userHomeRoot), username);
+    fs.mkdirSync(path.dirname(homeDir), { recursive: true });
+    const created = await this.runCommand("useradd", ["-m", "-d", homeDir, "-s", "/bin/bash", username], {
+      timeoutMs: 10_000,
+    });
+    if (created.code !== 0) {
+      const retried = await this.queryLinuxUser(username);
+      if (retried) {
+        return retried;
+      }
+      throw new Error(`failed to create linux user ${username}: ${created.stderr.trim() || "unknown error"}`);
+    }
+    const account = await this.queryLinuxUser(username);
+    if (!account) {
+      throw new Error(`linux user ${username} created but account lookup failed`);
+    }
+    this.ensureLinuxHomePermissions(account);
+    return account;
+  }
+
+  private async isPortAvailable(host: string, port: number): Promise<boolean> {
+    return await new Promise<boolean>((resolve) => {
+      const server = net.createServer();
+      server.unref();
+      server.once("error", () => {
+        resolve(false);
+      });
+      server.listen(port, host, () => {
+        server.close(() => resolve(true));
+      });
+    });
+  }
+
+  private async isPortOpen(host: string, port: number, timeoutMs = 800): Promise<boolean> {
+    return await new Promise<boolean>((resolve) => {
+      const socket = net.createConnection({ host, port });
+      const timer = setTimeout(() => {
+        socket.destroy();
+        resolve(false);
+      }, timeoutMs);
+      socket.once("connect", () => {
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(true);
+      });
+      socket.once("error", () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+    });
+  }
+
+  private async waitForPortOpen(host: string, port: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(1000, timeoutMs);
+    while (Date.now() < deadline) {
+      if (await this.isPortOpen(host, port)) {
+        return true;
+      }
+      await delay(300);
+    }
+    return false;
+  }
+
+  private async allocateGatewayPort(map: OpenClawUserMapFile, seed: string): Promise<number> {
+    const minPort = Math.max(1, this.config.gatewayPortBase);
+    const maxPort = Math.max(minPort, this.config.gatewayPortMax);
+    const span = maxPort - minPort + 1;
+    const used = new Set<number>();
+    for (const item of Object.values(map.users)) {
+      if (Number.isFinite(item.gatewayPort) && item.gatewayPort >= minPort && item.gatewayPort <= maxPort) {
+        used.add(item.gatewayPort);
+      }
+    }
+    const hashSeed = Number.parseInt(seed.slice(0, 8), 16);
+    for (let i = 0; i < span; i += 1) {
+      const candidate = minPort + ((hashSeed + i) % span);
+      if (used.has(candidate)) {
+        continue;
+      }
+      if (await this.isPortAvailable(this.config.gatewayHost, candidate)) {
+        return candidate;
+      }
+    }
+    throw new Error(`no available openclaw gateway port in ${minPort}-${maxPort}`);
+  }
+
+  private async ensureUserBinding(request: OpenClawBridgeRequest): Promise<OpenClawResolvedUserBinding> {
+    const userKey = this.resolveRequestUserKey(request);
+    if (!userKey) {
+      throw new Error("missing feishu sender identity (open_id/user_id/sender_id)");
+    }
+
+    return await this.withMapLock(async () => {
+      const nowIso = new Date().toISOString();
+      const seedHash = createHash("sha1").update(userKey).digest("hex");
+      const map = await this.loadUserMap();
+      const existing = map.users[userKey];
+      let entry: OpenClawUserBinding = existing
+        ? { ...existing }
+        : {
+            linuxUser: this.deriveLinuxUser(userKey),
+            gatewayPort: 0,
+            gatewayToken: "",
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          };
+
+      let changed = !existing;
+      if (!entry.gatewayToken.trim()) {
+        entry.gatewayToken = this.buildRandomToken();
+        changed = true;
+      }
+      if (!Number.isFinite(entry.gatewayPort) || entry.gatewayPort <= 0) {
+        entry.gatewayPort = await this.allocateGatewayPort(map, seedHash);
+        changed = true;
+      }
+
+      const account = await this.ensureLinuxUser(entry.linuxUser);
+
+      entry.updatedAt = nowIso;
+      map.users[userKey] = entry;
+      if (changed || !existing || existing.updatedAt !== entry.updatedAt) {
+        await this.saveUserMap(map);
+      }
+
+      return {
+        userKey,
+        linuxUser: entry.linuxUser,
+        gatewayPort: entry.gatewayPort,
+        gatewayToken: entry.gatewayToken,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+        account,
+      };
+    });
+  }
+
+  private buildOpenClawConfig(
+    baseConfig: Record<string, unknown>,
+    binding: OpenClawResolvedUserBinding,
+    runtimeDir: string,
+  ): Record<string, unknown> {
+    let cfg: Record<string, unknown> = {};
+    try {
+      cfg = toObject(JSON.parse(JSON.stringify(baseConfig)));
+    } catch {
+      cfg = {};
+    }
+
+    const workspaceRoot = path.join(runtimeDir, "workspace");
+    const userSkillsDir = path.join(binding.account.home, "skills");
+    const sharedSkillsDir = path.resolve(this.config.sharedSkillsDir);
+
+    const gateway = toObject(cfg.gateway);
+    gateway.mode = "local";
+    gateway.bind = "loopback";
+    gateway.port = binding.gatewayPort;
+    gateway.auth = {
+      mode: "token",
+      token: binding.gatewayToken,
+    };
+    cfg.gateway = gateway;
+
+    const channels = toObject(cfg.channels);
+    const feishu = toObject(channels.feishu);
+    feishu.enabled = false;
+    channels.feishu = feishu;
+    cfg.channels = channels;
+
+    // Force all per-user bridge instances onto the shared nex provider/model.
+    const models = toObject(cfg.models);
+    models.providers = {
+      nex: OPENCLAW_BRIDGE_FORCED_PROVIDER,
+    };
+    cfg.models = models;
+
+    const agents = toObject(cfg.agents);
+    const defaults = toObject(agents.defaults);
+    defaults.workspace = workspaceRoot;
+    defaults.model = {
+      primary: OPENCLAW_BRIDGE_FORCED_MODEL_ID,
+    };
+    defaults.models = {
+      [OPENCLAW_BRIDGE_FORCED_MODEL_ID]: {},
+    };
+    agents.defaults = defaults;
+    // Prevent inheriting host-level pre-bound agents/workspaces that may be inaccessible to per-user accounts.
+    agents.list = [];
+    cfg.agents = agents;
+
+    // Load user-personalized skills from <user-home>/skills.
+    const skills = toObject(cfg.skills);
+    const load = toObject(skills.load);
+    const normalizedUserSkillsDir = path.resolve(userSkillsDir);
+    const normalizedSharedSkillsDir = path.resolve(sharedSkillsDir);
+    // Keep skills sources deterministic: shared + per-user private.
+    load.extraDirs = [normalizedSharedSkillsDir, normalizedUserSkillsDir];
+    skills.load = load;
+    cfg.skills = skills;
+
+    // Per-user bridge is the only ingress/egress; disable template bindings to avoid cross-user drift.
+    cfg.bindings = [];
+
+    // Enforce per-user filesystem boundary while allowing command execution as the mapped linux user.
+    const tools = toObject(cfg.tools);
+    const exec = toObject(tools.exec);
+    // Force host exec policy evaluation path and disable interactive approvals.
+    exec.host = "gateway";
+    exec.security = "full";
+    exec.ask = "off";
+    const applyPatch = toObject(exec.applyPatch);
+    applyPatch.workspaceOnly = true;
+    exec.applyPatch = applyPatch;
+    tools.exec = exec;
+
+    const fsTools = toObject(tools.fs);
+    fsTools.workspaceOnly = true;
+    tools.fs = fsTools;
+    cfg.tools = tools;
+
+    return cfg;
+  }
+
+  private ensurePathOwnerAndMode(targetPath: string, uid: number, gid: number, mode: number): void {
+    try {
+      fs.chownSync(targetPath, uid, gid);
+    } catch {
+      // Ignore ownership errors and continue.
+    }
+    try {
+      fs.chmodSync(targetPath, mode);
+    } catch {
+      // Ignore mode errors and continue.
+    }
+  }
+
+  private writeExecApprovalsForUser(binding: OpenClawResolvedUserBinding): string {
+    const stateDir = path.join(binding.account.home, ".openclaw");
+    const approvalsPath = path.join(stateDir, "exec-approvals.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+
+    let existing: Record<string, unknown> = {};
+    if (fs.existsSync(approvalsPath)) {
+      try {
+        existing = toObject(JSON.parse(fs.readFileSync(approvalsPath, "utf8")));
+      } catch {
+        existing = {};
+      }
+    }
+
+    const socket = toObject(existing.socket);
+    const token = toString(socket.token).trim() || this.buildRandomToken();
+    const socketPath = toString(socket.path).trim() || path.join(stateDir, "exec-approvals.sock");
+
+    const defaults = toObject(existing.defaults);
+    defaults.security = "full";
+    defaults.ask = "off";
+    defaults.askFallback = "full";
+
+    const agents = toObject(existing.agents);
+    const mainAgent = toObject(agents.main);
+    mainAgent.security = "full";
+    mainAgent.ask = "off";
+    mainAgent.askFallback = "full";
+    agents.main = mainAgent;
+
+    const normalized = {
+      version: 1,
+      socket: {
+        path: socketPath,
+        token,
+      },
+      defaults,
+      agents,
+    };
+
+    fs.writeFileSync(approvalsPath, `${JSON.stringify(normalized, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    this.ensurePathOwnerAndMode(stateDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(approvalsPath, binding.account.uid, binding.account.gid, 0o600);
+    return approvalsPath;
+  }
+
+  private buildExecJailShellScript(): string {
+    return [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      "",
+      'REAL_SHELL="${TFCLAW_EXEC_REAL_SHELL:-/bin/bash}"',
+      'WORKSPACE="${TFCLAW_EXEC_WORKSPACE:-${PWD}}"',
+      'USER_HOME="${TFCLAW_EXEC_HOME:-${HOME:-$WORKSPACE}}"',
+      'USER_NAME="${USER:-$(id -un 2>/dev/null || echo user)}"',
+      'PATH_DEFAULT="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
+      "",
+      'if [[ "${1:-}" != "-c" || $# -lt 2 ]]; then',
+      '  exec "$REAL_SHELL" "$@"',
+      "fi",
+      "",
+      'CMD="$2"',
+      'WORKSPACE="$(readlink -f "$WORKSPACE" 2>/dev/null || realpath "$WORKSPACE" 2>/dev/null || echo "$WORKSPACE")"',
+      'USER_HOME="$(readlink -f "$USER_HOME" 2>/dev/null || realpath "$USER_HOME" 2>/dev/null || echo "$USER_HOME")"',
+      'if [[ ! -d "$WORKSPACE" ]]; then',
+      '  exec "$REAL_SHELL" -c "$CMD"',
+      "fi",
+      'if [[ ! -d "$USER_HOME" ]]; then',
+      '  USER_HOME="$WORKSPACE"',
+      "fi",
+      "",
+      'cd "$WORKSPACE"',
+      'export PATH="$PATH_DEFAULT"',
+      'export HOME="$USER_HOME"',
+      'export USER="$USER_NAME"',
+      'export LOGNAME="$USER_NAME"',
+      'export SHELL="$REAL_SHELL"',
+      'export TERM="${TERM:-xterm-256color}"',
+      'export LANG="${LANG:-C.UTF-8}"',
+      'exec "$REAL_SHELL" -lc "$CMD"',
+    ].join("\n");
+  }
+
+  private loadBaseOpenClawConfig(): Record<string, unknown> {
+    const templatePath = this.config.configTemplatePath.trim();
+    if (!templatePath) {
+      return {};
+    }
+    const absPath = path.resolve(templatePath);
+    if (!fs.existsSync(absPath)) {
+      throw new Error(`openclaw config template not found: ${absPath}`);
+    }
+    try {
+      return toObject(JSON.parse(fs.readFileSync(absPath, "utf8")));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`failed to parse openclaw config template (${absPath}): ${msg}`);
+    }
+  }
+
+  private prepareUserRuntime(binding: OpenClawResolvedUserBinding): {
+    sessionName: string;
+    startCommand: string;
+    workspaceConstDeclaration: string;
+  } {
+    const runtimeDir = path.join(binding.account.home, ".tfclaw-openclaw");
+    const workspaceDir = path.join(runtimeDir, "workspace");
+    const agentsDir = path.join(runtimeDir, "agents");
+    const shellWrapperDir = path.join(runtimeDir, "bin");
+    const shellWrapperPath = path.join(shellWrapperDir, "tfclaw-jail-shell.sh");
+    const skillsDir = path.join(binding.account.home, "skills");
+    const openclawStateDir = path.join(binding.account.home, ".openclaw");
+    const workspaceConstRuntimePath = path.join(runtimeDir, "WORKDIR.const.js");
+    const workspaceConstWorkspacePath = path.join(workspaceDir, "WORKDIR.const.js");
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.mkdirSync(shellWrapperDir, { recursive: true });
+    fs.mkdirSync(skillsDir, { recursive: true });
+    fs.mkdirSync(openclawStateDir, { recursive: true });
+    const workspaceConstDeclaration = this.buildWorkspaceConstDeclaration(workspaceDir);
+    fs.writeFileSync(workspaceConstRuntimePath, `${workspaceConstDeclaration}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.writeFileSync(workspaceConstWorkspacePath, `${workspaceConstDeclaration}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+
+    const baseConfig = this.loadBaseOpenClawConfig();
+    const configObj = this.buildOpenClawConfig(baseConfig, binding, runtimeDir);
+    const configPath = path.join(runtimeDir, "openclaw.json");
+
+    fs.writeFileSync(configPath, `${JSON.stringify(configObj, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.writeFileSync(shellWrapperPath, `${this.buildExecJailShellScript()}\n`, {
+      encoding: "utf8",
+      mode: 0o700,
+    });
+    this.writeExecApprovalsForUser(binding);
+    this.ensurePathOwnerAndMode(binding.account.home, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(runtimeDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(workspaceDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(agentsDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(shellWrapperDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(shellWrapperPath, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(skillsDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(openclawStateDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(configPath, binding.account.uid, binding.account.gid, 0o600);
+    this.ensurePathOwnerAndMode(workspaceConstRuntimePath, binding.account.uid, binding.account.gid, 0o600);
+    this.ensurePathOwnerAndMode(workspaceConstWorkspacePath, binding.account.uid, binding.account.gid, 0o600);
+
+    const nodePath = path.resolve(this.config.nodePath || process.execPath);
+    const startCommand = [
+      "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy npm_config_proxy npm_config_https_proxy npm_config_http_proxy npm_config_noproxy",
+      "umask 077",
+      `cd ${shellQuote(this.config.openclawRoot)}`,
+      `HOME=${shellQuote(binding.account.home)} USER=${shellQuote(binding.account.username)} LOGNAME=${shellQuote(binding.account.username)} SHELL=${shellQuote(shellWrapperPath)} TFCLAW_EXEC_WORKSPACE=${shellQuote(workspaceDir)} TFCLAW_EXEC_HOME=${shellQuote(binding.account.home)} TFCLAW_EXEC_REAL_SHELL='/bin/bash' OPENCLAW_HOME=${shellQuote(binding.account.home)} CLAWHUB_WORKDIR=${shellQuote(binding.account.home)} OPENCLAW_CONFIG_PATH=${shellQuote(configPath)} OPENCLAW_GATEWAY_TOKEN=${shellQuote(binding.gatewayToken)} exec ${shellQuote(nodePath)} ${shellQuote(this.openclawEntryPath)} gateway --allow-unconfigured --port ${binding.gatewayPort} --bind loopback --auth token --token ${shellQuote(binding.gatewayToken)}`,
+    ].join(" && ");
+
+    const sessionRaw = `${this.config.tmuxSessionPrefix}${binding.account.username}`;
+    const sessionName = sanitizeTmuxName(sessionRaw) || `openclaw_${binding.account.username}`;
+    return {
+      sessionName,
+      startCommand,
+      workspaceConstDeclaration,
+    };
+  }
+
+  private async ensureTmuxOpenClawProcess(
+    binding: OpenClawResolvedUserBinding,
+    runtime: { sessionName: string; startCommand: string },
+  ): Promise<void> {
+    if (await this.isPortOpen(this.config.gatewayHost, binding.gatewayPort)) {
+      return;
+    }
+
+    const hasSession = await this.runAsUser(binding.account.username, "tmux", [
+      "has-session",
+      "-t",
+      runtime.sessionName,
+    ]);
+    if (hasSession.code === 0) {
+      await this.runAsUser(binding.account.username, "tmux", [
+        "kill-session",
+        "-t",
+        runtime.sessionName,
+      ]);
+    }
+
+    const started = await this.runAsUser(
+      binding.account.username,
+      "tmux",
+      ["new-session", "-d", "-s", runtime.sessionName, "bash", "-lc", runtime.startCommand],
+      { timeoutMs: 10_000 },
+    );
+    if (started.code !== 0) {
+      throw new Error(
+        `failed to start tmux session for ${binding.account.username}: ${started.stderr.trim() || "unknown error"}`,
+      );
+    }
+
+    const ready = await this.waitForPortOpen(
+      this.config.gatewayHost,
+      binding.gatewayPort,
+      this.config.startupTimeoutMs,
+    );
+    if (ready) {
+      return;
+    }
+
+    const pane = await this.runAsUser(binding.account.username, "tmux", [
+      "capture-pane",
+      "-p",
+      "-t",
+      `${runtime.sessionName}:0.0`,
+    ]);
+    const tail = pane.stdout.trim().split(/\r?\n/).slice(-20).join("\n");
+    throw new Error(
+      `openclaw gateway did not become ready on ${this.config.gatewayHost}:${binding.gatewayPort}. tmux tail:\n${tail || "(empty)"}`,
+    );
+  }
+
+  private extractChatText(message: unknown): string {
+    const obj = toObject(message);
+    const directText = toString(obj.text).trim();
+    if (directText) {
+      return directText;
+    }
+    const content = obj.content;
+    if (typeof content === "string") {
+      return content.trim();
+    }
+    if (!Array.isArray(content)) {
+      return "";
+    }
+    const lines: string[] = [];
+    for (const item of content) {
+      const block = toObject(item);
+      const type = toString(block.type).trim().toLowerCase();
+      if (type !== "text") {
+        continue;
+      }
+      const text = toString(block.text).trim();
+      if (text) {
+        lines.push(text);
+      }
+    }
+    return lines.join("\n").trim();
+  }
+
+  private formatFrameError(frame: Record<string, unknown>): string {
+    const error = toObject(frame.error);
+    const message = toString(error.message).trim();
+    if (message) {
+      return message;
+    }
+    const code = toString(error.code).trim();
+    if (code) {
+      return `gateway error: ${code}`;
+    }
+    return "gateway request failed";
+  }
+
+  private async callGatewayChat(params: {
+    gatewayUrl: string;
+    gatewayToken: string;
+    message: string;
+  }): Promise<string> {
+    return await new Promise<string>((resolve, reject) => {
+      const ws = new WebSocket(params.gatewayUrl);
+      const connectReqId = `connect-${randomId()}`;
+      const chatReqId = `chat-${randomId()}`;
+      let closed = false;
+      let runId = "";
+      let lastDelta = "";
+
+      const cleanup = (): void => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        clearTimeout(timer);
+        try {
+          ws.close();
+        } catch {
+          // no-op
+        }
+      };
+
+      const fail = (error: string): void => {
+        cleanup();
+        reject(new Error(error));
+      };
+
+      const done = (reply: string): void => {
+        cleanup();
+        resolve(reply);
+      };
+
+      const timer = setTimeout(() => {
+        fail(`openclaw gateway request timeout after ${this.config.requestTimeoutMs}ms`);
+      }, this.config.requestTimeoutMs);
+
+      ws.once("open", () => {
+        const connectFrame = {
+          type: "req",
+          id: connectReqId,
+          method: "connect",
+          params: {
+            minProtocol: 1,
+            maxProtocol: 99,
+            client: {
+              id: "gateway-client",
+              version: "1.0.0",
+              platform: process.platform,
+              mode: "backend",
+            },
+            role: "operator",
+            scopes: ["operator.admin"],
+            caps: [],
+            auth: params.gatewayToken ? { token: params.gatewayToken } : undefined,
+          },
+        };
+        ws.send(JSON.stringify(connectFrame));
+      });
+
+      ws.on("message", (raw) => {
+        let frame: Record<string, unknown>;
+        try {
+          const text = typeof raw === "string" ? raw : raw.toString();
+          frame = toObject(JSON.parse(text));
+        } catch {
+          return;
+        }
+
+        const frameType = toString(frame.type).trim().toLowerCase();
+        if (frameType === "res") {
+          const id = toString(frame.id).trim();
+          const ok = Boolean(frame.ok);
+          if (id === connectReqId) {
+            if (!ok) {
+              fail(`openclaw gateway connect failed: ${this.formatFrameError(frame)}`);
+              return;
+            }
+            const chatFrame = {
+              type: "req",
+              id: chatReqId,
+              method: "chat.send",
+              params: {
+                sessionKey: this.config.sessionKey,
+                message: params.message,
+                deliver: false,
+                timeoutMs: this.config.requestTimeoutMs,
+                idempotencyKey: `tfclaw-openclaw-${randomId()}`,
+              },
+            };
+            ws.send(JSON.stringify(chatFrame));
+            return;
+          }
+
+          if (id === chatReqId) {
+            if (!ok) {
+              fail(`openclaw chat.send failed: ${this.formatFrameError(frame)}`);
+              return;
+            }
+            const payload = toObject(frame.payload);
+            const status = toString(payload.status).trim().toLowerCase();
+            const payloadRunId = toString(payload.runId).trim();
+            if (payloadRunId) {
+              runId = payloadRunId;
+            }
+            if (status === "error") {
+              const summary = toString(payload.summary).trim() || "unknown chat.send error";
+              fail(`openclaw chat.send error: ${summary}`);
+              return;
+            }
+            if (status === "ok" && !runId) {
+              const summary = toString(payload.summary).trim();
+              done(summary || "(openclaw run completed)");
+            }
+          }
+          return;
+        }
+
+        if (frameType !== "event" || toString(frame.event).trim().toLowerCase() !== "chat") {
+          return;
+        }
+
+        const payload = toObject(frame.payload);
+        const payloadRunId = toString(payload.runId).trim();
+        if (runId && payloadRunId && payloadRunId !== runId) {
+          return;
+        }
+        if (!runId && payloadRunId) {
+          runId = payloadRunId;
+        }
+
+        const state = toString(payload.state).trim().toLowerCase();
+        if (state === "delta") {
+          const delta = this.extractChatText(payload.message);
+          if (delta) {
+            lastDelta = delta;
+          }
+          return;
+        }
+        if (state === "final") {
+          const finalText = this.extractChatText(payload.message);
+          done(finalText || lastDelta || "(openclaw returned empty reply)");
+          return;
+        }
+        if (state === "error") {
+          const errText = toString(payload.errorMessage).trim() || "unknown error";
+          fail(`openclaw run failed: ${errText}`);
+          return;
+        }
+        if (state === "aborted") {
+          const reason = toString(payload.stopReason).trim() || "aborted";
+          fail(`openclaw run aborted: ${reason}`);
+        }
+      });
+
+      ws.once("error", (error) => {
+        fail(`openclaw gateway websocket error: ${error.message}`);
+      });
+      ws.once("close", (code, reason) => {
+        if (closed) {
+          return;
+        }
+        const detail = reason.toString().trim();
+        fail(`openclaw gateway closed (${code})${detail ? `: ${detail}` : ""}`);
+      });
+    });
+  }
+
+  private async ensureOpenClawEntry(): Promise<void> {
+    if (this.distChecked) {
+      return;
+    }
+
+    if (!fs.existsSync(this.config.openclawRoot)) {
+      throw new Error(`openclaw root not found: ${this.config.openclawRoot}`);
+    }
+    if (!fs.existsSync(this.openclawEntryPath)) {
+      throw new Error(`openclaw entry not found: ${this.openclawEntryPath}`);
+    }
+
+    let hasDist = this.distEntryCandidates.some((candidate) => fs.existsSync(candidate));
+    if (!hasDist && this.config.autoBuildDist) {
+      console.log("[gateway] openclaw dist missing. building dist with `pnpm exec tsdown --no-clean` ...");
+      const build = await this.runCommand("pnpm", ["exec", "tsdown", "--no-clean"], {
+        cwd: this.config.openclawRoot,
+        timeoutMs: 20 * 60 * 1000,
+      });
+      if (build.code !== 0) {
+        throw new Error(
+          `failed to build openclaw dist: ${build.stderr.trim() || build.stdout.trim() || "unknown error"}`,
+        );
+      }
+      hasDist = this.distEntryCandidates.some((candidate) => fs.existsSync(candidate));
+    }
+
+    if (!hasDist) {
+      throw new Error(
+        `openclaw dist is missing under ${path.join(this.config.openclawRoot, "dist")}. run "pnpm install && pnpm build:strict-smoke" in openclaw first.`,
+      );
+    }
+
+    this.distChecked = true;
+  }
+
+  private async runCommand(
+    command: string,
+    args: string[],
+    options?: {
+      cwd?: string;
+      env?: NodeJS.ProcessEnv;
+      timeoutMs?: number;
+    },
+  ): Promise<CommandRunResult> {
+    return await new Promise<CommandRunResult>((resolve) => {
+      const child = spawn(command, args, {
+        cwd: options?.cwd,
+        env: options?.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const timeoutMs = options?.timeoutMs ?? 0;
+      let timer: NodeJS.Timeout | undefined;
+
+      const finalize = (result: CommandRunResult): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        resolve(result);
+      };
+
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          finalize({
+            code: -1,
+            stdout,
+            stderr: `${stderr}\ncommand timeout after ${timeoutMs}ms`.trim(),
+          });
+        }, timeoutMs);
+      }
+
+      child.stdout.on("data", (chunk: Buffer | string) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer | string) => {
+        stderr += chunk.toString();
+      });
+      child.once("error", (error) => {
+        finalize({
+          code: -1,
+          stdout,
+          stderr,
+          spawnError: error,
+        });
+      });
+      child.once("close", (code) => {
+        finalize({
+          code: typeof code === "number" ? code : -1,
+          stdout,
+          stderr,
+        });
+      });
+    });
+  }
+}
+
 function renderTerminalStream(raw: string): RenderedTerminalOutput {
   const source = raw.replace(/\n\[tmux redraw\]\n/g, "\n");
 
@@ -950,6 +2124,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
 
   const rawRelay = toObject(rawConfig.relay);
   const rawNexChatBot = toObject(rawConfig.nexchatbot);
+  const rawOpenClawBridge = toObject(rawConfig.openclawBridge);
   const rawChannels = toObject(rawConfig.channels);
 
   const rawFeishu = toObject(rawChannels.feishu);
@@ -978,6 +2153,40 @@ function loadGatewayConfig(): LoadedGatewayConfig {
     Math.min(10 * 60 * 1000, toNumber(rawNexChatBot.timeoutMs, toNumber(process.env.TFCLAW_NEXCHATBOT_TIMEOUT_MS, 90_000))),
   );
 
+  const openclawRootFallback = path.resolve(
+    toString(rawOpenClawBridge.openclawRoot, process.env.TFCLAW_OPENCLAW_ROOT ?? path.join(process.cwd(), "..", "openclaw")),
+  );
+  const openclawBridgeEnabledFallback = toBoolean(process.env.TFCLAW_OPENCLAW_ENABLED, false);
+  const openclawSharedSkillsDirFallback = path.resolve(
+    toString(
+      rawOpenClawBridge.sharedSkillsDir,
+      process.env.TFCLAW_OPENCLAW_SHARED_SKILLS_DIR ?? path.join(openclawRootFallback, "skills"),
+    ),
+  );
+  const openclawUserHomeRootFallback = path.resolve(
+    toString(
+      rawOpenClawBridge.userHomeRoot,
+      process.env.TFCLAW_OPENCLAW_USER_HOME_ROOT ??
+        "/inspire/hdd/project/cq-scientific-cooperation-zone/ky26016/.home",
+    ),
+  );
+  const openclawGatewayPortBase = Math.max(
+    1025,
+    Math.min(65535, toNumber(rawOpenClawBridge.gatewayPortBase, toNumber(process.env.TFCLAW_OPENCLAW_GATEWAY_PORT_BASE, 19000))),
+  );
+  const openclawGatewayPortMax = Math.max(
+    openclawGatewayPortBase,
+    Math.min(65535, toNumber(rawOpenClawBridge.gatewayPortMax, toNumber(process.env.TFCLAW_OPENCLAW_GATEWAY_PORT_MAX, 19999))),
+  );
+  const openclawStartupTimeoutMs = Math.max(
+    1000,
+    Math.min(10 * 60 * 1000, toNumber(rawOpenClawBridge.startupTimeoutMs, toNumber(process.env.TFCLAW_OPENCLAW_STARTUP_TIMEOUT_MS, 45_000))),
+  );
+  const openclawRequestTimeoutMs = Math.max(
+    1000,
+    Math.min(30 * 60 * 1000, toNumber(rawOpenClawBridge.requestTimeoutMs, toNumber(process.env.TFCLAW_OPENCLAW_REQUEST_TIMEOUT_MS, 180_000))),
+  );
+
   const relayToken = toString(rawRelay.token, process.env.TFCLAW_TOKEN ?? "");
   if (!relayToken) {
     throw new Error("missing relay token. set relay.token in config.json or TFCLAW_TOKEN in env.");
@@ -994,6 +2203,42 @@ function loadGatewayConfig(): LoadedGatewayConfig {
       runPath: nexChatBotRunPath,
       apiKey: nexChatBotApiKey,
       timeoutMs: nexChatBotTimeoutMs,
+    },
+    openclawBridge: {
+      enabled: toBoolean(rawOpenClawBridge.enabled, openclawBridgeEnabledFallback),
+      openclawRoot: openclawRootFallback,
+      stateDir: path.resolve(
+        toString(
+          rawOpenClawBridge.stateDir,
+          process.env.TFCLAW_OPENCLAW_STATE_DIR ?? path.join(process.cwd(), ".runtime", "openclaw_bridge"),
+        ),
+      ),
+      sharedSkillsDir: openclawSharedSkillsDirFallback,
+      userHomeRoot: openclawUserHomeRootFallback,
+      userPrefix: toString(rawOpenClawBridge.userPrefix, process.env.TFCLAW_OPENCLAW_USER_PREFIX ?? "tfoc_"),
+      tmuxSessionPrefix: toString(
+        rawOpenClawBridge.tmuxSessionPrefix,
+        process.env.TFCLAW_OPENCLAW_TMUX_SESSION_PREFIX ?? "tfoc-",
+      ),
+      gatewayHost: toString(rawOpenClawBridge.gatewayHost, process.env.TFCLAW_OPENCLAW_GATEWAY_HOST ?? "127.0.0.1"),
+      gatewayPortBase: openclawGatewayPortBase,
+      gatewayPortMax: openclawGatewayPortMax,
+      startupTimeoutMs: openclawStartupTimeoutMs,
+      requestTimeoutMs: openclawRequestTimeoutMs,
+      sessionKey: toString(rawOpenClawBridge.sessionKey, process.env.TFCLAW_OPENCLAW_SESSION_KEY ?? "main"),
+      nodePath: toString(rawOpenClawBridge.nodePath, process.env.TFCLAW_OPENCLAW_NODE_PATH ?? process.execPath),
+      configTemplatePath: toString(
+        rawOpenClawBridge.configTemplatePath,
+        process.env.TFCLAW_OPENCLAW_CONFIG_TEMPLATE_PATH ?? "",
+      ),
+      autoBuildDist: toBoolean(
+        rawOpenClawBridge.autoBuildDist,
+        toBoolean(process.env.TFCLAW_OPENCLAW_AUTO_BUILD_DIST, false),
+      ),
+      allowAutoCreateUser: toBoolean(
+        rawOpenClawBridge.allowAutoCreateUser,
+        toBoolean(process.env.TFCLAW_OPENCLAW_ALLOW_AUTO_CREATE_USER, true),
+      ),
     },
     channels: {
       whatsapp: {
@@ -1440,6 +2685,7 @@ class TfclawCommandRouter {
   constructor(
     private readonly relay: RelayBridge,
     private readonly nexChatBridge: NexChatBridgeClient,
+    private readonly openclawBridge: OpenClawPerUserBridge,
   ) {}
 
   private selectionKey(channel: ChannelName, chatId: string): string {
@@ -2754,6 +4000,56 @@ class TfclawCommandRouter {
     }
   }
 
+  private async routeToOpenClaw(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    options?: { text?: string; historySeed?: HistorySeedEntry[] },
+  ): Promise<void> {
+    if (!this.openclawBridge.enabled) {
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        "openclaw bridge is disabled. set `openclawBridge.enabled=true` and `openclawBridge.openclawRoot` in gateway config.",
+      );
+      return;
+    }
+
+    try {
+      const text = (options?.text ?? ctx.llmText ?? ctx.text).trim();
+      const reply = await this.openclawBridge.run({
+        source: "tfclaw_feishu_gateway",
+        channel: ctx.channel,
+        selectionKey,
+        chatId: ctx.chatId,
+        senderId: ctx.senderId,
+        senderOpenId: ctx.senderOpenId,
+        senderUserId: ctx.senderUserId,
+        messageId: ctx.messageId,
+        eventId: ctx.eventId,
+        messageType: ctx.messageType,
+        text,
+        historySeed: options?.historySeed,
+      });
+      await ctx.responder.replyText(ctx.chatId, reply);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `openclaw bridge failed: ${message}`);
+    }
+  }
+
+  private async routeToAgentBridge(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    options?: { text?: string; historySeed?: HistorySeedEntry[] },
+  ): Promise<void> {
+    if (this.openclawBridge.enabled) {
+      await this.routeToOpenClaw(ctx, selectionKey, options);
+      return;
+    }
+    await this.routeToNexChatBot(ctx, selectionKey, options);
+  }
+
   async handleInboundMessage(ctx: InboundTextContext): Promise<void> {
     const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
     if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
@@ -2793,7 +4089,7 @@ class TfclawCommandRouter {
     }
 
     if (ctx.messageType !== "text") {
-      await this.routeToNexChatBot(ctx, selectionKey);
+      await this.routeToAgentBridge(ctx, selectionKey);
       return;
     }
 
@@ -2812,7 +4108,7 @@ class TfclawCommandRouter {
         );
         return;
       }
-      await this.routeToNexChatBot(
+      await this.routeToAgentBridge(
         {
           ...ctx,
           text: fallbackText,
@@ -2846,7 +4142,7 @@ class TfclawCommandRouter {
     if (!isTmuxMode && !this.isTfclawPresetCommand(text)) {
       const bufferedTexts = isGroupChat ? this.consumeGroupBufferedMessages(selectionKey, senderBufferKey) : [];
       const nexchatText = (llmText || text).trim();
-      await this.routeToNexChatBot(
+      await this.routeToAgentBridge(
         {
           ...ctx,
           text: nexchatText,
@@ -3551,9 +4847,26 @@ async function bootstrap(): Promise<void> {
     return;
   }
 
+  const bridgeHost = hostFromUrl(loaded.config.nexchatbot.baseUrl);
+  const relayHost = hostFromUrl(loaded.config.relay.url);
+  const openclawHost = hostFromUrl(`http://${loaded.config.openclawBridge.gatewayHost}`);
+  const localNoProxyHosts = [
+    "127.0.0.1",
+    "localhost",
+    "::1",
+    bridgeHost,
+    relayHost,
+    openclawHost,
+  ].filter((item) => isLocalNoProxyHost(item));
+  if (localNoProxyHosts.length > 0) {
+    mergeNoProxyHosts(localNoProxyHosts);
+    console.log(`[gateway] local no_proxy applied: ${(process.env.NO_PROXY ?? "").trim()}`);
+  }
+
   const relay = new RelayBridge(loaded.config.relay.url, loaded.config.relay.token, "feishu");
   const nexChatBridge = new NexChatBridgeClient(loaded.config.nexchatbot);
-  const router = new TfclawCommandRouter(relay, nexChatBridge);
+  const openclawBridge = new OpenClawPerUserBridge(loaded.config.openclawBridge);
+  const router = new TfclawCommandRouter(relay, nexChatBridge, openclawBridge);
   const chatApps = new ChatAppManager(loaded.config, router);
 
   relay.connect();
@@ -3569,6 +4882,13 @@ async function bootstrap(): Promise<void> {
     );
   } else {
     console.log("[gateway] nexchatbot bridge: disabled");
+  }
+  if (openclawBridge.enabled) {
+    console.log(
+      `[gateway] openclaw bridge: enabled -> root=${loaded.config.openclawBridge.openclawRoot}, stateDir=${loaded.config.openclawBridge.stateDir}, sharedSkillsDir=${loaded.config.openclawBridge.sharedSkillsDir}, userHomeRoot=${loaded.config.openclawBridge.userHomeRoot}, userPrefix=${loaded.config.openclawBridge.userPrefix}, portRange=${loaded.config.openclawBridge.gatewayPortBase}-${loaded.config.openclawBridge.gatewayPortMax}`,
+    );
+  } else {
+    console.log("[gateway] openclaw bridge: disabled");
   }
 
   let shuttingDown = false;

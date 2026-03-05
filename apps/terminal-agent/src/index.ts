@@ -185,6 +185,34 @@ function joinHttpUrl(baseUrl: string, pathValue: string): string {
   return `${base}/${pathPart.replace(/^\/+/, "")}`;
 }
 
+function mergeNoProxyHosts(hosts: string[]): void {
+  const existing = `${process.env.NO_PROXY ?? process.env.no_proxy ?? ""}`
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const merged = Array.from(new Set([...existing, ...hosts.map((item) => item.trim()).filter(Boolean)]));
+  const value = merged.join(",");
+  process.env.NO_PROXY = value;
+  process.env.no_proxy = value;
+}
+
+function hostFromUrl(raw: string): string {
+  const text = raw.trim();
+  if (!text) {
+    return "";
+  }
+  try {
+    return new URL(text).hostname.trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isLocalNoProxyHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "0.0.0.0";
+}
+
 function loadNexChatConfig(): NexChatBotConfig {
   const configPath = path.resolve(process.env.TFCLAW_CONFIG_PATH ?? "config.json");
   let rawConfig: Record<string, unknown> = {};
@@ -2343,6 +2371,18 @@ async function shutdown(): Promise<void> {
 
 async function bootstrap(): Promise<void> {
   try {
+    const localNoProxyHosts = [
+      "127.0.0.1",
+      "localhost",
+      "::1",
+      hostFromUrl(RELAY_URL),
+      hostFromUrl(nexChatBridge.endpointUrl()),
+    ].filter((item) => isLocalNoProxyHost(item));
+    if (localNoProxyHosts.length > 0) {
+      mergeNoProxyHosts(localNoProxyHosts);
+      console.log(`[agent] local no_proxy applied: ${(process.env.NO_PROXY ?? "").trim()}`);
+    }
+
     if (nexChatBridge.enabled) {
       console.log(`[nexchat] enabled -> ${nexChatBridge.endpointUrl()}`);
     } else {
