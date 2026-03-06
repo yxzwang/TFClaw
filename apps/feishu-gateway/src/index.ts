@@ -291,6 +291,12 @@ interface GroupBufferedMessage {
   at: number;
 }
 
+interface RouterUserScope {
+  senderKey: string;
+  userKey: string;
+  tmuxSessionKey: string;
+}
+
 interface ChatApp {
   readonly name: ChannelName;
   readonly enabled: boolean;
@@ -906,13 +912,48 @@ interface OpenClawResolvedUserBinding extends OpenClawUserBinding {
   account: LinuxUserAccount;
 }
 
+interface OpenClawExecutionScope {
+  userKey: string;
+  linuxUser: string;
+  homeDir: string;
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 const OPENCLAW_BRIDGE_FORCED_MODEL_ID = "nex/nex-n1.1";
+const OPENCLAW_BRIDGE_FORCED_CONTEXT_WINDOW = 128000;
+const OPENCLAW_BRIDGE_FORCED_MAX_TOKENS = 8192;
+const OPENCLAW_BRIDGE_COMPACTION_RESERVE_TOKENS_FLOOR = 20000;
 const OPENCLAW_BRIDGE_WORKDIR_CONST_NAME = "TFCLAW_USER_WORKDIR";
 const OPENCLAW_BRIDGE_WORKDIR_SEPARATOR = "——————————————————————";
+const OPENCLAW_BUILTIN_SLASH_COMMANDS = new Set([
+  "help",
+  "commands",
+  "status",
+  "context",
+  "compact",
+  "usage",
+  "model",
+  "reset",
+  "new",
+  "think",
+  "verbose",
+  "reasoning",
+  "elevated",
+  "exec",
+  "skill",
+  "whoami",
+  "approve",
+  "allowlist",
+  "config",
+  "debug",
+  "restart",
+  "stop",
+  "queue",
+  "tts",
+]);
 const OPENCLAW_BRIDGE_FORCED_PROVIDER = {
   baseUrl: "https://nex-deepseek-long-context.openapi-qb-ai.sii.edu.cn/v1",
   apiKey: "XncN/r7Uvu0PfmM9jwA0+0WRjTL4wE5RQa9qbUFnAM8=",
@@ -921,6 +962,8 @@ const OPENCLAW_BRIDGE_FORCED_PROVIDER = {
     {
       id: OPENCLAW_BRIDGE_FORCED_MODEL_ID,
       name: OPENCLAW_BRIDGE_FORCED_MODEL_ID,
+      contextWindow: OPENCLAW_BRIDGE_FORCED_CONTEXT_WINDOW,
+      maxTokens: OPENCLAW_BRIDGE_FORCED_MAX_TOKENS,
     },
   ],
 };
@@ -958,11 +1001,14 @@ class OpenClawPerUserBridge {
     const runtime = this.prepareUserRuntime(binding);
     await this.ensureTmuxOpenClawProcess(binding, runtime);
 
-    const prompt = this.composePrompt(
-      request.text,
-      request.historySeed,
-      runtime.workspaceConstDeclaration,
-    );
+    const slashCommand = this.resolveBuiltinSlashCommand(request.text);
+    const prompt = slashCommand
+      ? request.text.trim()
+      : this.composePrompt(
+          request.text,
+          request.historySeed,
+          runtime.workspaceConstDeclaration,
+        );
     const reply = await this.callGatewayChat({
       gatewayUrl: `ws://${this.config.gatewayHost}:${binding.gatewayPort}`,
       gatewayToken: binding.gatewayToken,
@@ -1011,8 +1057,34 @@ class OpenClawPerUserBridge {
     return `const ${OPENCLAW_BRIDGE_WORKDIR_CONST_NAME} = ${JSON.stringify(workspaceDir)};`;
   }
 
-  private resolveRequestUserKey(request: OpenClawBridgeRequest): string {
+  private resolveBuiltinSlashCommand(text: string): string | undefined {
+    const trimmed = text.trim();
+    const match = trimmed.match(/^\/([a-zA-Z][\w-]*)\b/);
+    if (!match) {
+      return undefined;
+    }
+    const command = (match[1] ?? "").toLowerCase();
+    if (!command || !OPENCLAW_BUILTIN_SLASH_COMMANDS.has(command)) {
+      return undefined;
+    }
+    return command;
+  }
+
+  private resolveRequestUserKey(
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId">,
+  ): string {
     return (request.senderOpenId || request.senderUserId || request.senderId || "").trim();
+  }
+
+  async resolveExecutionScope(
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId">,
+  ): Promise<OpenClawExecutionScope> {
+    const binding = await this.ensureUserBinding(request);
+    return {
+      userKey: binding.userKey,
+      linuxUser: binding.account.username,
+      homeDir: binding.account.home,
+    };
   }
 
   private deriveLinuxUser(userKey: string): string {
@@ -1286,7 +1358,9 @@ class OpenClawPerUserBridge {
     throw new Error(`no available openclaw gateway port in ${minPort}-${maxPort}`);
   }
 
-  private async ensureUserBinding(request: OpenClawBridgeRequest): Promise<OpenClawResolvedUserBinding> {
+  private async ensureUserBinding(
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId">,
+  ): Promise<OpenClawResolvedUserBinding> {
     const userKey = this.resolveRequestUserKey(request);
     if (!userKey) {
       throw new Error("missing feishu sender identity (open_id/user_id/sender_id)");
@@ -1319,9 +1393,11 @@ class OpenClawPerUserBridge {
 
       const account = await this.ensureLinuxUser(entry.linuxUser);
 
-      entry.updatedAt = nowIso;
+      if (changed) {
+        entry.updatedAt = nowIso;
+      }
       map.users[userKey] = entry;
-      if (changed || !existing || existing.updatedAt !== entry.updatedAt) {
+      if (changed || !existing) {
         await this.saveUserMap(map);
       }
 
@@ -1385,6 +1461,10 @@ class OpenClawPerUserBridge {
     defaults.models = {
       [OPENCLAW_BRIDGE_FORCED_MODEL_ID]: {},
     };
+    const compaction = toObject(defaults.compaction);
+    compaction.mode = "safeguard";
+    compaction.reserveTokensFloor = OPENCLAW_BRIDGE_COMPACTION_RESERVE_TOKENS_FLOOR;
+    defaults.compaction = compaction;
     agents.defaults = defaults;
     // Prevent inheriting host-level pre-bound agents/workspaces that may be inaccessible to per-user accounts.
     agents.list = [];
@@ -2688,8 +2768,45 @@ class TfclawCommandRouter {
     private readonly openclawBridge: OpenClawPerUserBridge,
   ) {}
 
-  private selectionKey(channel: ChannelName, chatId: string): string {
-    return `${channel}:${chatId}`;
+  private selectionKey(channel: ChannelName, chatId: string, userKey?: string): string {
+    if (!userKey) {
+      return `${channel}:${chatId}`;
+    }
+    const normalized = userKey.trim() || "unknown";
+    return `${channel}:${chatId}:${normalized}`;
+  }
+
+  private buildTmuxSessionKey(linuxUser: string, homeDir: string): string {
+    const encodedHome = Buffer.from(homeDir, "utf8").toString("base64url");
+    return `tfu:${linuxUser}|h:${encodedHome}`;
+  }
+
+  private async resolveUserScope(ctx: InboundTextContext): Promise<RouterUserScope> {
+    const senderKey = this.senderBufferKey(ctx);
+    try {
+      const scope = await this.openclawBridge.resolveExecutionScope({
+        senderId: ctx.senderId,
+        senderOpenId: ctx.senderOpenId,
+        senderUserId: ctx.senderUserId,
+      });
+      return {
+        senderKey,
+        userKey: scope.userKey || senderKey,
+        tmuxSessionKey: this.buildTmuxSessionKey(scope.linuxUser, scope.homeDir),
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (senderKey !== "unknown") {
+        console.warn(`[gateway] failed to resolve user scope for tmux control: ${msg}`);
+      }
+      const senderHash = createHash("sha1").update(senderKey || "unknown").digest("hex").slice(0, 12);
+      const fallbackHome = `/tmp/tfclaw-unresolved-${senderHash}`;
+      return {
+        senderKey,
+        userKey: senderKey,
+        tmuxSessionKey: this.buildTmuxSessionKey("tfclaw_nouser", fallbackHome),
+      };
+    }
   }
 
   private getMode(selectionKey: string): ChatInteractionMode {
@@ -2864,7 +2981,7 @@ class TfclawCommandRouter {
       }));
   }
 
-  private isTfclawPresetCommand(text: string): boolean {
+  private isTfclawPresetCommand(text: string, selectionKey?: string): boolean {
     const trimmed = text.trim();
     if (!trimmed) {
       return false;
@@ -2894,7 +3011,7 @@ class TfclawCommandRouter {
     const colonIndex = trimmed.indexOf(":");
     if (colonIndex > 0) {
       const maybeTerminalRef = trimmed.slice(0, colonIndex).trim();
-      if (maybeTerminalRef && this.resolveTerminal(maybeTerminalRef)) {
+      if (maybeTerminalRef && this.resolveTerminal(maybeTerminalRef, selectionKey)) {
         return true;
       }
     }
@@ -3264,7 +3381,7 @@ class TfclawCommandRouter {
     }
   }
 
-  private resolveTerminal(input: string): TerminalSummary | undefined {
+  private resolveTerminal(input: string, _selectionKey?: string): TerminalSummary | undefined {
     const normalized = input.trim();
     if (!normalized) {
       return undefined;
@@ -3289,7 +3406,7 @@ class TfclawCommandRouter {
     return undefined;
   }
 
-  private firstActiveTerminal(): TerminalSummary | undefined {
+  private firstActiveTerminal(_selectionKey?: string): TerminalSummary | undefined {
     for (const terminal of this.relay.cache.terminals.values()) {
       if (terminal.isActive) {
         return terminal;
@@ -3561,7 +3678,7 @@ class TfclawCommandRouter {
     }
 
     if (cmd === "capture") {
-      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
+      await this.handleCaptureList(selectionKey, ctx.chatId, ctx.responder);
       return true;
     }
 
@@ -3575,7 +3692,7 @@ class TfclawCommandRouter {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.keyUsageText("/key"));
         return true;
       }
-      const selected = this.selectedTerminal(selectionKey, true) ?? this.firstActiveTerminal();
+      const selected = this.selectedTerminal(selectionKey, true) ?? this.firstActiveTerminal(selectionKey);
       if (!selected) {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no active terminal. use /new then /attach.");
         return true;
@@ -3605,7 +3722,7 @@ class TfclawCommandRouter {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /use <id|title|index>");
         return true;
       }
-      const terminal = this.resolveTerminal(args);
+      const terminal = this.resolveTerminal(args, selectionKey);
       if (!terminal) {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${args}`);
         return true;
@@ -3625,7 +3742,7 @@ class TfclawCommandRouter {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /close <id|title|index>");
         return true;
       }
-      const terminal = this.resolveTerminal(key);
+      const terminal = this.resolveTerminal(key, selectionKey);
       if (!terminal) {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${key}`);
         return true;
@@ -3657,7 +3774,7 @@ class TfclawCommandRouter {
     let terminal: TerminalSummary | undefined;
 
     if (requestedRef) {
-      terminal = this.resolveTerminal(requestedRef);
+      terminal = this.resolveTerminal(requestedRef, selectionKey);
       if (!terminal) {
         await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `terminal not found: ${requestedRef}`);
         return;
@@ -3667,7 +3784,7 @@ class TfclawCommandRouter {
         return;
       }
     } else {
-      terminal = this.selectedTerminal(selectionKey, true) ?? this.firstActiveTerminal();
+      terminal = this.selectedTerminal(selectionKey, true) ?? this.firstActiveTerminal(selectionKey);
       if (!terminal) {
         const title = `${ctx.channel}-attach-${Date.now()}`;
         this.relay.command({
@@ -3829,12 +3946,12 @@ class TfclawCommandRouter {
   }
 
   private async handleCaptureSelection(
-    channel: ChannelName,
+    selectionKey: string,
     chatId: string,
     line: string,
     responder: MessageResponder,
   ): Promise<boolean> {
-    const key = this.selectionKey(channel, chatId);
+    const key = selectionKey;
     const selection = this.chatCaptureSelections.get(key);
     if (!selection) {
       return false;
@@ -3881,7 +3998,7 @@ class TfclawCommandRouter {
     return true;
   }
 
-  private async handleCaptureList(channel: ChannelName, chatId: string, responder: MessageResponder): Promise<void> {
+  private async handleCaptureList(selectionKey: string, chatId: string, responder: MessageResponder): Promise<void> {
     const requestId = this.relay.command({
       command: "capture.list",
     });
@@ -3891,16 +4008,16 @@ class TfclawCommandRouter {
       sources = await this.relay.waitForCaptureSources(requestId, 15000);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      await this.replyWithMode(chatId, responder, this.selectionKey(channel, chatId), `failed to list capture sources: ${msg}`);
+      await this.replyWithMode(chatId, responder, selectionKey, `failed to list capture sources: ${msg}`);
       return;
     }
 
     if (sources.length === 0) {
-      await this.replyWithMode(chatId, responder, this.selectionKey(channel, chatId), "no capture sources found.");
+      await this.replyWithMode(chatId, responder, selectionKey, "no capture sources found.");
       return;
     }
 
-    const key = this.selectionKey(channel, chatId);
+    const key = selectionKey;
     this.chatCaptureSelections.set(key, {
       options: sources,
       terminalId: this.chatTerminalSelection.get(key),
@@ -3914,11 +4031,12 @@ class TfclawCommandRouter {
     ctx: InboundTextContext,
     selectionKey: string,
     outboundText: string,
+    tmuxSessionKey: string,
   ): Promise<void> {
     const requestId = this.relay.command({
       command: "tfclaw.command",
       text: outboundText,
-      sessionKey: selectionKey,
+      sessionKey: tmuxSessionKey,
     });
     this.beginCommandProgressSession(selectionKey, requestId, ctx.chatId, ctx.responder);
 
@@ -4051,14 +4169,15 @@ class TfclawCommandRouter {
   }
 
   async handleInboundMessage(ctx: InboundTextContext): Promise<void> {
-    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId);
     if (ctx.allowFrom.length > 0 && (!ctx.senderId || !ctx.allowFrom.includes(ctx.senderId))) {
       await ctx.responder.replyText(ctx.chatId, "not allowed");
       return;
     }
 
+    const userScope = await this.resolveUserScope(ctx);
+    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId, userScope.userKey);
     const isGroupChat = this.isGroupChat(ctx);
-    const senderBufferKey = this.senderBufferKey(ctx);
+    const senderBufferKey = userScope.senderKey;
     const isTmuxMode = this.isTmuxMode(selectionKey);
     let text = ctx.text.replace(/\r/g, "").trim();
     let llmText = (ctx.llmText || text).replace(/\r/g, "").trim();
@@ -4124,7 +4243,7 @@ class TfclawCommandRouter {
     }
 
     const captureSelectionConsumed = await this.handleCaptureSelection(
-      ctx.channel,
+      selectionKey,
       ctx.chatId,
       text,
       ctx.responder,
@@ -4135,11 +4254,11 @@ class TfclawCommandRouter {
 
     const lowered = text.toLowerCase();
     if (lowered === "/capture" || lowered === "capture") {
-      await this.handleCaptureList(ctx.channel, ctx.chatId, ctx.responder);
+      await this.handleCaptureList(selectionKey, ctx.chatId, ctx.responder);
       return;
     }
 
-    if (!isTmuxMode && !this.isTfclawPresetCommand(text)) {
+    if (!isTmuxMode && !this.isTfclawPresetCommand(text, selectionKey)) {
       const bufferedTexts = isGroupChat ? this.consumeGroupBufferedMessages(selectionKey, senderBufferKey) : [];
       const nexchatText = (llmText || text).trim();
       await this.routeToAgentBridge(
@@ -4160,7 +4279,7 @@ class TfclawCommandRouter {
     const isSlashCommand = text.startsWith("/");
     const isDotControl = text.startsWith(".");
     const outboundText = isTmuxMode && !isSlashCommand && !isDotControl ? `/tmux send ${text}` : text;
-    await this.executeTfclawCommandRequest(ctx, selectionKey, outboundText);
+    await this.executeTfclawCommandRequest(ctx, selectionKey, outboundText, userScope.tmuxSessionKey);
   }
 }
 // SECTION: chat apps
