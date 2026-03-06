@@ -248,6 +248,8 @@ interface InboundTextContext {
   senderId?: string;
   senderOpenId?: string;
   senderUserId?: string;
+  senderName?: string;
+  mentions?: FeishuMentionEntry[];
   messageId?: string;
   eventId?: string;
   messageType: string;
@@ -293,6 +295,8 @@ interface OpenClawBridgeRequest {
   text: string;
   historySeed?: HistorySeedEntry[];
   attachments?: BridgeInboundAttachment[];
+  routingUserKey?: string;
+  workspaceOverrideDir?: string;
 }
 
 interface TerminalProgressSession {
@@ -324,9 +328,44 @@ interface GroupBufferedMessage {
   at: number;
 }
 
+type TfclawUserRole = "super_root" | "admin" | "user";
+
+interface TfclawAccessGroup {
+  name: string;
+  displayName: string;
+  scopeUserKey: string;
+  workspaceDir: string;
+  members: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface TfclawUserProfile {
+  displayName: string;
+  updatedAt: string;
+}
+
+interface TfclawAccessStateFile {
+  version: 1;
+  superRootUserKey?: string;
+  admins: string[];
+  groups: Record<string, TfclawAccessGroup>;
+  aliases: Record<string, string>;
+  userProfiles: Record<string, TfclawUserProfile>;
+}
+
+interface OpenClawRouteScope {
+  kind: "personal" | "group";
+  modeLabel: string;
+  routingUserKey: string;
+  workspaceOverrideDir?: string;
+}
+
 interface RouterUserScope {
   senderKey: string;
   userKey: string;
+  linuxUser: string;
+  actorRole: TfclawUserRole;
   tmuxSessionKey: string;
 }
 
@@ -339,6 +378,15 @@ interface ChatApp {
 
 function randomId(): string {
   return `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+}
+
+function resolveSenderUserKey(value: {
+  senderOpenId?: string;
+  senderUserId?: string;
+  senderId?: string;
+  routingUserKey?: string;
+}): string {
+  return (value.routingUserKey || value.senderOpenId || value.senderUserId || value.senderId || "").trim();
 }
 
 function sanitizeTmuxName(name: string): string {
@@ -1364,7 +1412,7 @@ class OpenClawPerUserBridge {
 
     await this.ensureOpenClawEntry();
     const binding = await this.ensureUserBinding(request);
-    const runtime = this.prepareUserRuntime(binding);
+    const runtime = this.prepareUserRuntime(binding, request.workspaceOverrideDir);
     await this.ensureTmuxOpenClawProcess(binding, runtime);
 
     const attachmentContext = this.stageInboundAttachments(binding, runtime, request.attachments ?? []);
@@ -1597,13 +1645,19 @@ class OpenClawPerUserBridge {
   }
 
   private resolveRequestUserKey(
-    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId">,
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId" | "routingUserKey">,
   ): string {
-    return (request.senderOpenId || request.senderUserId || request.senderId || "").trim();
+    return resolveSenderUserKey(request);
+  }
+
+  resolveUserKeyFromRequest(
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId" | "routingUserKey">,
+  ): string {
+    return this.resolveRequestUserKey(request);
   }
 
   async resolveExecutionScope(
-    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId">,
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId" | "routingUserKey">,
   ): Promise<OpenClawExecutionScope> {
     const binding = await this.ensureUserBinding(request);
     return {
@@ -1611,6 +1665,25 @@ class OpenClawPerUserBridge {
       linuxUser: binding.account.username,
       homeDir: binding.account.home,
     };
+  }
+
+  async listUserBindings(): Promise<Array<{
+    userKey: string;
+    linuxUser: string;
+    gatewayPort: number;
+    createdAt: string;
+    updatedAt: string;
+  }>> {
+    const map = await this.loadUserMap();
+    return Object.entries(map.users)
+      .map(([userKey, binding]) => ({
+        userKey,
+        linuxUser: binding.linuxUser,
+        gatewayPort: binding.gatewayPort,
+        createdAt: binding.createdAt,
+        updatedAt: binding.updatedAt,
+      }))
+      .sort((a, b) => a.userKey.localeCompare(b.userKey));
   }
 
   private deriveLinuxUser(userKey: string): string {
@@ -1885,7 +1958,7 @@ class OpenClawPerUserBridge {
   }
 
   private async ensureUserBinding(
-    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId">,
+    request: Pick<OpenClawBridgeRequest, "senderOpenId" | "senderUserId" | "senderId" | "routingUserKey">,
   ): Promise<OpenClawResolvedUserBinding> {
     const userKey = this.resolveRequestUserKey(request);
     if (!userKey) {
@@ -1942,7 +2015,7 @@ class OpenClawPerUserBridge {
   private buildOpenClawConfig(
     baseConfig: Record<string, unknown>,
     binding: OpenClawResolvedUserBinding,
-    runtimeDir: string,
+    workspaceRoot: string,
   ): Record<string, unknown> {
     let cfg: Record<string, unknown> = {};
     try {
@@ -1951,7 +2024,6 @@ class OpenClawPerUserBridge {
       cfg = {};
     }
 
-    const workspaceRoot = path.join(runtimeDir, "workspace");
     const userSkillsDir = path.join(binding.account.home, "skills");
     const sharedSkillsDir = path.resolve(this.config.sharedSkillsDir);
 
@@ -2182,14 +2254,16 @@ class OpenClawPerUserBridge {
     }
   }
 
-  private prepareUserRuntime(binding: OpenClawResolvedUserBinding): {
+  private prepareUserRuntime(binding: OpenClawResolvedUserBinding, workspaceOverrideDir?: string): {
     sessionName: string;
     startCommand: string;
     workspaceConstDeclaration: string;
     workspaceDir: string;
   } {
     const runtimeDir = path.join(binding.account.home, ".tfclaw-openclaw");
-    const workspaceDir = path.join(runtimeDir, "workspace");
+    const workspaceDir = workspaceOverrideDir?.trim()
+      ? path.resolve(workspaceOverrideDir.trim())
+      : path.join(runtimeDir, "workspace");
     const agentsDir = path.join(runtimeDir, "agents");
     const shellWrapperDir = path.join(runtimeDir, "bin");
     const shellWrapperPath = path.join(shellWrapperDir, "tfclaw-jail-shell.sh");
@@ -2214,7 +2288,7 @@ class OpenClawPerUserBridge {
     });
 
     const baseConfig = this.loadBaseOpenClawConfig();
-    const configObj = this.buildOpenClawConfig(baseConfig, binding, runtimeDir);
+    const configObj = this.buildOpenClawConfig(baseConfig, binding, workspaceDir);
     const configPath = path.join(runtimeDir, "openclaw.json");
 
     fs.writeFileSync(configPath, `${JSON.stringify(configObj, null, 2)}\n`, {
@@ -3988,12 +4062,571 @@ class RelayBridge {
     }
   }
 }
+class TfclawAccessManager {
+  private readonly stateFilePath: string;
+  private readonly superRootConfigPath: string;
+  private readonly groupWorkspaceRoot: string;
+  private lock: Promise<void> = Promise.resolve();
+
+  constructor(stateDir: string) {
+    const resolvedStateDir = path.resolve(stateDir);
+    fs.mkdirSync(resolvedStateDir, { recursive: true });
+    this.stateFilePath = path.join(resolvedStateDir, "access-control.json");
+    this.superRootConfigPath = path.join(resolvedStateDir, "super-root.local.json");
+    this.groupWorkspaceRoot = path.join(resolvedStateDir, "group_workspaces");
+    fs.mkdirSync(this.groupWorkspaceRoot, { recursive: true });
+  }
+
+  private defaultState(): TfclawAccessStateFile {
+    return {
+      version: 1,
+      admins: [],
+      groups: {},
+      aliases: {},
+      userProfiles: {},
+    };
+  }
+
+  private normalizeUserKey(value: string): string {
+    return value.trim();
+  }
+
+  private normalizeGroupName(value: string): string {
+    return value.trim().toLowerCase().replace(/\s+/g, "-").replace(/[^\p{L}\p{N}_-]/gu, "");
+  }
+
+  private normalizeAlias(value: string): string {
+    return value.trim().toLowerCase();
+  }
+
+  private normalizeDisplayName(value: string): string {
+    return value.trim().replace(/\s+/g, " ");
+  }
+
+  private looksLikeFeishuUserIdentifier(value: string): boolean {
+    return /^(?:ou|on|od|u)_[A-Za-z0-9]+$/i.test(value.trim());
+  }
+
+  private looksLikeLinuxUser(value: string): boolean {
+    return /^tfoc_[a-f0-9]+$/i.test(value.trim());
+  }
+
+  private isDisplayNameAliasCandidate(value: string): boolean {
+    const normalized = this.normalizeDisplayName(value);
+    if (!normalized) {
+      return false;
+    }
+    if (this.looksLikeFeishuUserIdentifier(normalized) || this.looksLikeLinuxUser(normalized)) {
+      return false;
+    }
+    // Prefer true human-readable names as fallback display labels.
+    if (/\p{Script=Han}/u.test(normalized)) {
+      return true;
+    }
+    if (/[^\x00-\x7F]/.test(normalized)) {
+      return true;
+    }
+    if (/\s/.test(normalized) && /[A-Za-z]/.test(normalized)) {
+      return true;
+    }
+    // Allow simple English names like "fang", while still excluding opaque ids.
+    if (/^[A-Za-z][A-Za-z'.-]{1,31}$/.test(normalized)) {
+      return true;
+    }
+    return false;
+  }
+
+  private guessDisplayNameFromAliases(state: TfclawAccessStateFile, userKey: string): string | undefined {
+    const normalizedUserKey = this.normalizeUserKey(userKey);
+    if (!normalizedUserKey) {
+      return undefined;
+    }
+    let best: string | undefined;
+    for (const [alias, mappedUserKey] of Object.entries(state.aliases)) {
+      if (this.normalizeUserKey(mappedUserKey) !== normalizedUserKey) {
+        continue;
+      }
+      if (!this.isDisplayNameAliasCandidate(alias)) {
+        continue;
+      }
+      const candidate = this.normalizeDisplayName(alias);
+      if (!candidate) {
+        continue;
+      }
+      if (!best || candidate.length < best.length) {
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  private roleOf(state: TfclawAccessStateFile, userKey: string): TfclawUserRole {
+    const normalized = this.normalizeUserKey(userKey);
+    if (!normalized) {
+      return "user";
+    }
+    if (state.superRootUserKey === normalized) {
+      return "super_root";
+    }
+    if (state.admins.includes(normalized)) {
+      return "admin";
+    }
+    return "user";
+  }
+
+  private ensureAbsoluteWorkspacePath(rawPath: string): string {
+    const trimmed = rawPath.trim();
+    if (!trimmed) {
+      throw new Error("workspace path is required");
+    }
+    const resolved = path.resolve(trimmed);
+    fs.mkdirSync(resolved, { recursive: true });
+    return resolved;
+  }
+
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.lock;
+    let release: (() => void) | undefined;
+    this.lock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release?.();
+    }
+  }
+
+  private async loadState(): Promise<TfclawAccessStateFile> {
+    if (!fs.existsSync(this.stateFilePath)) {
+      return this.defaultState();
+    }
+    try {
+      const parsed = toObject(JSON.parse(fs.readFileSync(this.stateFilePath, "utf8")));
+      const admins = Array.isArray(parsed.admins)
+        ? Array.from(new Set(parsed.admins.map((item) => this.normalizeUserKey(toString(item))).filter(Boolean)))
+        : [];
+      const aliasesObj = toObject(parsed.aliases);
+      const aliases: Record<string, string> = {};
+      for (const [rawAlias, rawUserKey] of Object.entries(aliasesObj)) {
+        const alias = this.normalizeAlias(rawAlias);
+        const userKey = this.normalizeUserKey(toString(rawUserKey));
+        if (!alias || !userKey) {
+          continue;
+        }
+        aliases[alias] = userKey;
+      }
+      const groupsObj = toObject(parsed.groups);
+      const groups: Record<string, TfclawAccessGroup> = {};
+      for (const [rawKey, rawValue] of Object.entries(groupsObj)) {
+        const key = this.normalizeGroupName(rawKey);
+        if (!key) {
+          continue;
+        }
+        const value = toObject(rawValue);
+        const members = Array.isArray(value.members)
+          ? Array.from(new Set(value.members.map((item) => this.normalizeUserKey(toString(item))).filter(Boolean)))
+          : [];
+        const displayName = toString(value.displayName, key).trim() || key;
+        const workspaceDir = this.ensureAbsoluteWorkspacePath(
+          toString(value.workspaceDir, path.join(this.groupWorkspaceRoot, key)),
+        );
+        groups[key] = {
+          name: key,
+          displayName,
+          scopeUserKey: toString(value.scopeUserKey, `group:${key}`).trim() || `group:${key}`,
+          workspaceDir,
+          members,
+          createdAt: toString(value.createdAt, new Date().toISOString()),
+          updatedAt: toString(value.updatedAt, new Date().toISOString()),
+        };
+      }
+      const userProfilesObj = toObject(parsed.userProfiles);
+      const userProfiles: Record<string, TfclawUserProfile> = {};
+      for (const [rawUserKey, rawProfile] of Object.entries(userProfilesObj)) {
+        const userKey = this.normalizeUserKey(rawUserKey);
+        if (!userKey) {
+          continue;
+        }
+        const profile = toObject(rawProfile);
+        const displayName = this.normalizeDisplayName(toString(profile.displayName, toString(profile.name)));
+        if (!displayName) {
+          continue;
+        }
+        userProfiles[userKey] = {
+          displayName,
+          updatedAt: toString(profile.updatedAt, new Date().toISOString()),
+        };
+      }
+      const state: TfclawAccessStateFile = {
+        version: 1,
+        superRootUserKey: this.normalizeUserKey(toString(parsed.superRootUserKey)),
+        admins,
+        groups,
+        aliases,
+        userProfiles,
+      };
+      if (state.superRootUserKey && state.admins.includes(state.superRootUserKey)) {
+        state.admins = state.admins.filter((item) => item !== state.superRootUserKey);
+      }
+      return state;
+    } catch {
+      return this.defaultState();
+    }
+  }
+
+  private async saveState(state: TfclawAccessStateFile): Promise<void> {
+    fs.mkdirSync(path.dirname(this.stateFilePath), { recursive: true });
+    fs.writeFileSync(this.stateFilePath, `${JSON.stringify(state, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  }
+
+  async getRole(userKey: string): Promise<TfclawUserRole> {
+    const state = await this.loadState();
+    return this.roleOf(state, userKey);
+  }
+
+  async getSuperRootUserKey(): Promise<string | undefined> {
+    const state = await this.loadState();
+    return state.superRootUserKey;
+  }
+
+  readConfiguredSuperRootIdentifier(): string | undefined {
+    if (!fs.existsSync(this.superRootConfigPath)) {
+      return undefined;
+    }
+    try {
+      const parsed = toObject(JSON.parse(fs.readFileSync(this.superRootConfigPath, "utf8")));
+      const configured = toString(parsed.superRoot, toString(parsed.super_root, toString(parsed.user))).trim();
+      return configured || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async setSuperRootFromConfig(targetUserKey: string): Promise<void> {
+    const target = this.normalizeUserKey(targetUserKey);
+    if (!target) {
+      return;
+    }
+    await this.withLock(async () => {
+      const state = await this.loadState();
+      state.superRootUserKey = target;
+      state.admins = state.admins.filter((item) => item !== target);
+      await this.saveState(state);
+    });
+  }
+
+  async registerUserAliases(userKey: string, aliases: string[]): Promise<void> {
+    const normalizedUserKey = this.normalizeUserKey(userKey);
+    if (!normalizedUserKey) {
+      return;
+    }
+    const normalizedAliases = Array.from(
+      new Set(
+        aliases
+          .map((item) => this.normalizeAlias(item))
+          .filter((item) => item.length > 0),
+      ),
+    );
+    if (normalizedAliases.length === 0) {
+      return;
+    }
+    await this.withLock(async () => {
+      const state = await this.loadState();
+      for (const alias of normalizedAliases) {
+        state.aliases[alias] = normalizedUserKey;
+      }
+      await this.saveState(state);
+    });
+  }
+
+  async registerUserDisplayName(userKey: string, displayName: string): Promise<void> {
+    const normalizedUserKey = this.normalizeUserKey(userKey);
+    const normalizedDisplayName = this.normalizeDisplayName(displayName);
+    if (!normalizedUserKey || !normalizedDisplayName) {
+      return;
+    }
+    await this.withLock(async () => {
+      const state = await this.loadState();
+      const existing = state.userProfiles[normalizedUserKey];
+      if (existing?.displayName === normalizedDisplayName) {
+        return;
+      }
+      state.userProfiles[normalizedUserKey] = {
+        displayName: normalizedDisplayName,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.saveState(state);
+    });
+  }
+
+  async getUserDisplayName(userKey: string): Promise<string | undefined> {
+    const normalizedUserKey = this.normalizeUserKey(userKey);
+    if (!normalizedUserKey) {
+      return undefined;
+    }
+    const state = await this.loadState();
+    return state.userProfiles[normalizedUserKey]?.displayName || this.guessDisplayNameFromAliases(state, normalizedUserKey);
+  }
+
+  async getUserDisplayNames(userKeys: string[]): Promise<Map<string, string>> {
+    const state = await this.loadState();
+    const output = new Map<string, string>();
+    for (const rawUserKey of userKeys) {
+      const userKey = this.normalizeUserKey(rawUserKey);
+      if (!userKey) {
+        continue;
+      }
+      const displayName = state.userProfiles[userKey]?.displayName || this.guessDisplayNameFromAliases(state, userKey);
+      if (!displayName) {
+        continue;
+      }
+      output.set(userKey, displayName);
+    }
+    return output;
+  }
+
+  async resolveUserAlias(input: string): Promise<string | undefined> {
+    const alias = this.normalizeAlias(input);
+    if (!alias) {
+      return undefined;
+    }
+    const state = await this.loadState();
+    return state.aliases[alias];
+  }
+
+  async setSuperRoot(requesterUserKey: string, targetUserKey: string): Promise<{ previous?: string; current: string }> {
+    const requester = this.normalizeUserKey(requesterUserKey);
+    const target = this.normalizeUserKey(targetUserKey);
+    if (!target) {
+      throw new Error("target user is required");
+    }
+    return await this.withLock(async () => {
+      const state = await this.loadState();
+      if (state.superRootUserKey && state.superRootUserKey !== requester) {
+        throw new Error("only current super_root can change super_root");
+      }
+      const previous = state.superRootUserKey;
+      state.superRootUserKey = target;
+      state.admins = state.admins.filter((item) => item !== target);
+      await this.saveState(state);
+      return { previous, current: target };
+    });
+  }
+
+  async setAdmin(requesterUserKey: string, targetUserKey: string, enabled: boolean): Promise<void> {
+    const requester = this.normalizeUserKey(requesterUserKey);
+    const target = this.normalizeUserKey(targetUserKey);
+    if (!target) {
+      throw new Error("target user is required");
+    }
+    return await this.withLock(async () => {
+      const state = await this.loadState();
+      if (state.superRootUserKey !== requester) {
+        throw new Error("only super_root can manage admins");
+      }
+      if (target === state.superRootUserKey) {
+        return;
+      }
+      if (enabled) {
+        if (!state.admins.includes(target)) {
+          state.admins.push(target);
+        }
+      } else {
+        state.admins = state.admins.filter((item) => item !== target);
+      }
+      await this.saveState(state);
+    });
+  }
+
+  async createGroup(
+    requesterUserKey: string,
+    displayName: string,
+    workspacePath?: string,
+  ): Promise<TfclawAccessGroup> {
+    const requester = this.normalizeUserKey(requesterUserKey);
+    const normalizedName = this.normalizeGroupName(displayName);
+    if (!normalizedName) {
+      throw new Error("group name is required");
+    }
+    return await this.withLock(async () => {
+      const state = await this.loadState();
+      const role = this.roleOf(state, requester);
+      if (role === "user") {
+        throw new Error("only admin/super_root can create groups");
+      }
+      if (state.groups[normalizedName]) {
+        throw new Error(`group already exists: ${normalizedName}`);
+      }
+      const workspaceDir = this.ensureAbsoluteWorkspacePath(
+        workspacePath?.trim() || path.join(this.groupWorkspaceRoot, normalizedName, "workspace"),
+      );
+      const now = new Date().toISOString();
+      const group: TfclawAccessGroup = {
+        name: normalizedName,
+        displayName: displayName.trim() || normalizedName,
+        scopeUserKey: `group:${normalizedName}`,
+        workspaceDir,
+        members: [requester],
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.groups[normalizedName] = group;
+      await this.saveState(state);
+      return group;
+    });
+  }
+
+  async setGroupWorkspace(
+    requesterUserKey: string,
+    groupName: string,
+    workspacePath: string,
+  ): Promise<TfclawAccessGroup> {
+    const requester = this.normalizeUserKey(requesterUserKey);
+    const normalizedName = this.normalizeGroupName(groupName);
+    return await this.withLock(async () => {
+      const state = await this.loadState();
+      const role = this.roleOf(state, requester);
+      if (role === "user") {
+        throw new Error("only admin/super_root can set group workspace");
+      }
+      const group = state.groups[normalizedName];
+      if (!group) {
+        throw new Error(`group not found: ${normalizedName}`);
+      }
+      group.workspaceDir = this.ensureAbsoluteWorkspacePath(workspacePath);
+      group.updatedAt = new Date().toISOString();
+      await this.saveState(state);
+      return group;
+    });
+  }
+
+  async addGroupMember(
+    requesterUserKey: string,
+    groupName: string,
+    targetUserKey: string,
+  ): Promise<TfclawAccessGroup> {
+    const requester = this.normalizeUserKey(requesterUserKey);
+    const target = this.normalizeUserKey(targetUserKey);
+    if (!target) {
+      throw new Error("target user is required");
+    }
+    const normalizedName = this.normalizeGroupName(groupName);
+    return await this.withLock(async () => {
+      const state = await this.loadState();
+      const role = this.roleOf(state, requester);
+      if (role === "user") {
+        throw new Error("only admin/super_root can add group members");
+      }
+      const group = state.groups[normalizedName];
+      if (!group) {
+        throw new Error(`group not found: ${normalizedName}`);
+      }
+      if (!group.members.includes(target)) {
+        group.members.push(target);
+      }
+      group.updatedAt = new Date().toISOString();
+      await this.saveState(state);
+      return group;
+    });
+  }
+
+  async removeGroupMember(
+    requesterUserKey: string,
+    groupName: string,
+    targetUserKey: string,
+  ): Promise<TfclawAccessGroup> {
+    const requester = this.normalizeUserKey(requesterUserKey);
+    const target = this.normalizeUserKey(targetUserKey);
+    const normalizedName = this.normalizeGroupName(groupName);
+    return await this.withLock(async () => {
+      const state = await this.loadState();
+      const role = this.roleOf(state, requester);
+      if (role === "user") {
+        throw new Error("only admin/super_root can remove group members");
+      }
+      const group = state.groups[normalizedName];
+      if (!group) {
+        throw new Error(`group not found: ${normalizedName}`);
+      }
+      group.members = group.members.filter((item) => item !== target);
+      group.updatedAt = new Date().toISOString();
+      await this.saveState(state);
+      return group;
+    });
+  }
+
+  async getGroup(groupName: string): Promise<TfclawAccessGroup | undefined> {
+    const state = await this.loadState();
+    const key = this.normalizeGroupName(groupName);
+    return key ? state.groups[key] : undefined;
+  }
+
+  async getGroupForMember(groupName: string, userKey: string): Promise<TfclawAccessGroup | undefined> {
+    const group = await this.getGroup(groupName);
+    if (!group) {
+      return undefined;
+    }
+    const normalizedUser = this.normalizeUserKey(userKey);
+    if (!group.members.includes(normalizedUser)) {
+      return undefined;
+    }
+    return group;
+  }
+
+  async listGroups(): Promise<TfclawAccessGroup[]> {
+    const state = await this.loadState();
+    return Object.values(state.groups).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async listGroupsForUser(userKey: string): Promise<TfclawAccessGroup[]> {
+    const normalized = this.normalizeUserKey(userKey);
+    const state = await this.loadState();
+    return Object.values(state.groups)
+      .filter((group) => group.members.includes(normalized))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async listUsersWithRoles(extraUserKeys: string[]): Promise<Array<{ userKey: string; role: TfclawUserRole }>> {
+    const state = await this.loadState();
+    const keys = new Set<string>();
+    for (const item of extraUserKeys) {
+      const key = this.normalizeUserKey(item);
+      if (key) {
+        keys.add(key);
+      }
+    }
+    if (state.superRootUserKey) {
+      keys.add(state.superRootUserKey);
+    }
+    for (const admin of state.admins) {
+      keys.add(admin);
+    }
+    for (const group of Object.values(state.groups)) {
+      for (const member of group.members) {
+        keys.add(member);
+      }
+    }
+    return Array.from(keys)
+      .sort((a, b) => a.localeCompare(b))
+      .map((userKey) => ({
+        userKey,
+        role: this.roleOf(state, userKey),
+      }));
+  }
+}
+
 // SECTION: router
 class TfclawCommandRouter {
   private chatTerminalSelection = new Map<string, string>();
   private chatTmuxTarget = new Map<string, string>();
   private chatPassthroughEnabled = new Map<string, boolean>();
   private chatCaptureSelections = new Map<string, ChatCaptureSelection>();
+  private chatOpenClawRouteScopes = new Map<string, OpenClawRouteScope>();
   private chatModes = new Map<string, ChatInteractionMode>();
   private groupMessageBuffer = new Map<string, GroupBufferedMessage[]>();
   private progressSessions = new Map<string, TerminalProgressSession>();
@@ -4013,6 +4646,7 @@ class TfclawCommandRouter {
     private readonly relay: RelayBridge,
     private readonly nexChatBridge: NexChatBridgeClient,
     private readonly openclawBridge: OpenClawPerUserBridge,
+    private readonly accessManager: TfclawAccessManager,
   ) {}
 
   private selectionKey(channel: ChannelName, chatId: string, userKey?: string): string {
@@ -4030,16 +4664,27 @@ class TfclawCommandRouter {
 
   private async resolveUserScope(ctx: InboundTextContext): Promise<RouterUserScope> {
     const senderKey = this.senderBufferKey(ctx);
+    const resolvedUserKey = this.openclawBridge.resolveUserKeyFromRequest({
+      senderId: ctx.senderId,
+      senderOpenId: ctx.senderOpenId,
+      senderUserId: ctx.senderUserId,
+    }) || senderKey;
+    const actorRole = await this.accessManager.getRole(resolvedUserKey);
     try {
       const scope = await this.openclawBridge.resolveExecutionScope({
         senderId: ctx.senderId,
         senderOpenId: ctx.senderOpenId,
         senderUserId: ctx.senderUserId,
       });
+      const tmuxSessionKey = actorRole === "admin" || actorRole === "super_root"
+        ? this.buildTmuxSessionKey("root", "/")
+        : this.buildTmuxSessionKey(scope.linuxUser, scope.homeDir);
       return {
         senderKey,
         userKey: scope.userKey || senderKey,
-        tmuxSessionKey: this.buildTmuxSessionKey(scope.linuxUser, scope.homeDir),
+        linuxUser: scope.linuxUser,
+        actorRole,
+        tmuxSessionKey,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -4050,7 +4695,9 @@ class TfclawCommandRouter {
       const fallbackHome = `/tmp/tfclaw-unresolved-${senderHash}`;
       return {
         senderKey,
-        userKey: senderKey,
+        userKey: resolvedUserKey || senderKey,
+        linuxUser: "unknown",
+        actorRole,
         tmuxSessionKey: this.buildTmuxSessionKey("tfclaw_nouser", fallbackHome),
       };
     }
@@ -4827,6 +5474,12 @@ class TfclawCommandRouter {
       "9) /tfstate - show current mode",
       "10) /tfkey <enter|tab|esc|ctrl+c|ctrl+d|ctrl+z|ctrl+letter> - send one key to terminal",
       "11) in terminal mode, use .tf <command> to run tfclaw commands",
+      "12) /tfroot show - display super_root (set via local file only, /tfroot set disabled)",
+      "13) /tfadmin list|add|remove ... - manage admin users (add/remove: super_root only)",
+      "14) /tfusers - list all users and roles (admin/super_root)",
+      "15) /tfgroup list|create|workspace|add|remove ... - manage groups",
+      "16) /tfmode status|list|personal|group <groupName> - switch personal/group openclaw",
+      "17) user target in /tfadmin add/remove and /tfgroup add/remove supports: feishuId | feishuName | linuxUser | me",
     ].join("\n");
   }
 
@@ -4927,6 +5580,456 @@ class TfclawCommandRouter {
       cmd: normalized.slice(0, firstSpace).toLowerCase(),
       args: normalized.slice(firstSpace + 1).trim(),
     };
+  }
+
+  private normalizeDisplayUserName(value: string): string {
+    const trimmed = value.trim().replace(/\s+/g, " ");
+    if (!trimmed) {
+      return "";
+    }
+    if (this.looksLikeFeishuUserIdentifier(trimmed)) {
+      return "";
+    }
+    if (/^tfoc_[a-f0-9]+$/i.test(trimmed)) {
+      return "";
+    }
+    return trimmed;
+  }
+
+  private displayUserNameFromMap(userKey: string, nameMap: Map<string, string>): string {
+    const displayName = this.normalizeDisplayUserName(nameMap.get(userKey) || "");
+    if (displayName) {
+      return displayName;
+    }
+    return "未登记姓名用户";
+  }
+
+  private async displayUserName(userKey: string): Promise<string> {
+    const displayName = this.normalizeDisplayUserName(await this.accessManager.getUserDisplayName(userKey) || "");
+    if (displayName) {
+      return displayName;
+    }
+    return "未登记姓名用户";
+  }
+
+  private formatRole(role: TfclawUserRole): string {
+    switch (role) {
+      case "super_root":
+        return "最高root";
+      case "admin":
+        return "管理员";
+      default:
+        return "普通用户";
+    }
+  }
+
+  private normalizeTargetUserArg(arg: string, userScope: RouterUserScope): string {
+    const normalized = arg.trim();
+    if (!normalized) {
+      return "";
+    }
+    const lowered = normalized.toLowerCase();
+    if (lowered === "me" || lowered === "self" || lowered === "@me") {
+      return userScope.userKey;
+    }
+    return normalized;
+  }
+
+  private looksLikeFeishuUserIdentifier(value: string): boolean {
+    return /^(?:ou|on|od|u)_[A-Za-z0-9]+$/i.test(value.trim());
+  }
+
+  private async resolveTargetUserKey(arg: string, userScope: RouterUserScope): Promise<string | undefined> {
+    const normalized = this.normalizeTargetUserArg(arg, userScope);
+    if (!normalized) {
+      return undefined;
+    }
+    const bindings = await this.openclawBridge.listUserBindings();
+    const exactBinding = bindings.find((item) => item.userKey === normalized);
+    if (exactBinding) {
+      return exactBinding.userKey;
+    }
+    const linuxBinding = bindings.find((item) => item.linuxUser === normalized);
+    if (linuxBinding) {
+      return linuxBinding.userKey;
+    }
+    const aliasResolved = await this.accessManager.resolveUserAlias(normalized);
+    if (aliasResolved) {
+      return aliasResolved;
+    }
+    if (this.looksLikeFeishuUserIdentifier(normalized)) {
+      return normalized;
+    }
+    return undefined;
+  }
+
+  private async resolveOpenClawRouteScope(
+    selectionKey: string,
+    userScope: RouterUserScope,
+  ): Promise<OpenClawRouteScope> {
+    const selected = this.chatOpenClawRouteScopes.get(selectionKey);
+    const personalLabel = await this.displayUserName(userScope.userKey);
+    if (!selected || selected.kind === "personal") {
+      return {
+        kind: "personal",
+        modeLabel: personalLabel,
+        routingUserKey: userScope.userKey,
+      };
+    }
+    const group = await this.accessManager.getGroupForMember(selected.modeLabel, userScope.userKey);
+    if (!group) {
+      this.chatOpenClawRouteScopes.delete(selectionKey);
+      return {
+        kind: "personal",
+        modeLabel: personalLabel,
+        routingUserKey: userScope.userKey,
+      };
+    }
+    return {
+      kind: "group",
+      modeLabel: group.displayName,
+      routingUserKey: group.scopeUserKey,
+      workspaceOverrideDir: group.workspaceDir,
+    };
+  }
+
+  private toAgentRouteOptions(route: OpenClawRouteScope): {
+    routingUserKey?: string;
+    workspaceOverrideDir?: string;
+    modeLabel?: string;
+  } {
+    return {
+      routingUserKey: route.routingUserKey,
+      workspaceOverrideDir: route.workspaceOverrideDir,
+      modeLabel: route.kind === "group" ? route.modeLabel : route.modeLabel,
+    };
+  }
+
+  private async handleAccessControlCommand(
+    ctx: InboundTextContext,
+    selectionKey: string,
+    userScope: RouterUserScope,
+    text: string,
+  ): Promise<boolean> {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) {
+      return false;
+    }
+    const body = trimmed.slice(1).trim();
+    if (!body) {
+      return false;
+    }
+    const [cmdRaw, ...rest] = body.split(/\s+/);
+    const cmd = (cmdRaw ?? "").toLowerCase();
+    const argsText = rest.join(" ").trim();
+
+    if (cmd === "tfroot") {
+      const [actionRaw] = argsText.split(/\s+/, 2);
+      const action = (actionRaw ?? "show").toLowerCase();
+      if (action === "show" || action === "who" || action === "status") {
+        const rootUser = await this.accessManager.getSuperRootUserKey();
+        const rootDisplayName = rootUser ? await this.displayUserName(rootUser) : "";
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          rootUser ? `super_root: ${rootDisplayName}` : "super_root: (unset)",
+        );
+        return true;
+      }
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        "tfroot set is disabled. configure super_root in local file: <stateDir>/super-root.local.json",
+      );
+      return true;
+    }
+
+    if (cmd === "tfadmin") {
+      const [actionRaw, targetRaw] = argsText.split(/\s+/, 2);
+      const action = (actionRaw ?? "").toLowerCase();
+      if (action === "list" || action === "users" || action === "status") {
+        if (userScope.actorRole === "user") {
+          await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "permission denied: admin/super_root only");
+          return true;
+        }
+        const bindings = await this.openclawBridge.listUserBindings();
+        const roles = await this.accessManager.listUsersWithRoles(bindings.map((item) => item.userKey));
+        const displayNames = await this.accessManager.getUserDisplayNames(roles.map((item) => item.userKey));
+        const lines = roles.map((item) => `- ${this.displayUserNameFromMap(item.userKey, displayNames)} | ${this.formatRole(item.role)}`);
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          lines.length > 0 ? `system users:\n${lines.join("\n")}` : "system users: (none)",
+        );
+        return true;
+      }
+      if (action === "add" || action === "remove") {
+        const targetUser = await this.resolveTargetUserKey(targetRaw ?? "", userScope);
+        if (!targetUser) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            "usage: /tfadmin add|remove <feishuId|feishuName|linuxUser|me>",
+          );
+          return true;
+        }
+        try {
+          await this.accessManager.setAdmin(userScope.userKey, targetUser, action === "add");
+          const targetDisplayName = await this.displayUserName(targetUser);
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `${action === "add" ? "admin granted" : "admin revoked"}: ${targetDisplayName}`,
+          );
+        } catch (error) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `tfadmin failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return true;
+      }
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        "usage: /tfadmin list | /tfadmin add <feishuId|feishuName|linuxUser> | /tfadmin remove <feishuId|feishuName|linuxUser>",
+      );
+      return true;
+    }
+
+    if (cmd === "tfusers") {
+      if (userScope.actorRole === "user") {
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "permission denied: admin/super_root only");
+        return true;
+      }
+      const bindings = await this.openclawBridge.listUserBindings();
+      const roles = await this.accessManager.listUsersWithRoles(bindings.map((item) => item.userKey));
+      const displayNames = await this.accessManager.getUserDisplayNames(roles.map((item) => item.userKey));
+      const rows = roles.map((item) =>
+        `- ${this.displayUserNameFromMap(item.userKey, displayNames)} | ${this.formatRole(item.role)}`);
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        rows.length > 0 ? `system users:\n${rows.join("\n")}` : "system users: (none)",
+      );
+      return true;
+    }
+
+    if (cmd === "tfgroup") {
+      const [actionRaw, ...restArgs] = argsText.split(/\s+/);
+      const action = (actionRaw ?? "").toLowerCase();
+      if (action === "list" || action === "ls") {
+        const role = userScope.actorRole;
+        const groups = role === "user"
+          ? await this.accessManager.listGroupsForUser(userScope.userKey)
+          : await this.accessManager.listGroups();
+        if (groups.length === 0) {
+          await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "groups: (none)");
+          return true;
+        }
+        const lines = groups.map((group) =>
+          `- ${group.displayName} (${group.name}) | members=${group.members.length} | workspace=${group.workspaceDir}`);
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `groups:\n${lines.join("\n")}`);
+        return true;
+      }
+
+      if (action === "create") {
+        const groupName = restArgs[0] ?? "";
+        const workspacePath = restArgs.slice(1).join(" ").trim();
+        if (!groupName) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            "usage: /tfgroup create <groupName> [workspacePath]",
+          );
+          return true;
+        }
+        try {
+          const group = await this.accessManager.createGroup(userScope.userKey, groupName, workspacePath || undefined);
+          await this.openclawBridge.resolveExecutionScope({
+            routingUserKey: group.scopeUserKey,
+            senderId: undefined,
+            senderOpenId: undefined,
+            senderUserId: undefined,
+          });
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `group created: ${group.displayName} (${group.name})\nworkspace: ${group.workspaceDir}`,
+          );
+        } catch (error) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `tfgroup create failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return true;
+      }
+
+      if (action === "workspace" || action === "set-workspace") {
+        const groupName = restArgs[0] ?? "";
+        const workspacePath = restArgs.slice(1).join(" ").trim();
+        if (!groupName || !workspacePath) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            "usage: /tfgroup workspace <groupName> <workspacePath>",
+          );
+          return true;
+        }
+        try {
+          const group = await this.accessManager.setGroupWorkspace(userScope.userKey, groupName, workspacePath);
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `group workspace updated: ${group.displayName}\nworkspace: ${group.workspaceDir}`,
+          );
+        } catch (error) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `tfgroup workspace failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return true;
+      }
+
+      if (action === "add" || action === "remove") {
+        const groupName = restArgs[0] ?? "";
+        const targetUser = await this.resolveTargetUserKey(restArgs[1] ?? "", userScope);
+        if (!groupName || !targetUser) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            "usage: /tfgroup add|remove <groupName> <feishuId|feishuName|linuxUser|me>",
+          );
+          return true;
+        }
+        try {
+          const group = action === "add"
+            ? await this.accessManager.addGroupMember(userScope.userKey, groupName, targetUser)
+            : await this.accessManager.removeGroupMember(userScope.userKey, groupName, targetUser);
+          const targetDisplayName = await this.displayUserName(targetUser);
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `group ${action === "add" ? "member added" : "member removed"}: ${group.displayName}\nmember: ${targetDisplayName}`,
+          );
+        } catch (error) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `tfgroup ${action} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return true;
+      }
+
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        [
+          "usage:",
+          "/tfgroup list",
+          "/tfgroup create <groupName> [workspacePath]",
+          "/tfgroup workspace <groupName> <workspacePath>",
+          "/tfgroup add <groupName> <feishuId|feishuName|linuxUser>",
+          "/tfgroup remove <groupName> <feishuId|feishuName|linuxUser>",
+        ].join("\n"),
+      );
+      return true;
+    }
+
+    if (cmd === "tfmode") {
+      const [actionRaw, ...restArgs] = argsText.split(/\s+/);
+      const action = (actionRaw ?? "status").toLowerCase();
+      if (action === "status" || action === "show") {
+        const mode = await this.resolveOpenClawRouteScope(selectionKey, userScope);
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `openclaw mode: ${mode.kind === "group" ? `group:${mode.modeLabel}` : `user:${mode.modeLabel}`}`,
+        );
+        return true;
+      }
+      if (action === "list") {
+        const groups = await this.accessManager.listGroupsForUser(userScope.userKey);
+        const lines = groups.map((group) => `- ${group.displayName} (${group.name})`);
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          lines.length > 0 ? `your groups:\n${lines.join("\n")}` : "your groups: (none)",
+        );
+        return true;
+      }
+      if (action === "personal" || action === "user") {
+        this.chatOpenClawRouteScopes.delete(selectionKey);
+        const selfDisplayName = await this.displayUserName(userScope.userKey);
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `openclaw mode switched: user:${selfDisplayName}`,
+        );
+        return true;
+      }
+      if (action === "group") {
+        const groupName = restArgs[0] ?? "";
+        if (!groupName) {
+          await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /tfmode group <groupName>");
+          return true;
+        }
+        const group = await this.accessManager.getGroupForMember(groupName, userScope.userKey);
+        if (!group) {
+          await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `group unavailable: ${groupName}`);
+          return true;
+        }
+        this.chatOpenClawRouteScopes.set(selectionKey, {
+          kind: "group",
+          modeLabel: group.name,
+          routingUserKey: group.scopeUserKey,
+          workspaceOverrideDir: group.workspaceDir,
+        });
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `openclaw mode switched: group:${group.displayName}`,
+        );
+        return true;
+      }
+      await this.replyWithMode(
+        ctx.chatId,
+        ctx.responder,
+        selectionKey,
+        "usage: /tfmode status|list|personal|group <groupName>",
+      );
+      return true;
+    }
+
+    return false;
   }
 
   private async handleTfclawCommand(
@@ -5423,7 +6526,13 @@ class TfclawCommandRouter {
   private async routeToOpenClaw(
     ctx: InboundTextContext,
     selectionKey: string,
-    options?: { text?: string; historySeed?: HistorySeedEntry[] },
+    options?: {
+      text?: string;
+      historySeed?: HistorySeedEntry[];
+      routingUserKey?: string;
+      workspaceOverrideDir?: string;
+      modeLabel?: string;
+    },
   ): Promise<void> {
     if (!this.openclawBridge.enabled) {
       await this.replyWithMode(
@@ -5451,10 +6560,19 @@ class TfclawCommandRouter {
         text,
         historySeed: options?.historySeed,
         attachments: ctx.attachments,
+        routingUserKey: options?.routingUserKey,
+        workspaceOverrideDir: options?.workspaceOverrideDir,
       });
       const normalizedText = reply.text.trim();
+      const modeLabel = (options?.modeLabel || options?.routingUserKey || "user").trim();
+      const modeHeader = `mode:${modeLabel}`;
+      let sentModeHeader = false;
       if (normalizedText) {
-        await ctx.responder.replyText(ctx.chatId, normalizedText);
+        await ctx.responder.replyText(ctx.chatId, `${modeHeader}\n${normalizedText}`);
+        sentModeHeader = true;
+      } else if (reply.media.length > 0) {
+        await ctx.responder.replyText(ctx.chatId, modeHeader);
+        sentModeHeader = true;
       }
 
       for (const media of reply.media) {
@@ -5490,7 +6608,10 @@ class TfclawCommandRouter {
       }
 
       if (!normalizedText && reply.media.length === 0) {
-        await ctx.responder.replyText(ctx.chatId, "(openclaw returned empty reply)");
+        await ctx.responder.replyText(
+          ctx.chatId,
+          sentModeHeader ? "(openclaw returned empty reply)" : `${modeHeader}\n(openclaw returned empty reply)`,
+        );
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -5501,7 +6622,13 @@ class TfclawCommandRouter {
   private async routeToAgentBridge(
     ctx: InboundTextContext,
     selectionKey: string,
-    options?: { text?: string; historySeed?: HistorySeedEntry[] },
+    options?: {
+      text?: string;
+      historySeed?: HistorySeedEntry[];
+      routingUserKey?: string;
+      workspaceOverrideDir?: string;
+      modeLabel?: string;
+    },
   ): Promise<void> {
     if (this.openclawBridge.enabled) {
       await this.routeToOpenClaw(ctx, selectionKey, options);
@@ -5517,6 +6644,26 @@ class TfclawCommandRouter {
     }
 
     const userScope = await this.resolveUserScope(ctx);
+    await this.accessManager.registerUserAliases(userScope.userKey, [
+      ctx.senderOpenId || "",
+      ctx.senderUserId || "",
+      ctx.senderId || "",
+      ctx.senderName || "",
+      userScope.linuxUser || "",
+    ]);
+    await this.accessManager.registerUserDisplayName(userScope.userKey, ctx.senderName || "");
+    for (const mention of ctx.mentions ?? []) {
+      const mentionUserKey = (mention.openId || mention.userId || "").trim();
+      if (!mentionUserKey) {
+        continue;
+      }
+      await this.accessManager.registerUserAliases(mentionUserKey, [
+        mention.name || "",
+        mention.openId || "",
+        mention.userId || "",
+      ]);
+      await this.accessManager.registerUserDisplayName(mentionUserKey, mention.name || "");
+    }
     const selectionKey = this.selectionKey(ctx.channel, ctx.chatId, userScope.userKey);
     const isGroupChat = this.isGroupChat(ctx);
     const senderBufferKey = userScope.senderKey;
@@ -5550,7 +6697,12 @@ class TfclawCommandRouter {
     }
 
     if (ctx.messageType !== "text") {
-      await this.routeToAgentBridge(ctx, selectionKey);
+      const routeScope = await this.resolveOpenClawRouteScope(selectionKey, userScope);
+      await this.routeToAgentBridge(
+        ctx,
+        selectionKey,
+        this.toAgentRouteOptions(routeScope),
+      );
       return;
     }
 
@@ -5579,8 +6731,14 @@ class TfclawCommandRouter {
         {
           text: fallbackText,
           historySeed: this.toHistorySeed(bufferedTexts),
+          ...this.toAgentRouteOptions(await this.resolveOpenClawRouteScope(selectionKey, userScope)),
         },
       );
+      return;
+    }
+
+    const accessCommandConsumed = await this.handleAccessControlCommand(ctx, selectionKey, userScope, text);
+    if (accessCommandConsumed) {
       return;
     }
 
@@ -5613,6 +6771,7 @@ class TfclawCommandRouter {
         {
           text: nexchatText,
           historySeed: this.toHistorySeed(bufferedTexts),
+          ...this.toAgentRouteOptions(await this.resolveOpenClawRouteScope(selectionKey, userScope)),
         },
       );
       return;
@@ -5635,6 +6794,16 @@ class FeishuChatApp implements ChatApp, MessageResponder {
   private botName = "";
   private readonly recentInboundKeys = new Map<string, number>();
   private readonly inboundDedupTtlMs = 5 * 60 * 1000;
+  private readonly userNameCache = new Map<string, { name: string; expiresAt: number }>();
+  private readonly chatInfoCache = new Map<string, { displayName: string; userCount: number; expiresAt: number }>();
+  private readonly systemSenderNameCache = new Map<string, { senderOpenId: string; displayName: string; expiresAt: number }>();
+  private readonly ownerDisplayNameByOpenId = new Map<string, string>();
+  private ownerDisplayNameIndexExpiresAt = 0;
+  private readonly userNameCacheHitTtlMs = 24 * 60 * 60 * 1000;
+  private readonly userNameCacheMissTtlMs = 5 * 60 * 1000;
+  private readonly chatInfoCacheTtlMs = 10 * 60 * 1000;
+  private readonly ownerDisplayNameIndexTtlMs = 10 * 60 * 1000;
+  private readonly systemSenderNameCacheTtlMs = 10 * 60 * 1000;
 
   constructor(
     private readonly config: FeishuChannelConfig,
@@ -5801,6 +6970,426 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     }
     this.recentInboundKeys.set(key, now);
     return false;
+  }
+
+  private looksLikeFeishuIdentifier(value: string): boolean {
+    return /^(?:ou|on|od|u)_[A-Za-z0-9]+$/i.test(value.trim());
+  }
+
+  private looksLikeLinuxUser(value: string): boolean {
+    return /^tfoc_[a-f0-9]+$/i.test(value.trim());
+  }
+
+  private normalizeDisplayNameCandidate(value: string): string {
+    return value.trim().replace(/\s+/g, " ");
+  }
+
+  private isLikelyHumanName(value: string): boolean {
+    const normalized = this.normalizeDisplayNameCandidate(value);
+    if (!normalized) {
+      return false;
+    }
+    if (this.looksLikeFeishuIdentifier(normalized) || this.looksLikeLinuxUser(normalized)) {
+      return false;
+    }
+    if (/\p{Script=Han}/u.test(normalized)) {
+      return true;
+    }
+    if (/^[A-Za-z][A-Za-z '.-]{0,39}$/.test(normalized)) {
+      return true;
+    }
+    return false;
+  }
+
+  private selectLikelyHumanName(...values: string[]): string {
+    for (const value of values) {
+      const normalized = this.normalizeDisplayNameCandidate(value);
+      if (!this.isLikelyHumanName(normalized)) {
+        continue;
+      }
+      return normalized;
+    }
+    return "";
+  }
+
+  private selectDisplayNameCandidate(...values: string[]): string {
+    for (const value of values) {
+      const normalized = this.normalizeDisplayNameCandidate(value);
+      if (!normalized) {
+        continue;
+      }
+      if (this.looksLikeFeishuIdentifier(normalized) || this.looksLikeLinuxUser(normalized)) {
+        continue;
+      }
+      return normalized;
+    }
+    return "";
+  }
+
+  private getCachedUserDisplayName(cacheKey: string): string | undefined {
+    const hit = this.userNameCache.get(cacheKey);
+    if (!hit) {
+      return undefined;
+    }
+    if (Date.now() > hit.expiresAt) {
+      this.userNameCache.delete(cacheKey);
+      return undefined;
+    }
+    if (!hit.name) {
+      this.userNameCache.delete(cacheKey);
+      return undefined;
+    }
+    return hit.name;
+  }
+
+  private setCachedUserDisplayName(cacheKey: string, name: string): void {
+    const normalized = this.normalizeDisplayNameCandidate(name);
+    this.userNameCache.set(cacheKey, {
+      name: normalized,
+      expiresAt: Date.now() + (normalized ? this.userNameCacheHitTtlMs : this.userNameCacheMissTtlMs),
+    });
+  }
+
+  private extractUserNameFromContactResponse(response: unknown): string {
+    const obj = toObject(response);
+    const dataObj = toObject(obj.data);
+    const userObj = toObject(dataObj.user);
+    return this.selectDisplayNameCandidate(
+      toString(userObj.name),
+      toString(userObj.en_name),
+      toString(userObj.nickname),
+      toString(userObj.employee_name),
+    );
+  }
+
+  private getCachedChatInfo(chatId: string): { displayName: string; userCount: number } | undefined {
+    const hit = this.chatInfoCache.get(chatId);
+    if (!hit) {
+      return undefined;
+    }
+    if (Date.now() > hit.expiresAt) {
+      this.chatInfoCache.delete(chatId);
+      return undefined;
+    }
+    return {
+      displayName: hit.displayName,
+      userCount: hit.userCount,
+    };
+  }
+
+  private async fetchChatInfo(chatId: string): Promise<{ displayName: string; userCount: number } | undefined> {
+    const normalizedChatId = chatId.trim();
+    if (!this.larkClient || !normalizedChatId) {
+      return undefined;
+    }
+    const cached = this.getCachedChatInfo(normalizedChatId);
+    if (cached) {
+      return cached;
+    }
+    try {
+      const response = await this.larkClient.im.v1.chat.get({
+        path: {
+          chat_id: normalizedChatId,
+        },
+        params: {
+          user_id_type: "open_id",
+        },
+      });
+      const obj = toObject(response);
+      const dataObj = toObject(obj.data);
+      const i18nObj = toObject(dataObj.i18n_names);
+      const displayName = this.selectLikelyHumanName(
+        toString(dataObj.name),
+        toString(i18nObj.zh_cn),
+        toString(i18nObj.en_us),
+      );
+      const userCount = Math.max(0, toNumber(dataObj.user_count, 0));
+      this.chatInfoCache.set(normalizedChatId, {
+        displayName,
+        userCount,
+        expiresAt: Date.now() + this.chatInfoCacheTtlMs,
+      });
+      return {
+        displayName,
+        userCount,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fetchUserDisplayNameById(
+    idValue: string,
+    idType: "open_id" | "user_id",
+  ): Promise<string> {
+    const normalizedId = idValue.trim();
+    if (!this.larkClient || !normalizedId) {
+      return "";
+    }
+    const cacheKey = `${idType}:${normalizedId}`;
+    const cached = this.getCachedUserDisplayName(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+    try {
+      const response = await this.larkClient.contact.v3.user.get({
+        path: {
+          user_id: normalizedId,
+        },
+        params: {
+          user_id_type: idType,
+        },
+      });
+      const name = this.extractUserNameFromContactResponse(response);
+      if (!name && FEISHU_DEBUG_INBOUND) {
+        const obj = toObject(response);
+        const userObj = toObject(toObject(obj.data).user);
+        const userKeys = Object.keys(userObj).sort().join(",");
+        console.warn(`[gateway] feishu contact user has no name fields: ${cacheKey} keys=[${userKeys}]`);
+      }
+      this.setCachedUserDisplayName(cacheKey, name);
+      return name;
+    } catch (error) {
+      this.setCachedUserDisplayName(cacheKey, "");
+      if (FEISHU_DEBUG_INBOUND) {
+        console.warn(`[gateway] feishu fetch user profile failed: ${describeSdkError(error)} | ${cacheKey}`);
+      }
+      return "";
+    }
+  }
+
+  private async refreshOwnerDisplayNameIndex(): Promise<void> {
+    const now = Date.now();
+    if (!this.larkClient || now < this.ownerDisplayNameIndexExpiresAt) {
+      return;
+    }
+    const next = new Map<string, string>();
+    let pageToken = "";
+    for (let i = 0; i < 20; i += 1) {
+      const response = await this.larkClient.im.v1.chat.list({
+        params: {
+          page_size: 50,
+          user_id_type: "open_id",
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+      const obj = toObject(response);
+      if (obj.code !== undefined && toNumber(obj.code, 0) !== 0) {
+        break;
+      }
+      const dataObj = toObject(obj.data);
+      const items = Array.isArray(dataObj.items) ? dataObj.items : [];
+      for (const rawItem of items) {
+        const item = toObject(rawItem);
+        const ownerOpenId = toString(item.owner_id).trim();
+        if (!ownerOpenId) {
+          continue;
+        }
+        const i18n = toObject(item.i18n_names);
+        const displayName = this.selectLikelyHumanName(
+          toString(item.name),
+          toString(i18n.zh_cn),
+          toString(i18n.en_us),
+        );
+        if (!displayName) {
+          continue;
+        }
+        if (this.botName && displayName.trim().toLowerCase() === this.botName.trim().toLowerCase()) {
+          continue;
+        }
+        if (/[，,]/.test(displayName)) {
+          continue;
+        }
+        if (/bot/i.test(displayName) && !/\p{Script=Han}/u.test(displayName)) {
+          continue;
+        }
+        const previous = next.get(ownerOpenId);
+        if (!previous || displayName.length < previous.length) {
+          next.set(ownerOpenId, displayName);
+        }
+      }
+      if (!Boolean(dataObj.has_more)) {
+        break;
+      }
+      pageToken = toString(dataObj.page_token).trim();
+      if (!pageToken) {
+        break;
+      }
+    }
+    this.ownerDisplayNameByOpenId.clear();
+    for (const [key, value] of next.entries()) {
+      this.ownerDisplayNameByOpenId.set(key, value);
+    }
+    this.ownerDisplayNameIndexExpiresAt = now + this.ownerDisplayNameIndexTtlMs;
+  }
+
+  private async fetchOwnerDisplayNameByOpenId(openId: string): Promise<string> {
+    const normalizedOpenId = openId.trim();
+    if (!normalizedOpenId) {
+      return "";
+    }
+    await this.refreshOwnerDisplayNameIndex();
+    return this.ownerDisplayNameByOpenId.get(normalizedOpenId) || "";
+  }
+
+  private getCachedSystemSenderName(chatId: string, senderOpenId: string): string | undefined {
+    const hit = this.systemSenderNameCache.get(chatId);
+    if (!hit) {
+      return undefined;
+    }
+    if (Date.now() > hit.expiresAt) {
+      this.systemSenderNameCache.delete(chatId);
+      return undefined;
+    }
+    if (hit.senderOpenId !== senderOpenId) {
+      return undefined;
+    }
+    return hit.displayName;
+  }
+
+  private async fetchSenderDisplayNameFromSystemMessages(chatId: string, senderOpenId: string): Promise<string> {
+    const normalizedChatId = chatId.trim();
+    const normalizedSenderOpenId = senderOpenId.trim();
+    if (!this.larkClient || !normalizedChatId || !normalizedSenderOpenId) {
+      return "";
+    }
+    const cached = this.getCachedSystemSenderName(normalizedChatId, normalizedSenderOpenId);
+    if (cached) {
+      return cached;
+    }
+    try {
+      const response = await this.larkClient.im.v1.message.list({
+        params: {
+          container_id_type: "chat",
+          container_id: normalizedChatId,
+          page_size: 50,
+          sort_type: "ByCreateTimeAsc",
+        },
+      });
+      const obj = toObject(response);
+      if (obj.code !== undefined && toNumber(obj.code, 0) !== 0) {
+        return "";
+      }
+      const dataObj = toObject(obj.data);
+      const items = Array.isArray(dataObj.items) ? dataObj.items : [];
+      const userSenders = new Set<string>();
+      const systemNames: string[] = [];
+      for (const rawItem of items) {
+        const item = toObject(rawItem);
+        const senderObj = toObject(item.sender);
+        const senderType = toString(senderObj.sender_type).trim().toLowerCase();
+        const senderId = toString(senderObj.id).trim();
+        if (senderType === "user" && senderId) {
+          userSenders.add(senderId);
+        }
+        const messageType = toString(item.msg_type).trim().toLowerCase();
+        if (messageType !== "system") {
+          continue;
+        }
+        const bodyObj = toObject(item.body);
+        const contentText = toString(bodyObj.content).trim();
+        if (!contentText) {
+          continue;
+        }
+        let contentObj: Record<string, unknown> = {};
+        try {
+          contentObj = toObject(JSON.parse(contentText));
+        } catch {
+          contentObj = {};
+        }
+        const fromUsers = Array.isArray(contentObj.from_user) ? contentObj.from_user : [];
+        for (const fromUser of fromUsers) {
+          systemNames.push(toString(fromUser));
+        }
+      }
+      if (!(userSenders.size === 1 && userSenders.has(normalizedSenderOpenId))) {
+        return "";
+      }
+      const displayName = this.selectLikelyHumanName(...systemNames);
+      if (!displayName) {
+        return "";
+      }
+      this.systemSenderNameCache.set(normalizedChatId, {
+        senderOpenId: normalizedSenderOpenId,
+        displayName,
+        expiresAt: Date.now() + this.systemSenderNameCacheTtlMs,
+      });
+      return displayName;
+    } catch {
+      return "";
+    }
+  }
+
+  private async resolveSenderDisplayName(
+    senderObj: Record<string, unknown>,
+    senderOpenId: string,
+    senderUserId: string,
+    contentObj: Record<string, unknown>,
+    chatId: string,
+    chatType: string,
+  ): Promise<string> {
+    const fromPayload = this.selectDisplayNameCandidate(
+      toString(senderObj.name),
+      toString(senderObj.sender_name),
+      toString(senderObj.user_name),
+      toString(senderObj.nickname),
+      toString(senderObj.display_name),
+      toString(toObject(senderObj.sender).name),
+      toString(toObject(toObject(senderObj.sender).sender).name),
+      toString(contentObj.user_name),
+      toString(contentObj.name),
+    );
+    if (fromPayload) {
+      return fromPayload;
+    }
+    const fromOpenId = await this.fetchUserDisplayNameById(senderOpenId, "open_id");
+    if (fromOpenId) {
+      if (senderUserId.trim()) {
+        this.setCachedUserDisplayName(`user_id:${senderUserId.trim()}`, fromOpenId);
+      }
+      return fromOpenId;
+    }
+    const fromUserId = await this.fetchUserDisplayNameById(senderUserId, "user_id");
+    if (fromUserId) {
+      if (senderOpenId.trim()) {
+        this.setCachedUserDisplayName(`open_id:${senderOpenId.trim()}`, fromUserId);
+      }
+      return fromUserId;
+    }
+    const fromSystem = await this.fetchSenderDisplayNameFromSystemMessages(chatId, senderOpenId);
+    if (fromSystem) {
+      this.setCachedUserDisplayName(`open_id:${senderOpenId.trim()}`, fromSystem);
+      if (senderUserId.trim()) {
+        this.setCachedUserDisplayName(`user_id:${senderUserId.trim()}`, fromSystem);
+      }
+      return fromSystem;
+    }
+    const chatInfo = await this.fetchChatInfo(chatId);
+    const normalizedChatType = chatType.trim().toLowerCase();
+    if (chatInfo?.displayName
+      && (chatInfo.userCount === 1
+        || normalizedChatType === "p2p"
+        || normalizedChatType === "single")) {
+      if (senderOpenId.trim()) {
+        this.setCachedUserDisplayName(`open_id:${senderOpenId.trim()}`, chatInfo.displayName);
+      }
+      if (senderUserId.trim()) {
+        this.setCachedUserDisplayName(`user_id:${senderUserId.trim()}`, chatInfo.displayName);
+      }
+      return chatInfo.displayName;
+    }
+    const fromOwner = await this.fetchOwnerDisplayNameByOpenId(senderOpenId);
+    if (fromOwner) {
+      this.setCachedUserDisplayName(`open_id:${senderOpenId.trim()}`, fromOwner);
+      if (senderUserId.trim()) {
+        this.setCachedUserDisplayName(`user_id:${senderUserId.trim()}`, fromOwner);
+      }
+      return fromOwner;
+    }
+    console.warn(
+      `[gateway] sender name unresolved: chat_id=${chatId} chat_type=${normalizedChatType || "unknown"} sender_open_id=${senderOpenId || "unknown"} sender_user_id=${senderUserId || "unknown"} chat_name=${chatInfo?.displayName || "(none)"} chat_user_count=${chatInfo?.userCount ?? -1}`,
+    );
+    return "";
   }
 
   private async sendTextMessage(
@@ -6010,11 +7599,15 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       throw new Error("file too large (>30MB)");
     }
 
-    const safeFileName = path.basename(fileName || `openclaw-${Date.now()}.bin`).replace(/[\/\\]/g, "_").trim() || `openclaw-${Date.now()}.bin`;
-    const uploadFileName = safeFileName.replace(/[^\x20-\x7E]/g, "_") || `openclaw-${Date.now()}.bin`;
+    const safeFileName = path.basename(fileName || `openclaw-${Date.now()}.bin`)
+      .replace(/[\/\\]/g, "_")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim() || `openclaw-${Date.now()}.bin`;
+    const uploadFileName = safeFileName.slice(0, 120) || `openclaw-${Date.now()}.bin`;
+    const tmpExt = path.extname(uploadFileName).trim() || ".bin";
     const tmpPath = path.join(
       os.tmpdir(),
-      `tfclaw-feishu-${Date.now()}-${Math.random().toString(16).slice(2)}-${uploadFileName}`,
+      `tfclaw-feishu-${Date.now()}-${Math.random().toString(16).slice(2)}${tmpExt}`,
     );
     fs.writeFileSync(tmpPath, fileBuffer);
 
@@ -6359,7 +7952,8 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     }
 
     const chatType = toString(message.chat_type).trim().toLowerCase() || "unknown";
-    const senderIdObj = toObject(toObject(inboundPayload.sender).sender_id);
+    const senderObj = toObject(inboundPayload.sender);
+    const senderIdObj = toObject(senderObj.sender_id);
     const senderOpenId = toString(senderIdObj.open_id);
     const senderUserId = toString(senderIdObj.user_id);
     const normalizedSenderId = senderOpenId || senderUserId;
@@ -6381,6 +7975,14 @@ class FeishuChatApp implements ChatApp, MessageResponder {
         contentObj = {};
       }
     }
+    const senderName = await this.resolveSenderDisplayName(
+      senderObj,
+      senderOpenId,
+      senderUserId,
+      contentObj,
+      chatId,
+      chatType,
+    );
     const rawText = messageType === "text" ? toString(contentObj.text, rawContent) : "";
     const attachments = await this.downloadInboundAttachments(messageType, contentObj, messageId);
     const mentions = extractFeishuMentions(message, contentObj);
@@ -6440,6 +8042,8 @@ class FeishuChatApp implements ChatApp, MessageResponder {
         senderId: normalizedSenderId || undefined,
         senderOpenId: senderOpenId || undefined,
         senderUserId: senderUserId || undefined,
+        senderName: senderName || undefined,
+        mentions,
         messageId: messageId || undefined,
         eventId: eventId || undefined,
         messageType,
@@ -6688,7 +8292,36 @@ async function bootstrap(): Promise<void> {
   const relay = new RelayBridge(loaded.config.relay.url, loaded.config.relay.token, "feishu");
   const nexChatBridge = new NexChatBridgeClient(loaded.config.nexchatbot);
   const openclawBridge = new OpenClawPerUserBridge(loaded.config.openclawBridge);
-  const router = new TfclawCommandRouter(relay, nexChatBridge, openclawBridge);
+  const accessManager = new TfclawAccessManager(loaded.config.openclawBridge.stateDir);
+  const configuredSuperRoot = accessManager.readConfiguredSuperRootIdentifier();
+  if (configuredSuperRoot) {
+    const bindings = await openclawBridge.listUserBindings();
+    let resolvedSuperRoot = "";
+    const byUserKey = bindings.find((item) => item.userKey === configuredSuperRoot);
+    if (byUserKey) {
+      resolvedSuperRoot = byUserKey.userKey;
+    } else {
+      const byLinuxUser = bindings.find((item) => item.linuxUser === configuredSuperRoot);
+      if (byLinuxUser) {
+        resolvedSuperRoot = byLinuxUser.userKey;
+      }
+    }
+    if (!resolvedSuperRoot) {
+      resolvedSuperRoot = (await accessManager.resolveUserAlias(configuredSuperRoot)) || "";
+    }
+    if (!resolvedSuperRoot && /^(?:ou|on|od|u)_[A-Za-z0-9]+$/i.test(configuredSuperRoot)) {
+      resolvedSuperRoot = configuredSuperRoot;
+    }
+    if (resolvedSuperRoot) {
+      await accessManager.setSuperRootFromConfig(resolvedSuperRoot);
+      console.log(`[gateway] super_root loaded from local config: ${resolvedSuperRoot}`);
+    } else {
+      console.warn(
+        `[gateway] super_root local config unresolved: ${configuredSuperRoot}. Use feishu user key, known name, or mapped linux user.`,
+      );
+    }
+  }
+  const router = new TfclawCommandRouter(relay, nexChatBridge, openclawBridge, accessManager);
   const chatApps = new ChatAppManager(loaded.config, router);
 
   relay.connect();

@@ -108,12 +108,22 @@ npm run start:gateway
 
 ## Feishu 命令
 
-- `/help`
-- `/list`
-- `/new`
-- `/use <id|title|index>`
-- `/close <id|title|index>`
-- `/capture`（列出屏幕/窗口并回复数字）
-- `<terminal-id>: <command>`
-- `<command>`（发给当前选中 terminal）
-- `/ctrlc`, `/ctrld`
+- `/tfhelp`（TFClaw 命令总览）
+- `/tflist`、`/tfnew`、`/tfuse <id|title|index>`、`/tfattach [id|title|index]`、`/tfclose <id|title|index>`
+- `/tfcapture`（列出屏幕/窗口并回复数字）
+- `<terminal-id>: <command>`、`<command>`（发给当前选中 terminal）
+- `/tfkey <...>`、`/tfctrlc`、`/tfctrld`
+- `/tfmode status|list|personal|group <groupName>`
+- `/tfgroup list|create|workspace|add|remove ...`
+- `/tfadmin list|add|remove ...`
+- `/tfusers`
+- `/tfroot show`（只读，`/tfroot set` 已禁用）
+
+### 权限与参数说明
+
+- `super_root` 只从本地文件配置加载：`<openclawBridge.stateDir>/super-root.local.json`
+- `/tfadmin add/remove` 与 `/tfgroup add/remove` 的用户参数支持：
+  - 飞书 ID（如 `ou_xxx`）
+  - 飞书用户名（如 `汪燠欣`）
+  - Linux 用户名（如 `tfoc_xxx`）
+  - `me`

@@ -32,6 +32,15 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP，并提供对应的app
   - terminal 状态与输出快照缓存
   - 命令转发与基础 ACK
 - gateway（Feishu 通道）支持：
+  - `/tfhelp`（TFClaw 命令总览）
+  - `/tflist`、`/tfnew`、`/tfuse <id|title|index>`、`/tfattach [id|title|index]`、`/tfclose <id|title|index>`
+  - `/tfcapture`（列出屏幕/窗口并回复数字）
+  - `/tfmode status|list|personal|group <groupName>`（切换个人/团组 OpenClaw）
+  - `/tfgroup list|create|workspace|add|remove ...`（团组与共享工作空间管理）
+  - `/tfadmin list|add|remove ...`（管理员管理；add/remove 仅 super_root 可用）
+  - `/tfusers`（查看全量用户与角色）
+  - `/tfroot show`（只读；super_root 仅可通过本地文件 `<openclawBridge.stateDir>/super-root.local.json` 配置）
+  - `/tfadmin add/remove` 与 `/tfgroup add/remove` 的用户参数支持：`feishuId | feishuName | linuxUser | me`
     - `/tmux help查看所有支持命令`
     - `/tmux status|sessions|panes|new|target|close|socket|lines|wait|stream|capture|key|send`
     - `/t<subcommand>` 别名（例如 `/tkey` `/ttarget` `/tcapture`）
@@ -283,4 +292,3 @@ gateway 额外支持：`TFCLAW_CONFIG_PATH=/path/to/config.json`
 - 目前飞书端动态窗口的跟踪还是没有做到预设的24h，原因未知。可以手动/tcapture查看目前运行情况。
 - 窗口枚举/窗口截图当前仅在 Windows agent 上实现；Linux/macOS 暂仅屏幕截图。
 - 使用手机app需要server连接公网，注意安全。
-
