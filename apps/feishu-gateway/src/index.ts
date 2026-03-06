@@ -126,6 +126,10 @@ interface OpenClawBridgeConfig {
   configTemplatePath: string;
   autoBuildDist: boolean;
   allowAutoCreateUser: boolean;
+  feishuAppId: string;
+  feishuAppSecret: string;
+  feishuVerificationToken: string;
+  feishuWebhookPortOffset: number;
 }
 
 interface GatewayConfig {
@@ -693,6 +697,85 @@ function buildFeishuResourceHint(messageType: string, contentObj: Record<string,
   }
   parts.push("下载提示: 调用 download_message_resource 获取并解析内容");
   return parts.join(" | ");
+}
+
+const FEISHU_LINK_RE = /https?:\/\/[^\s<>"'`]+/g;
+const FEISHU_DOC_LINK_PATH_MARKERS = [
+  "/docx/",
+  "/doc/",
+  "/wiki/",
+  "/base/",
+  "/sheet/",
+  "/sheets/",
+  "/bitable/",
+];
+
+function trimTrailingPunctuation(text: string): string {
+  return text.replace(/[),.;!?，。；！？、]+$/g, "");
+}
+
+function extractFeishuDocLinks(text: string): string[] {
+  if (!text) {
+    return [];
+  }
+
+  const matches = text.match(FEISHU_LINK_RE) ?? [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of matches) {
+    const candidate = trimTrailingPunctuation(raw.trim());
+    if (!candidate) {
+      continue;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      continue;
+    }
+    const host = parsed.hostname.trim().toLowerCase();
+    if (!host) {
+      continue;
+    }
+    const isFeishuHost =
+      host.endsWith(".feishu.cn")
+      || host === "feishu.cn"
+      || host.endsWith(".larksuite.com")
+      || host === "larksuite.com";
+    if (!isFeishuHost) {
+      continue;
+    }
+    const pathName = parsed.pathname.trim().toLowerCase();
+    const hasDocMarker = FEISHU_DOC_LINK_PATH_MARKERS.some((marker) => pathName.includes(marker));
+    if (!hasDocMarker) {
+      continue;
+    }
+    const normalized = parsed.toString();
+    if (seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function buildFeishuDocToolHint(text: string): string {
+  const links = extractFeishuDocLinks(text);
+  if (links.length === 0) {
+    return "";
+  }
+  const lines = links.map((link, idx) => `${idx + 1}. ${link}`);
+  return [
+    "[系统提示] 检测到飞书文档/知识库链接。请优先调用内置 Feishu 工具读取链接内容后再回答。",
+    "[链接列表]",
+    ...lines,
+    "[可用工具]",
+    "- feishu_doc",
+    "- feishu_wiki",
+    "- feishu_drive",
+    "- feishu_bitable",
+  ].join("\n");
 }
 
 function mergeNoProxyHosts(hosts: string[]): void {
@@ -1441,7 +1524,32 @@ class OpenClawPerUserBridge {
 
     const channels = toObject(cfg.channels);
     const feishu = toObject(channels.feishu);
-    feishu.enabled = false;
+    const feishuWebhookPort = this.derivePerUserFeishuWebhookPort(binding.gatewayPort);
+    // Keep Feishu tools available in per-user openclaw while disabling WS ingress conflicts.
+    feishu.enabled = true;
+    feishu.connectionMode = "webhook";
+    feishu.webhookHost = "127.0.0.1";
+    feishu.webhookPort = feishuWebhookPort;
+    if (!toString(feishu.webhookPath).trim()) {
+      feishu.webhookPath = "/feishu/events";
+    }
+    if (!toString(feishu.appId).trim() && this.config.feishuAppId.trim()) {
+      feishu.appId = this.config.feishuAppId.trim();
+    }
+    if (!toString(feishu.appSecret).trim() && this.config.feishuAppSecret.trim()) {
+      feishu.appSecret = this.config.feishuAppSecret.trim();
+    }
+    const configuredVerificationToken = this.config.feishuVerificationToken.trim();
+    if (!toString(feishu.verificationToken).trim()) {
+      feishu.verificationToken = configuredVerificationToken || `tfclaw-${binding.account.username}`;
+    }
+    const feishuTools = toObject(feishu.tools);
+    feishuTools.doc = true;
+    feishuTools.chat = true;
+    feishuTools.wiki = true;
+    feishuTools.drive = true;
+    feishuTools.scopes = true;
+    feishu.tools = feishuTools;
     channels.feishu = feishu;
     cfg.channels = channels;
 
@@ -1501,6 +1609,18 @@ class OpenClawPerUserBridge {
     cfg.tools = tools;
 
     return cfg;
+  }
+
+  private derivePerUserFeishuWebhookPort(gatewayPort: number): number {
+    const primary = gatewayPort + this.config.feishuWebhookPortOffset;
+    if (primary >= 1025 && primary <= 65535) {
+      return primary;
+    }
+    const secondary = gatewayPort + 1000;
+    if (secondary >= 1025 && secondary <= 65535) {
+      return secondary;
+    }
+    return Math.max(1025, Math.min(65535, gatewayPort - 1000));
   }
 
   private ensurePathOwnerAndMode(targetPath: string, uid: number, gid: number, mode: number): void {
@@ -2318,6 +2438,22 @@ function loadGatewayConfig(): LoadedGatewayConfig {
       allowAutoCreateUser: toBoolean(
         rawOpenClawBridge.allowAutoCreateUser,
         toBoolean(process.env.TFCLAW_OPENCLAW_ALLOW_AUTO_CREATE_USER, true),
+      ),
+      feishuAppId: toString(rawOpenClawBridge.feishuAppId, feishuAppId),
+      feishuAppSecret: toString(rawOpenClawBridge.feishuAppSecret, feishuAppSecret),
+      feishuVerificationToken: toString(
+        rawOpenClawBridge.feishuVerificationToken,
+        toString(rawFeishu.verificationToken, ""),
+      ),
+      feishuWebhookPortOffset: Math.max(
+        100,
+        Math.min(
+          50000,
+          toNumber(
+            rawOpenClawBridge.feishuWebhookPortOffset,
+            toNumber(process.env.TFCLAW_OPENCLAW_FEISHU_WEBHOOK_PORT_OFFSET, 20000),
+          ),
+        ),
       ),
     },
     channels: {
@@ -4702,12 +4838,14 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     const atTags = messageType === "text" ? extractFeishuAtTags(rawText) : [];
     const resourceHint = buildFeishuResourceHint(messageType, contentObj, messageId);
     const text = messageType === "text" ? normalizeFeishuInboundText(rawText, mentionKeyList) : "";
-    const llmText = messageType === "text"
+    const llmBaseText = messageType === "text"
       ? normalizeFeishuInboundText(
         replaceFeishuMentionTokens(rawText, mentions, this.botOpenId, this.botName),
         mentionKeyList,
       )
       : resourceHint;
+    const feishuDocHint = messageType === "text" ? buildFeishuDocToolHint(llmBaseText) : "";
+    const llmText = feishuDocHint ? `${llmBaseText}\n\n${feishuDocHint}` : llmBaseText;
     const isMentioned = chatType !== "group"
       ? true
       : isFeishuMessageMentionedToBot(mentions, this.botOpenId, this.botName, this.config.appId, {
@@ -4721,7 +4859,10 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       );
     }
 
-    if (messageId && FEISHU_ACK_REACTION_ENABLED) {
+    const shouldAckReaction = FEISHU_ACK_REACTION_ENABLED
+      && Boolean(messageId)
+      && (chatType !== "group" || isMentioned);
+    if (shouldAckReaction) {
       void this.addReaction(messageId).catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
         console.warn(`[gateway] feishu add reaction failed: ${msg}`);
