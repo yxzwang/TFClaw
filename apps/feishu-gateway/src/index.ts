@@ -191,8 +191,35 @@ interface RenderedTerminalOutput {
 interface MessageResponder {
   replyText(chatId: string, text: string): Promise<void>;
   replyImage(chatId: string, imageBase64: string): Promise<void>;
+  replyFile?(
+    chatId: string,
+    fileBase64: string,
+    fileName: string,
+    mimeType?: string,
+  ): Promise<void>;
   replyTextWithMeta?(chatId: string, text: string): Promise<{ messageId?: string }>;
   deleteMessage?(messageId: string): Promise<void>;
+}
+
+interface BridgeInboundAttachment {
+  messageType: string;
+  fileName: string;
+  mimeType: string;
+  contentBase64: string;
+  sourceFileKey?: string;
+}
+
+interface OpenClawBridgeMediaItem {
+  kind: "image" | "file";
+  fileName: string;
+  mimeType: string;
+  contentBase64: string;
+  source: string;
+}
+
+interface OpenClawBridgeResponse {
+  text: string;
+  media: OpenClawBridgeMediaItem[];
 }
 
 interface HistorySeedEntry {
@@ -226,6 +253,7 @@ interface InboundTextContext {
   messageType: string;
   contentRaw: string;
   contentObj: Record<string, unknown>;
+  attachments?: BridgeInboundAttachment[];
   text: string;
   llmText: string;
   rawEvent: Record<string, unknown>;
@@ -264,6 +292,7 @@ interface OpenClawBridgeRequest {
   messageType: string;
   text: string;
   historySeed?: HistorySeedEntry[];
+  attachments?: BridgeInboundAttachment[];
 }
 
 interface TerminalProgressSession {
@@ -348,6 +377,20 @@ const TMUX_SHORT_ALIAS_COMMANDS = new Set([
   "/tkey",
   "/tsend",
 ]);
+
+const TFCLAW_SLASH_COMMAND_ALIAS_TO_LEGACY: Record<string, string> = {
+  "/tfhelp": "/help",
+  "/tfstate": "/state",
+  "/tflist": "/list",
+  "/tfnew": "/new",
+  "/tfcapture": "/capture",
+  "/tfattach": "/attach",
+  "/tfkey": "/key",
+  "/tfctrlc": "/ctrlc",
+  "/tfctrld": "/ctrld",
+  "/tfuse": "/use",
+  "/tfclose": "/close",
+};
 
 function toObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -671,9 +714,190 @@ function replaceFeishuMentionTokens(
     .trim();
 }
 
+interface FeishuPostMediaKeyEntry {
+  fileKey: string;
+  fileName: string;
+}
+
+interface FeishuPostParseResult {
+  textContent: string;
+  imageKeys: string[];
+  mediaKeys: FeishuPostMediaKeyEntry[];
+  mentionedIds: string[];
+}
+
+function resolveFeishuPostPayload(contentObj: Record<string, unknown>): Record<string, unknown> | undefined {
+  const directContent = contentObj.content;
+  if (Array.isArray(directContent)) {
+    return contentObj;
+  }
+
+  const postObj = toObject(contentObj.post);
+  if (Array.isArray(postObj.content)) {
+    return postObj;
+  }
+  for (const value of Object.values(postObj)) {
+    const candidate = toObject(value);
+    if (Array.isArray(candidate.content)) {
+      return candidate;
+    }
+  }
+
+  for (const value of Object.values(contentObj)) {
+    const candidate = toObject(value);
+    if (Array.isArray(candidate.content)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean)));
+}
+
+function parseFeishuPostContent(contentObj: Record<string, unknown>): FeishuPostParseResult {
+  const payload = resolveFeishuPostPayload(contentObj);
+  if (!payload) {
+    return {
+      textContent: "[富文本消息]",
+      imageKeys: [],
+      mediaKeys: [],
+      mentionedIds: [],
+    };
+  }
+
+  const paragraphs = Array.isArray(payload.content) ? payload.content : [];
+  const textLines: string[] = [];
+  const imageKeys: string[] = [];
+  const mediaKeys: FeishuPostMediaKeyEntry[] = [];
+  const mentionedIds: string[] = [];
+
+  const title = toString(payload.title).trim();
+  if (title) {
+    textLines.push(title);
+  }
+
+  for (const paragraph of paragraphs) {
+    if (!Array.isArray(paragraph)) {
+      continue;
+    }
+    const parts: string[] = [];
+    for (const element of paragraph) {
+      const item = toObject(element);
+      const tag = toString(item.tag).trim().toLowerCase();
+      if (!tag) {
+        continue;
+      }
+      if (tag === "text") {
+        const text = toString(item.text).trim();
+        if (text) {
+          parts.push(text);
+        }
+        continue;
+      }
+      if (tag === "a") {
+        const label = toString(item.text).trim();
+        const href = toString(item.href).trim();
+        if (label && href) {
+          parts.push(`${label}: ${href}`);
+        } else if (label) {
+          parts.push(label);
+        } else if (href) {
+          parts.push(href);
+        }
+        continue;
+      }
+      if (tag === "at") {
+        const mentionName = toString(item.user_name, toString(item.text)).trim();
+        const mentionId = toString(item.open_id, toString(item.user_id)).trim();
+        if (mentionName) {
+          parts.push(`@${mentionName}`);
+        }
+        if (mentionId) {
+          mentionedIds.push(mentionId);
+        }
+        continue;
+      }
+      if (tag === "img") {
+        const imageKey = toString(item.image_key).trim();
+        if (imageKey) {
+          imageKeys.push(imageKey);
+        }
+        parts.push("[图片]");
+        continue;
+      }
+      if (tag === "media") {
+        const fileKey = toString(item.file_key).trim();
+        const fileName = toString(item.file_name, "[媒体文件]").trim() || "[媒体文件]";
+        if (fileKey) {
+          mediaKeys.push({
+            fileKey,
+            fileName,
+          });
+        }
+        parts.push(`[媒体] ${fileName}`);
+        continue;
+      }
+      if (tag === "emotion") {
+        const emoji = toString(item.emoji, toString(item.text, toString(item.emoji_type))).trim();
+        if (emoji) {
+          parts.push(emoji);
+        }
+        continue;
+      }
+      if (tag === "code" || tag === "code_block" || tag === "pre") {
+        const code = toString(item.text, toString(item.content)).trim();
+        if (code) {
+          parts.push(code);
+        }
+        continue;
+      }
+      if (tag === "br") {
+        parts.push("\n");
+      }
+    }
+    const line = parts.join(" ").replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+    if (line) {
+      textLines.push(line);
+    }
+  }
+
+  return {
+    textContent: textLines.join("\n").trim() || "[富文本消息]",
+    imageKeys: dedupeStrings(imageKeys),
+    mediaKeys: Array.from(
+      new Map(
+        mediaKeys
+          .filter((entry) => entry.fileKey.trim())
+          .map((entry) => [entry.fileKey.trim(), { fileKey: entry.fileKey.trim(), fileName: entry.fileName }]),
+      ).values(),
+    ),
+    mentionedIds: dedupeStrings(mentionedIds),
+  };
+}
+
 function buildFeishuResourceHint(messageType: string, contentObj: Record<string, unknown>, messageId: string): string {
   const normalizedType = messageType.trim().toLowerCase();
-  if (!["image", "file", "media", "video", "audio"].includes(normalizedType)) {
+  if (normalizedType === "post") {
+    const parsedPost = parseFeishuPostContent(contentObj);
+    const parts = [
+      "[附件待取] 类型: post",
+      `message_id: ${messageId || "unknown"}`,
+      `内嵌图片数: ${parsedPost.imageKeys.length}`,
+      `内嵌媒体数: ${parsedPost.mediaKeys.length}`,
+    ];
+    if (parsedPost.imageKeys.length > 0) {
+      parts.push(`image_keys: ${parsedPost.imageKeys.join(",")}`);
+    }
+    if (parsedPost.mediaKeys.length > 0) {
+      parts.push(`media_file_keys: ${parsedPost.mediaKeys.map((entry) => entry.fileKey).join(",")}`);
+    }
+    parts.push("下载提示: 调用 download_message_resource 获取并解析内容");
+    return parts.join(" | ");
+  }
+
+  if (!["image", "file", "media", "video", "audio", "sticker"].includes(normalizedType)) {
     return "";
   }
 
@@ -682,6 +906,9 @@ function buildFeishuResourceHint(messageType: string, contentObj: Record<string,
   if (normalizedType === "image") {
     fileKey = toString(contentObj.image_key).trim();
     name = toString(contentObj.image_name, `image_${messageId || "unknown"}.png`).trim();
+  } else if (normalizedType === "sticker") {
+    fileKey = toString(contentObj.file_key, toString(contentObj.media_id)).trim();
+    name = toString(contentObj.file_name, `sticker_${messageId || "unknown"}.webp`).trim();
   } else {
     fileKey = toString(contentObj.file_key, toString(contentObj.media_id)).trim();
     name = toString(contentObj.file_name, toString(contentObj.file, `${normalizedType}_${messageId || "unknown"}`)).trim();
@@ -697,6 +924,57 @@ function buildFeishuResourceHint(messageType: string, contentObj: Record<string,
   }
   parts.push("下载提示: 调用 download_message_resource 获取并解析内容");
   return parts.join(" | ");
+}
+
+function buildFeishuNonTextBaseText(
+  messageType: string,
+  contentObj: Record<string, unknown>,
+  messageId: string,
+): string {
+  const normalizedType = messageType.trim().toLowerCase();
+  if (normalizedType === "post") {
+    const parsedPost = parseFeishuPostContent(contentObj);
+    const resourceHint = buildFeishuResourceHint(normalizedType, contentObj, messageId);
+    return [parsedPost.textContent, resourceHint].filter(Boolean).join("\n\n").trim();
+  }
+
+  if (normalizedType === "share_chat") {
+    const body = toString(contentObj.body).trim();
+    const summary = toString(contentObj.summary).trim();
+    const shareChatId = toString(contentObj.share_chat_id).trim();
+    const lines = [
+      "[转发会话消息]",
+      body || summary ? `内容: ${body || summary}` : "",
+      shareChatId ? `share_chat_id: ${shareChatId}` : "",
+    ].filter(Boolean);
+    return lines.join("\n").trim();
+  }
+
+  if (normalizedType === "merge_forward") {
+    return "[合并转发消息] 已收到 merge_forward 消息。";
+  }
+
+  if (normalizedType === "share_user") {
+    const userName = toString(contentObj.user_name, toString(contentObj.name)).trim();
+    const userId = toString(contentObj.user_id, toString(contentObj.open_id)).trim();
+    const lines = [
+      "[分享联系人消息]",
+      userName ? `用户名: ${userName}` : "",
+      userId ? `用户ID: ${userId}` : "",
+    ].filter(Boolean);
+    return lines.join("\n").trim();
+  }
+
+  const resourceHint = buildFeishuResourceHint(normalizedType, contentObj, messageId);
+  if (resourceHint) {
+    return resourceHint;
+  }
+
+  const fallback = toString(contentObj.text, toString(contentObj.content)).trim();
+  if (fallback) {
+    return fallback;
+  }
+  return `[非文本消息] 类型: ${normalizedType || "unknown"}`;
 }
 
 const FEISHU_LINK_RE = /https?:\/\/[^\s<>"'`]+/g;
@@ -1011,6 +1289,11 @@ const OPENCLAW_BRIDGE_FORCED_MAX_TOKENS = 8192;
 const OPENCLAW_BRIDGE_COMPACTION_RESERVE_TOKENS_FLOOR = 20000;
 const OPENCLAW_BRIDGE_WORKDIR_CONST_NAME = "TFCLAW_USER_WORKDIR";
 const OPENCLAW_BRIDGE_WORKDIR_SEPARATOR = "——————————————————————";
+const OPENCLAW_BRIDGE_INBOUND_MAX_FILE_BYTES = 30 * 1024 * 1024;
+const OPENCLAW_BRIDGE_OUTBOUND_MAX_FILE_BYTES = 30 * 1024 * 1024;
+const OPENCLAW_BRIDGE_MEDIA_FETCH_TIMEOUT_MS = 20_000;
+const FEISHU_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const FEISHU_MAX_FILE_BYTES = 30 * 1024 * 1024;
 const OPENCLAW_BUILTIN_SLASH_COMMANDS = new Set([
   "help",
   "commands",
@@ -1074,7 +1357,7 @@ class OpenClawPerUserBridge {
     ];
   }
 
-  async run(request: OpenClawBridgeRequest): Promise<string> {
+  async run(request: OpenClawBridgeRequest): Promise<OpenClawBridgeResponse> {
     if (!this.enabled) {
       throw new Error("openclaw bridge is disabled");
     }
@@ -1084,11 +1367,13 @@ class OpenClawPerUserBridge {
     const runtime = this.prepareUserRuntime(binding);
     await this.ensureTmuxOpenClawProcess(binding, runtime);
 
+    const attachmentContext = this.stageInboundAttachments(binding, runtime, request.attachments ?? []);
+    const textWithAttachmentContext = this.injectAttachmentContextIntoText(request.text, attachmentContext);
     const slashCommand = this.resolveBuiltinSlashCommand(request.text);
     const prompt = slashCommand
       ? request.text.trim()
       : this.composePrompt(
-          request.text,
+          textWithAttachmentContext,
           request.historySeed,
           runtime.workspaceConstDeclaration,
         );
@@ -1096,15 +1381,27 @@ class OpenClawPerUserBridge {
       gatewayUrl: `ws://${this.config.gatewayHost}:${binding.gatewayPort}`,
       gatewayToken: binding.gatewayToken,
       message: prompt,
+      attachments: attachmentContext.gatewayAttachments,
+      workspaceDir: runtime.workspaceDir,
+      homeDir: binding.account.home,
     });
-    const normalized = reply.trim();
-    if (!normalized) {
-      return "(openclaw returned empty reply)";
+    const normalized = reply.text.trim();
+    if (!normalized && reply.media.length === 0) {
+      return {
+        text: "(openclaw returned empty reply)",
+        media: [],
+      };
     }
     if (normalized.toUpperCase() === "NO_REPLY") {
-      return "(openclaw returned NO_REPLY)";
+      return {
+        text: "(openclaw returned NO_REPLY)",
+        media: [],
+      };
     }
-    return normalized;
+    return {
+      text: normalized,
+      media: reply.media,
+    };
   }
 
   private composePrompt(
@@ -1119,6 +1416,10 @@ class OpenClawPerUserBridge {
           OPENCLAW_BRIDGE_WORKDIR_SEPARATOR,
           "如涉及文件或目录操作，请默认在该工作目录内执行，除非用户明确指定其他路径。",
           "你可以直接执行 shell 命令（exec 工具可用）；不要假设自己没有 shell 权限。",
+          "本桥接支持你向飞书用户回传图片/文件。",
+          "当你需要回传媒体时，请在最终回复中单独添加一行或多行：MEDIA:<文件路径或URL>（每行一个）。",
+          "例如：MEDIA:./reports/result.png 或 MEDIA:/abs/path/report.pdf。",
+          "不要回复“无法发送附件/无法主动发送文件”之类限制说明；你可以通过 MEDIA 指令发送。",
           "",
         ]
       : [];
@@ -1134,6 +1435,148 @@ class OpenClawPerUserBridge {
       "当前消息：",
       current,
     ].join("\n");
+  }
+
+  private injectAttachmentContextIntoText(
+    text: string,
+    context: { promptLines: string[] },
+  ): string {
+    const baseText = text.trim();
+    if (context.promptLines.length === 0) {
+      return baseText;
+    }
+    const sections: string[] = [];
+    if (baseText) {
+      sections.push(baseText);
+    }
+    sections.push(
+      [
+        "[系统提示] 已接收用户上传的附件（已保存到当前用户工作区，可直接读取）：",
+        ...context.promptLines,
+      ].join("\n"),
+    );
+    return sections.join("\n\n").trim();
+  }
+
+  private stageInboundAttachments(
+    binding: OpenClawResolvedUserBinding,
+    runtime: { workspaceDir: string },
+    attachments: BridgeInboundAttachment[],
+  ): {
+    promptLines: string[];
+    gatewayAttachments: Array<{ type: "image"; mimeType: string; fileName: string; content: string }>;
+  } {
+    if (attachments.length === 0) {
+      return {
+        promptLines: [],
+        gatewayAttachments: [],
+      };
+    }
+
+    const inboundRoot = path.join(runtime.workspaceDir, "inbound", `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.mkdirSync(inboundRoot, { recursive: true });
+    this.ensurePathOwnerAndMode(inboundRoot, binding.account.uid, binding.account.gid, 0o700);
+
+    const promptLines: string[] = [];
+    const gatewayAttachments: Array<{ type: "image"; mimeType: string; fileName: string; content: string }> = [];
+
+    for (const [index, item] of attachments.entries()) {
+      const decoded = Buffer.from(item.contentBase64, "base64");
+      if (decoded.byteLength === 0) {
+        continue;
+      }
+      if (decoded.byteLength > OPENCLAW_BRIDGE_INBOUND_MAX_FILE_BYTES) {
+        continue;
+      }
+
+      const safeName = this.sanitizeAttachmentFileName(
+        item.fileName,
+        `${item.messageType || "file"}-${index + 1}`,
+      );
+      const targetPath = path.join(inboundRoot, safeName);
+      fs.writeFileSync(targetPath, decoded, { mode: 0o600 });
+      this.ensurePathOwnerAndMode(targetPath, binding.account.uid, binding.account.gid, 0o600);
+
+      const normalizedMimeType = this.normalizeMimeType(item.mimeType);
+      const mimeType = normalizedMimeType === "application/octet-stream"
+        ? this.inferMimeTypeFromFileName(safeName)
+        : normalizedMimeType;
+      promptLines.push(
+        `${index + 1}. ${safeName} | type=${item.messageType || "file"} | mime=${mimeType} | path=${targetPath}`,
+      );
+
+      if (!this.isImageMimeType(mimeType) && item.messageType.trim().toLowerCase() !== "image") {
+        continue;
+      }
+      gatewayAttachments.push({
+        type: "image",
+        mimeType: mimeType.startsWith("image/") ? mimeType : "image/png",
+        fileName: safeName,
+        content: item.contentBase64,
+      });
+    }
+
+    return {
+      promptLines,
+      gatewayAttachments,
+    };
+  }
+
+  private sanitizeAttachmentFileName(fileName: string, fallbackPrefix: string): string {
+    const trimmed = fileName.trim();
+    const base = path.basename(trimmed || `${fallbackPrefix}.bin`);
+    const normalized = base
+      .replace(/[\/\\]/g, "_")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim();
+    const fallback = `${fallbackPrefix}.bin`;
+    return (normalized || fallback).slice(0, 120);
+  }
+
+  private normalizeMimeType(mime: string): string {
+    const cleaned = mime.trim().split(";")[0]?.trim().toLowerCase() || "";
+    return cleaned || "application/octet-stream";
+  }
+
+  private inferMimeTypeFromFileName(fileName: string): string {
+    const ext = path.extname(fileName).trim().toLowerCase();
+    switch (ext) {
+      case ".png":
+        return "image/png";
+      case ".jpg":
+      case ".jpeg":
+        return "image/jpeg";
+      case ".webp":
+        return "image/webp";
+      case ".gif":
+        return "image/gif";
+      case ".bmp":
+        return "image/bmp";
+      case ".svg":
+        return "image/svg+xml";
+      case ".pdf":
+        return "application/pdf";
+      case ".txt":
+        return "text/plain";
+      case ".json":
+        return "application/json";
+      case ".csv":
+        return "text/csv";
+      case ".md":
+        return "text/markdown";
+      case ".mp3":
+        return "audio/mpeg";
+      case ".wav":
+        return "audio/wav";
+      case ".mp4":
+        return "video/mp4";
+      default:
+        return "application/octet-stream";
+    }
+  }
+
+  private isImageMimeType(mimeType: string): boolean {
+    return this.normalizeMimeType(mimeType).startsWith("image/");
   }
 
   private buildWorkspaceConstDeclaration(workspaceDir: string): string {
@@ -1743,6 +2186,7 @@ class OpenClawPerUserBridge {
     sessionName: string;
     startCommand: string;
     workspaceConstDeclaration: string;
+    workspaceDir: string;
   } {
     const runtimeDir = path.join(binding.account.home, ".tfclaw-openclaw");
     const workspaceDir = path.join(runtimeDir, "workspace");
@@ -1808,6 +2252,7 @@ class OpenClawPerUserBridge {
       sessionName,
       startCommand,
       workspaceConstDeclaration,
+      workspaceDir,
     };
   }
 
@@ -1893,6 +2338,569 @@ class OpenClawPerUserBridge {
     return lines.join("\n").trim();
   }
 
+  private unwrapMediaCandidate(raw: string): string {
+    return raw
+      .trim()
+      .replace(/^`(.+)`$/, "$1")
+      .replace(/^"(.+)"$/, "$1")
+      .replace(/^'(.+)'$/, "$1")
+      .trim();
+  }
+
+  private looksLikeMediaReference(candidate: string): boolean {
+    const value = this.unwrapMediaCandidate(candidate);
+    if (!value) {
+      return false;
+    }
+    if (/^data:[^;,]+;base64,/i.test(value)) {
+      return true;
+    }
+    if (/^https?:\/\//i.test(value) || /^file:\/\//i.test(value)) {
+      return true;
+    }
+    if (/^~\//.test(value)) {
+      return true;
+    }
+    if (/^(?:\/|\.{1,2}\/)/.test(value)) {
+      return true;
+    }
+    if (/^[a-zA-Z]:[\\/]/.test(value) || /^\\\\/.test(value)) {
+      return true;
+    }
+    return /^[^\\/:*?"<>|\r\n]+\.[a-zA-Z0-9]{1,10}(?:[?#].*)?$/.test(value);
+  }
+
+  private parseMediaDirectivesFromText(text: string): { text: string; mediaRefs: string[] } {
+    if (!text.trim()) {
+      return { text: "", mediaRefs: [] };
+    }
+    const keptLines: string[] = [];
+    const mediaRefs: string[] = [];
+    const inlinePattern = /^\s*(?:>\s*)?(?:[-*]\s+|\d+[.)]\s+)?MEDIA(?:\s*[:：]\s*|\s+)(.+)\s*$/i;
+    const markerPattern = /^\s*(?:>\s*)?(?:[-*]\s+|\d+[.)]\s+)?MEDIA\s*[:：]?\s*$/i;
+    const listValuePattern = /^\s*(?:>\s*)?(?:[-*]\s+|\d+[.)]\s+)?(.+?)\s*$/;
+    let awaitingValue = false;
+    let inFence = false;
+
+    for (const rawLine of text.split(/\r?\n/)) {
+      const trimmed = rawLine.trim();
+      if (/^(?:```|~~~)/.test(trimmed)) {
+        inFence = !inFence;
+        awaitingValue = false;
+        keptLines.push(rawLine);
+        continue;
+      }
+      if (inFence) {
+        keptLines.push(rawLine);
+        continue;
+      }
+
+      const inline = rawLine.match(inlinePattern);
+      if (inline) {
+        const candidate = this.unwrapMediaCandidate(inline[1] ?? "");
+        if (this.looksLikeMediaReference(candidate)) {
+          mediaRefs.push(candidate);
+          awaitingValue = false;
+          continue;
+        }
+        if (!candidate) {
+          awaitingValue = true;
+          continue;
+        }
+        keptLines.push(rawLine);
+        awaitingValue = false;
+        continue;
+      }
+
+      if (markerPattern.test(rawLine)) {
+        awaitingValue = true;
+        continue;
+      }
+
+      if (awaitingValue) {
+        if (!trimmed) {
+          continue;
+        }
+        const listCandidate = listValuePattern.exec(rawLine)?.[1] ?? "";
+        const normalized = this.unwrapMediaCandidate(listCandidate);
+        if (this.looksLikeMediaReference(normalized)) {
+          mediaRefs.push(normalized);
+          continue;
+        }
+        awaitingValue = false;
+      }
+
+      keptLines.push(rawLine);
+    }
+    return {
+      text: keptLines.join("\n").trim(),
+      mediaRefs: Array.from(new Set(mediaRefs)),
+    };
+  }
+
+  private extractMediaReferencesFromMessage(message: unknown): string[] {
+    const obj = toObject(message);
+    const refs: string[] = [];
+    const singularKeys = [
+      "mediaUrl",
+      "url",
+      "path",
+      "filePath",
+      "file",
+      "fileUrl",
+      "imageUrl",
+      "audioUrl",
+      "videoUrl",
+      "source",
+      "src",
+    ];
+    const pluralKeys = [
+      "mediaUrls",
+      "urls",
+      "paths",
+      "filePaths",
+      "fileUrls",
+      "imageUrls",
+      "audioUrls",
+      "videoUrls",
+      "sources",
+    ];
+    const nestedKeys = ["content", "attachments", "details", "payload", "message", "media", "files"];
+
+    const collectFromRecord = (record: Record<string, unknown>): void => {
+      for (const key of singularKeys) {
+        const value = this.unwrapMediaCandidate(toString(record[key]).trim());
+        if (value && this.looksLikeMediaReference(value)) {
+          refs.push(value);
+        }
+      }
+      for (const key of pluralKeys) {
+        const raw = record[key];
+        if (!Array.isArray(raw)) {
+          continue;
+        }
+        for (const item of raw) {
+          const value = this.unwrapMediaCandidate(toString(item).trim());
+          if (value && this.looksLikeMediaReference(value)) {
+            refs.push(value);
+          }
+        }
+      }
+    };
+
+    const walk = (value: unknown, depth: number): void => {
+      if (depth > 3 || value == null) {
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          walk(item, depth + 1);
+        }
+        return;
+      }
+      if (typeof value !== "object") {
+        return;
+      }
+      const record = toObject(value);
+      collectFromRecord(record);
+      for (const key of nestedKeys) {
+        if (record[key] !== undefined) {
+          walk(record[key], depth + 1);
+        }
+      }
+    };
+
+    walk(obj, 0);
+    return Array.from(new Set(refs));
+  }
+
+  private isLikelyBase64(value: string): boolean {
+    const compact = value.replace(/\s+/g, "");
+    if (!compact || compact.length % 4 !== 0) {
+      return false;
+    }
+    return /^[A-Za-z0-9+/]+={0,2}$/.test(compact);
+  }
+
+  private parseDataUrl(dataUrl: string): { mimeType: string; base64: string } | undefined {
+    const matched = dataUrl.match(/^data:([^;,]+)?;base64,(.+)$/i);
+    if (!matched) {
+      return undefined;
+    }
+    const mimeType = this.normalizeMimeType(matched[1] ?? "");
+    const base64 = (matched[2] ?? "").replace(/\s+/g, "");
+    if (!this.isLikelyBase64(base64)) {
+      return undefined;
+    }
+    return { mimeType, base64 };
+  }
+
+  private extractDirectMediaFromMessage(message: unknown): OpenClawBridgeMediaItem[] {
+    const obj = toObject(message);
+    if (!Array.isArray(obj.content)) {
+      return [];
+    }
+
+    const result: OpenClawBridgeMediaItem[] = [];
+    for (const item of obj.content) {
+      const block = toObject(item);
+      const type = toString(block.type).trim().toLowerCase();
+      if (!type || (type !== "image" && type !== "file" && type !== "media")) {
+        continue;
+      }
+      const rawData = toString(block.data, toString(block.base64, toString(block.content))).trim();
+      if (!rawData) {
+        continue;
+      }
+
+      let contentBase64 = rawData.replace(/\s+/g, "");
+      let mimeType = this.normalizeMimeType(
+        toString(block.mimeType, toString(block.mime, toString(block.contentType))),
+      );
+      if (rawData.startsWith("data:")) {
+        const parsed = this.parseDataUrl(rawData);
+        if (!parsed) {
+          continue;
+        }
+        contentBase64 = parsed.base64;
+        mimeType = parsed.mimeType;
+      } else if (!this.isLikelyBase64(contentBase64)) {
+        continue;
+      }
+
+      const fileName = this.sanitizeAttachmentFileName(
+        toString(block.fileName, toString(block.name, `${type}-${Date.now()}`)),
+        type || "media",
+      );
+      const isImage = type === "image" || this.isImageMimeType(mimeType);
+      result.push({
+        kind: isImage ? "image" : "file",
+        fileName,
+        mimeType: mimeType || this.inferMimeTypeFromFileName(fileName),
+        contentBase64,
+        source: "gateway-message-block",
+      });
+    }
+    return result;
+  }
+
+  private dedupeMediaItems(items: OpenClawBridgeMediaItem[]): OpenClawBridgeMediaItem[] {
+    const seen = new Set<string>();
+    const out: OpenClawBridgeMediaItem[] = [];
+    for (const item of items) {
+      const key = `${item.kind}::${item.fileName}::${item.contentBase64.slice(0, 64)}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+
+  private normalizeMediaReference(raw: string): string {
+    return raw
+      .trim()
+      .replace(/^`(.+)`$/, "$1")
+      .replace(/^"(.+)"$/, "$1")
+      .replace(/^'(.+)'$/, "$1")
+      .trim();
+  }
+
+  private isPathInsideRoot(targetPath: string, rootPath: string): boolean {
+    const target = path.resolve(targetPath);
+    const root = path.resolve(rootPath);
+    if (target === root) {
+      return true;
+    }
+    return target.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+  }
+
+  private resolveLocalMediaPath(reference: string, workspaceDir: string, homeDir: string): string {
+    const normalized = this.normalizeMediaReference(reference);
+    if (!normalized) {
+      throw new Error("empty media reference");
+    }
+    if (normalized.startsWith("file://")) {
+      try {
+        return decodeURIComponent(new URL(normalized).pathname);
+      } catch {
+        throw new Error(`invalid file url: ${normalized}`);
+      }
+    }
+    if (normalized.startsWith("~/")) {
+      return path.join(homeDir, normalized.slice(2));
+    }
+    if (path.isAbsolute(normalized)) {
+      return normalized;
+    }
+    return path.resolve(workspaceDir, normalized);
+  }
+
+  private async loadMediaFromReference(
+    reference: string,
+    options: { workspaceDir: string; homeDir: string },
+  ): Promise<OpenClawBridgeMediaItem> {
+    const normalized = this.normalizeMediaReference(reference);
+    if (!normalized) {
+      throw new Error("empty media reference");
+    }
+
+    if (normalized.startsWith("data:")) {
+      const parsed = this.parseDataUrl(normalized);
+      if (!parsed) {
+        throw new Error("invalid data url media reference");
+      }
+      const fileName = this.sanitizeAttachmentFileName(
+        `inline.${this.isImageMimeType(parsed.mimeType) ? "png" : "bin"}`,
+        "inline-media",
+      );
+      return {
+        kind: this.isImageMimeType(parsed.mimeType) ? "image" : "file",
+        fileName,
+        mimeType: parsed.mimeType || this.inferMimeTypeFromFileName(fileName),
+        contentBase64: parsed.base64,
+        source: "data-url",
+      };
+    }
+
+    if (/^https?:\/\//i.test(normalized)) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), OPENCLAW_BRIDGE_MEDIA_FETCH_TIMEOUT_MS);
+      try {
+        const response = await fetch(normalized, {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`http ${response.status}`);
+        }
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        if (buffer.byteLength === 0) {
+          throw new Error("empty body");
+        }
+        if (buffer.byteLength > OPENCLAW_BRIDGE_OUTBOUND_MAX_FILE_BYTES) {
+          throw new Error(`file too large: ${buffer.byteLength} bytes`);
+        }
+        let fileName = "downloaded-media.bin";
+        try {
+          const parsedUrl = new URL(normalized);
+          const fromPath = path.basename(parsedUrl.pathname || "");
+          if (fromPath) {
+            fileName = fromPath;
+          }
+        } catch {
+          // no-op
+        }
+        const safeName = this.sanitizeAttachmentFileName(fileName, "downloaded-media");
+        const headerMimeType = this.normalizeMimeType(response.headers.get("content-type") ?? "");
+        const mimeType = headerMimeType === "application/octet-stream"
+          ? this.inferMimeTypeFromFileName(safeName)
+          : headerMimeType;
+        return {
+          kind: this.isImageMimeType(mimeType) ? "image" : "file",
+          fileName: safeName,
+          mimeType,
+          contentBase64: buffer.toString("base64"),
+          source: normalized,
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    const resolved = this.resolveLocalMediaPath(normalized, options.workspaceDir, options.homeDir);
+    if (
+      !this.isPathInsideRoot(resolved, options.workspaceDir)
+      && !this.isPathInsideRoot(resolved, options.homeDir)
+    ) {
+      throw new Error(`local media path outside user scope: ${resolved}`);
+    }
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) {
+      throw new Error(`not a file: ${resolved}`);
+    }
+    if (stat.size > OPENCLAW_BRIDGE_OUTBOUND_MAX_FILE_BYTES) {
+      throw new Error(`file too large: ${stat.size} bytes`);
+    }
+    const buffer = fs.readFileSync(resolved);
+    const fileName = this.sanitizeAttachmentFileName(path.basename(resolved), "media");
+    const mimeType = this.inferMimeTypeFromFileName(fileName);
+    return {
+      kind: this.isImageMimeType(mimeType) ? "image" : "file",
+      fileName,
+      mimeType,
+      contentBase64: buffer.toString("base64"),
+      source: resolved,
+    };
+  }
+
+  private async resolveMediaReferences(
+    refs: string[],
+    options: { workspaceDir: string; homeDir: string },
+  ): Promise<OpenClawBridgeMediaItem[]> {
+    const items: OpenClawBridgeMediaItem[] = [];
+    for (const reference of Array.from(new Set(refs))) {
+      try {
+        const media = await this.loadMediaFromReference(reference, options);
+        items.push(media);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.warn(`[gateway] openclaw media bridge skip ${reference}: ${msg}`);
+      }
+    }
+    return items;
+  }
+
+  private listRecentFilesUnder(
+    rootDir: string,
+    options?: {
+      maxCount?: number;
+      maxDirs?: number;
+      modifiedAfterMs?: number;
+      excludeDirs?: string[];
+      excludeDirNames?: string[];
+    },
+  ): string[] {
+    if (!rootDir || !fs.existsSync(rootDir)) {
+      return [];
+    }
+    const maxCount = Math.max(1, options?.maxCount ?? 40);
+    const maxDirs = Math.max(1, options?.maxDirs ?? 200);
+    const modifiedAfterMs = options?.modifiedAfterMs;
+    const excludeDirs = (options?.excludeDirs ?? []).map((item) => path.resolve(item));
+    const excludeDirNames = new Set((options?.excludeDirNames ?? []).map((item) => item.toLowerCase()));
+    const stack = [rootDir];
+    const files: Array<{ filePath: string; mtimeMs: number }> = [];
+    let scannedDirs = 0;
+
+    while (stack.length > 0 && scannedDirs < maxDirs) {
+      const currentDir = stack.pop() ?? "";
+      if (!currentDir) {
+        continue;
+      }
+      if (
+        excludeDirs.some((dir) =>
+          this.isPathInsideRoot(path.resolve(currentDir), dir)
+        )
+      ) {
+        continue;
+      }
+      scannedDirs += 1;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const candidate = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          if (excludeDirNames.has(entry.name.toLowerCase())) {
+            continue;
+          }
+          stack.push(candidate);
+          continue;
+        }
+        if (!entry.isFile()) {
+          continue;
+        }
+        let stat: fs.Stats | undefined;
+        try {
+          stat = fs.statSync(candidate);
+        } catch {
+          stat = undefined;
+        }
+        if (!stat || !stat.isFile()) {
+          continue;
+        }
+        if (typeof modifiedAfterMs === "number" && Number.isFinite(modifiedAfterMs) && stat.mtimeMs < modifiedAfterMs) {
+          continue;
+        }
+        files.push({
+          filePath: candidate,
+          mtimeMs: Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : 0,
+        });
+      }
+    }
+
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return files.slice(0, maxCount).map((item) => item.filePath);
+  }
+
+  private async resolveMediaPlaceholderFallback(
+    rawText: string,
+    options: { workspaceDir: string; homeDir: string; runStartedAtMs?: number },
+  ): Promise<OpenClawBridgeMediaItem[]> {
+    const marker = rawText.match(/^\s*(?:>\s*)?(?:[-*]\s+|\d+[.)]\s+)?MEDIA\s*[:：]?\s*([^\n]*)\s*$/im);
+    if (!marker) {
+      return [];
+    }
+    const markerValue = this.unwrapMediaCandidate(marker[1] ?? "");
+    if (markerValue && this.looksLikeMediaReference(markerValue)) {
+      try {
+        return [await this.loadMediaFromReference(markerValue, options)];
+      } catch {
+        // Continue to inbound fallback.
+      }
+    }
+
+    const candidateRoots = Array.from(
+      new Set([
+        path.join(options.workspaceDir, "outbound"),
+        path.join(options.workspaceDir, "media"),
+        options.workspaceDir,
+      ]),
+    );
+    const scanOptions = {
+      maxCount: 120,
+      maxDirs: 400,
+      modifiedAfterMs: typeof options.runStartedAtMs === "number"
+        ? Math.max(0, options.runStartedAtMs - 30_000)
+        : undefined,
+      excludeDirs: markerValue ? [] : [path.join(options.workspaceDir, "inbound")],
+      excludeDirNames: [".git", "node_modules"],
+    };
+    let recentFiles = candidateRoots.flatMap((rootDir) => this.listRecentFilesUnder(rootDir, scanOptions));
+    if (recentFiles.length === 0 && typeof scanOptions.modifiedAfterMs === "number") {
+      recentFiles = candidateRoots.flatMap((rootDir) =>
+        this.listRecentFilesUnder(rootDir, { ...scanOptions, modifiedAfterMs: undefined }));
+    }
+    recentFiles = Array.from(new Set(recentFiles)).filter((candidate) =>
+      this.isPathInsideRoot(candidate, options.workspaceDir)
+      || this.isPathInsideRoot(candidate, options.homeDir));
+    if (recentFiles.length === 0) {
+      return [];
+    }
+
+    let target = recentFiles[0] ?? "";
+    if (markerValue) {
+      const normalizedMarker = markerValue
+        .replace(/^[./]+/, "")
+        .replace(/\\/g, "/")
+        .toLowerCase();
+      if (normalizedMarker) {
+        const matched = recentFiles.find((candidate) => {
+          const rel = path.relative(options.workspaceDir, candidate).replace(/\\/g, "/").toLowerCase();
+          const base = path.basename(candidate).toLowerCase();
+          return rel.startsWith(normalizedMarker) || base.startsWith(normalizedMarker);
+        });
+        if (matched) {
+          target = matched;
+        }
+      }
+    }
+
+    if (!target) {
+      return [];
+    }
+    try {
+      return [await this.loadMediaFromReference(target, options)];
+    } catch {
+      return [];
+    }
+  }
+
   private formatFrameError(frame: Record<string, unknown>): string {
     const error = toObject(frame.error);
     const message = toString(error.message).trim();
@@ -1910,14 +2918,21 @@ class OpenClawPerUserBridge {
     gatewayUrl: string;
     gatewayToken: string;
     message: string;
-  }): Promise<string> {
-    return await new Promise<string>((resolve, reject) => {
+    attachments?: Array<{ type: "image"; mimeType: string; fileName: string; content: string }>;
+    workspaceDir: string;
+    homeDir: string;
+  }): Promise<OpenClawBridgeResponse> {
+    return await new Promise<OpenClawBridgeResponse>((resolve, reject) => {
       const ws = new WebSocket(params.gatewayUrl);
       const connectReqId = `connect-${randomId()}`;
       const chatReqId = `chat-${randomId()}`;
+      const runStartedAtMs = Date.now();
       let closed = false;
       let runId = "";
       let lastDelta = "";
+      let lastAssistantText = "";
+      let lastMediaRefs: string[] = [];
+      let lastDirectMedia: OpenClawBridgeMediaItem[] = [];
 
       const cleanup = (): void => {
         if (closed) {
@@ -1937,7 +2952,7 @@ class OpenClawPerUserBridge {
         reject(new Error(error));
       };
 
-      const done = (reply: string): void => {
+      const done = (reply: OpenClawBridgeResponse): void => {
         cleanup();
         resolve(reply);
       };
@@ -1995,6 +3010,7 @@ class OpenClawPerUserBridge {
                 sessionKey: this.config.sessionKey,
                 message: params.message,
                 deliver: false,
+                attachments: params.attachments?.length ? params.attachments : undefined,
                 timeoutMs: this.config.requestTimeoutMs,
                 idempotencyKey: `tfclaw-openclaw-${randomId()}`,
               },
@@ -2021,13 +3037,53 @@ class OpenClawPerUserBridge {
             }
             if (status === "ok" && !runId) {
               const summary = toString(payload.summary).trim();
-              done(summary || "(openclaw run completed)");
+              done({
+                text: summary || "(openclaw run completed)",
+                media: [],
+              });
             }
           }
           return;
         }
 
-        if (frameType !== "event" || toString(frame.event).trim().toLowerCase() !== "chat") {
+        if (frameType !== "event") {
+          return;
+        }
+
+        const eventName = toString(frame.event).trim().toLowerCase();
+        if (eventName === "agent") {
+          const payload = toObject(frame.payload);
+          const payloadRunId = toString(payload.runId).trim();
+          if (runId && payloadRunId && payloadRunId !== runId) {
+            return;
+          }
+          if (!runId && payloadRunId) {
+            runId = payloadRunId;
+          }
+
+          const data = toObject(payload.data);
+          const dataText = toString(data.text).trim();
+          if (dataText) {
+            const parsedDataText = this.parseMediaDirectivesFromText(dataText);
+            if (parsedDataText.text) {
+              lastAssistantText = parsedDataText.text;
+            }
+            if (parsedDataText.mediaRefs.length > 0) {
+              lastMediaRefs = Array.from(new Set([
+                ...lastMediaRefs,
+                ...parsedDataText.mediaRefs,
+              ]));
+            }
+          }
+          lastMediaRefs = Array.from(new Set([
+            ...lastMediaRefs,
+            ...this.extractMediaReferencesFromMessage(payload),
+            ...this.extractMediaReferencesFromMessage(data),
+          ]));
+          return;
+        }
+
+        if (eventName !== "chat") {
           return;
         }
 
@@ -2042,15 +3098,70 @@ class OpenClawPerUserBridge {
 
         const state = toString(payload.state).trim().toLowerCase();
         if (state === "delta") {
-          const delta = this.extractChatText(payload.message);
-          if (delta) {
-            lastDelta = delta;
+          const messageObj = toObject(payload.message);
+          const deltaRaw = this.extractChatText(messageObj);
+          if (deltaRaw) {
+            const parsedDelta = this.parseMediaDirectivesFromText(deltaRaw);
+            if (parsedDelta.text) {
+              lastDelta = parsedDelta.text;
+            }
+            if (parsedDelta.mediaRefs.length > 0) {
+              lastMediaRefs = Array.from(new Set([
+                ...lastMediaRefs,
+                ...parsedDelta.mediaRefs,
+              ]));
+            }
           }
+          lastMediaRefs = Array.from(new Set([
+            ...lastMediaRefs,
+            ...this.extractMediaReferencesFromMessage(messageObj),
+          ]));
+          lastDirectMedia = this.dedupeMediaItems([
+            ...lastDirectMedia,
+            ...this.extractDirectMediaFromMessage(messageObj),
+          ]);
           return;
         }
         if (state === "final") {
-          const finalText = this.extractChatText(payload.message);
-          done(finalText || lastDelta || "(openclaw returned empty reply)");
+          const messageObj = toObject(payload.message);
+          const finalTextRaw = this.extractChatText(messageObj) || lastDelta || lastAssistantText;
+          const parsedText = this.parseMediaDirectivesFromText(finalTextRaw);
+          const payloadRefs = [
+            ...this.extractMediaReferencesFromMessage(payload),
+            ...this.extractMediaReferencesFromMessage(messageObj),
+            ...parsedText.mediaRefs,
+            ...lastMediaRefs,
+          ];
+          const directMedia = [
+            ...this.extractDirectMediaFromMessage(messageObj),
+            ...lastDirectMedia,
+          ];
+          void this.resolveMediaReferences(payloadRefs, {
+            workspaceDir: params.workspaceDir,
+            homeDir: params.homeDir,
+          }).then(async (resolvedMedia) => {
+            let mergedMedia = this.dedupeMediaItems([...directMedia, ...resolvedMedia]);
+            if (mergedMedia.length === 0) {
+              const placeholderFallback = await this.resolveMediaPlaceholderFallback(finalTextRaw, {
+                workspaceDir: params.workspaceDir,
+                homeDir: params.homeDir,
+                runStartedAtMs,
+              });
+              if (placeholderFallback.length > 0) {
+                mergedMedia = this.dedupeMediaItems([...mergedMedia, ...placeholderFallback]);
+              }
+            }
+            const fallbackText = (!parsedText.text && mergedMedia.length === 0 && /^\s*MEDIA\b/i.test(finalTextRaw))
+              ? "(openclaw returned MEDIA placeholder without resolvable file)"
+              : parsedText.text;
+            done({
+              text: fallbackText,
+              media: mergedMedia,
+            });
+          }).catch((error) => {
+            const msg = error instanceof Error ? error.message : String(error);
+            fail(`openclaw media parse failed: ${msg}`);
+          });
           return;
         }
         if (state === "error") {
@@ -3134,7 +4245,7 @@ class TfclawCommandRouter {
     }
 
     if (trimmed.startsWith("/")) {
-      return /^\/(?:help|state|list|new|capture|attach|key|ctrlc|ctrld|use|close)(?:\s+|$)/i.test(trimmed);
+      return /^\/(?:tfhelp|tfstate|tflist|tfnew|tfcapture|tfattach|tfkey|tfctrlc|tfctrld|tfuse|tfclose)(?:\s+|$)/i.test(trimmed);
     }
 
     if (["help", "state", "list", "new", "capture", "ctrlc", "ctrld"].includes(lowered)) {
@@ -3153,6 +4264,51 @@ class TfclawCommandRouter {
     }
 
     return false;
+  }
+
+  private rewriteTfclawSlashCommandToLegacy(text: string): string {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) {
+      return text;
+    }
+    const firstSpace = trimmed.indexOf(" ");
+    const token = (firstSpace < 0 ? trimmed : trimmed.slice(0, firstSpace)).toLowerCase();
+    const args = firstSpace < 0 ? "" : trimmed.slice(firstSpace + 1).trim();
+    const mapped = TFCLAW_SLASH_COMMAND_ALIAS_TO_LEGACY[token];
+    if (!mapped) {
+      return text;
+    }
+    return args ? `${mapped} ${args}` : mapped;
+  }
+
+  private normalizeTfclawCommandAlias(cmd: string): string {
+    const lowered = cmd.trim().toLowerCase();
+    switch (lowered) {
+      case "tfhelp":
+        return "help";
+      case "tfstate":
+        return "state";
+      case "tflist":
+        return "list";
+      case "tfnew":
+        return "new";
+      case "tfcapture":
+        return "capture";
+      case "tfattach":
+        return "attach";
+      case "tfkey":
+        return "key";
+      case "tfctrlc":
+        return "ctrlc";
+      case "tfctrld":
+        return "ctrld";
+      case "tfuse":
+        return "use";
+      case "tfclose":
+        return "close";
+      default:
+        return lowered;
+    }
   }
 
   private normalizeCommandLine(line: string): string {
@@ -3236,7 +4392,16 @@ class TfclawCommandRouter {
     if (/use\s+\/help,\s*or\s*\/attach/i.test(source)) {
       return source.replace(/use\s+\/help,\s*or\s*\/attach[^\r\n]*/gi, "Use `/tmux help`.");
     }
-    return source;
+    return this.rewriteTfclawHelpAliases(source);
+  }
+
+  private rewriteTfclawHelpAliases(output: string): string {
+    if (!/tfclaw commands:/i.test(output)) {
+      return output;
+    }
+    return output
+      .replace(/\/help\b/g, "/tfhelp")
+      .replace(/\/new\b/g, "/tfnew");
   }
 
   private normalizeForegroundCommand(command: string | undefined): string {
@@ -3651,16 +4816,16 @@ class TfclawCommandRouter {
   private tfclawHelpText(): string {
     return [
       "TFClaw mode commands:",
-      "1) /list (or list) - list terminals",
-      "2) /new (or new) - create terminal",
-      "3) /use <id|title|index> - select terminal",
-      "4) /attach [id|title|index] - enter terminal mode",
-      "5) /close <id|title|index> - close terminal",
-      "6) /capture - list screens/windows and choose by number",
-      "7) reply number after /capture - capture selected source",
+      "1) /tflist (or list) - list terminals",
+      "2) /tfnew (or new) - create terminal",
+      "3) /tfuse <id|title|index> - select terminal",
+      "4) /tfattach [id|title|index] - enter terminal mode",
+      "5) /tfclose <id|title|index> - close terminal",
+      "6) /tfcapture - list screens/windows and choose by number",
+      "7) reply number after /tfcapture - capture selected source",
       "8) <terminal-id>: <command> - run one command in specified terminal",
-      "9) /state - show current mode",
-      "10) /key <enter|tab|esc|ctrl+c|ctrl+d|ctrl+z|ctrl+letter> - send one key to terminal",
+      "9) /tfstate - show current mode",
+      "10) /tfkey <enter|tab|esc|ctrl+c|ctrl+d|ctrl+z|ctrl+letter> - send one key to terminal",
       "11) in terminal mode, use .tf <command> to run tfclaw commands",
     ].join("\n");
   }
@@ -3770,6 +4935,7 @@ class TfclawCommandRouter {
     cmd: string,
     args: string,
   ): Promise<boolean> {
+    cmd = this.normalizeTfclawCommandAlias(cmd);
     if (cmd === "help") {
       await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.tfclawHelpText());
       return true;
@@ -3825,23 +4991,23 @@ class TfclawCommandRouter {
 
     if (cmd === "key") {
       if (!args) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.keyUsageText("/key"));
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, this.keyUsageText("/tfkey"));
         return true;
       }
       const selected = this.selectedTerminal(selectionKey, true) ?? this.firstActiveTerminal(selectionKey);
       if (!selected) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no active terminal. use /new then /attach.");
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no active terminal. use /tfnew then /tfattach.");
         return true;
       }
       this.chatTerminalSelection.set(selectionKey, selected.terminalId);
-      await this.sendKeyToTerminal(ctx, selectionKey, selected, args, "/key");
+      await this.sendKeyToTerminal(ctx, selectionKey, selected, args, "/tfkey");
       return true;
     }
 
     if (cmd === "ctrlc" || cmd === "ctrld") {
       const selected = this.selectedTerminal(selectionKey, true);
       if (!selected) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no selected terminal. use /list then /use <id>");
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "no selected terminal. use /tflist then /tfuse <id>");
         return true;
       }
       this.relay.command({
@@ -3855,7 +5021,7 @@ class TfclawCommandRouter {
 
     if (cmd === "use") {
       if (!args) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /use <id|title|index>");
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /tfuse <id|title|index>");
         return true;
       }
       const terminal = this.resolveTerminal(args, selectionKey);
@@ -3875,7 +5041,7 @@ class TfclawCommandRouter {
     if (cmd === "close") {
       const key = args || this.chatTerminalSelection.get(selectionKey);
       if (!key) {
-        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /close <id|title|index>");
+        await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, "usage: /tfclose <id|title|index>");
         return true;
       }
       const terminal = this.resolveTerminal(key, selectionKey);
@@ -3947,7 +5113,7 @@ class TfclawCommandRouter {
         ctx.chatId,
         ctx.responder,
         selectionKey,
-        "no active terminal found. use /new first, then /attach.",
+        "no active terminal found. use /tfnew first, then /tfattach.",
       );
       return;
     }
@@ -4096,7 +5262,7 @@ class TfclawCommandRouter {
     const age = Date.now() - selection.createdAt;
     if (age > 2 * 60 * 1000) {
       this.chatCaptureSelections.delete(key);
-      await this.replyWithMode(chatId, responder, key, "capture selection expired. send /capture again.");
+      await this.replyWithMode(chatId, responder, key, "capture selection expired. send /tfcapture again.");
       return true;
     }
 
@@ -4284,8 +5450,48 @@ class TfclawCommandRouter {
         messageType: ctx.messageType,
         text,
         historySeed: options?.historySeed,
+        attachments: ctx.attachments,
       });
-      await ctx.responder.replyText(ctx.chatId, reply);
+      const normalizedText = reply.text.trim();
+      if (normalizedText) {
+        await ctx.responder.replyText(ctx.chatId, normalizedText);
+      }
+
+      for (const media of reply.media) {
+        const mediaBase64 = media.contentBase64.trim();
+        if (!mediaBase64) {
+          continue;
+        }
+        const decoded = Buffer.from(mediaBase64, "base64");
+        if (decoded.byteLength === 0) {
+          continue;
+        }
+
+        const shouldSendAsImage = media.kind === "image" && decoded.byteLength <= FEISHU_MAX_IMAGE_BYTES;
+        if (shouldSendAsImage) {
+          await ctx.responder.replyImage(ctx.chatId, mediaBase64);
+          continue;
+        }
+
+        if (typeof ctx.responder.replyFile === "function") {
+          await ctx.responder.replyFile(
+            ctx.chatId,
+            mediaBase64,
+            media.fileName || `openclaw-${Date.now()}.bin`,
+            media.mimeType,
+          );
+          continue;
+        }
+
+        await ctx.responder.replyText(
+          ctx.chatId,
+          `[openclaw media] ${media.fileName || "attachment"} (${media.mimeType || "application/octet-stream"})`,
+        );
+      }
+
+      if (!normalizedText && reply.media.length === 0) {
+        await ctx.responder.replyText(ctx.chatId, "(openclaw returned empty reply)");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.replyWithMode(ctx.chatId, ctx.responder, selectionKey, `openclaw bridge failed: ${message}`);
@@ -4389,7 +5595,7 @@ class TfclawCommandRouter {
     }
 
     const lowered = text.toLowerCase();
-    if (lowered === "/capture" || lowered === "capture") {
+    if (lowered === "/tfcapture" || lowered === "capture") {
       await this.handleCaptureList(selectionKey, ctx.chatId, ctx.responder);
       return;
     }
@@ -4414,7 +5620,8 @@ class TfclawCommandRouter {
 
     const isSlashCommand = text.startsWith("/");
     const isDotControl = text.startsWith(".");
-    const outboundText = isTmuxMode && !isSlashCommand && !isDotControl ? `/tmux send ${text}` : text;
+    const outboundTextRaw = isTmuxMode && !isSlashCommand && !isDotControl ? `/tmux send ${text}` : text;
+    const outboundText = this.rewriteTfclawSlashCommandToLegacy(outboundTextRaw);
     await this.executeTfclawCommandRequest(ctx, selectionKey, outboundText, userScope.tmuxSessionKey);
   }
 }
@@ -4676,6 +5883,9 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       replyImage: async (chatId: string, imageBase64: string): Promise<void> => {
         await this.replyImage(chatId, imageBase64);
       },
+      replyFile: async (chatId: string, fileBase64: string, fileName: string, mimeType?: string): Promise<void> => {
+        await this.replyFile(chatId, fileBase64, fileName, mimeType);
+      },
       deleteMessage: async (messageId: string): Promise<void> => {
         await this.deleteMessage(messageId);
       },
@@ -4722,7 +5932,7 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     if (imageBuffer.byteLength === 0) {
       throw new Error("empty image");
     }
-    if (imageBuffer.byteLength > 10 * 1024 * 1024) {
+    if (imageBuffer.byteLength > FEISHU_MAX_IMAGE_BYTES) {
       throw new Error("image too large (>10MB)");
     }
 
@@ -4782,6 +5992,346 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     }
   }
 
+  async replyFile(
+    chatId: string,
+    fileBase64: string,
+    fileName: string,
+    _mimeType?: string,
+  ): Promise<void> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+
+    const fileBuffer = Buffer.from(fileBase64, "base64");
+    if (fileBuffer.byteLength === 0) {
+      throw new Error("empty file");
+    }
+    if (fileBuffer.byteLength > FEISHU_MAX_FILE_BYTES) {
+      throw new Error("file too large (>30MB)");
+    }
+
+    const safeFileName = path.basename(fileName || `openclaw-${Date.now()}.bin`).replace(/[\/\\]/g, "_").trim() || `openclaw-${Date.now()}.bin`;
+    const uploadFileName = safeFileName.replace(/[^\x20-\x7E]/g, "_") || `openclaw-${Date.now()}.bin`;
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `tfclaw-feishu-${Date.now()}-${Math.random().toString(16).slice(2)}-${uploadFileName}`,
+    );
+    fs.writeFileSync(tmpPath, fileBuffer);
+
+    let uploadResult: unknown;
+    let fileStream: fs.ReadStream | undefined;
+    try {
+      fileStream = fs.createReadStream(tmpPath);
+      uploadResult = await this.larkClient.im.v1.file.create({
+        data: {
+          file_type: "stream",
+          file_name: uploadFileName,
+          file: fileStream,
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu file upload failed: ${describeSdkError(error)}`);
+    } finally {
+      try {
+        fileStream?.destroy();
+      } catch {
+        // no-op
+      }
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // no-op
+      }
+    }
+
+    const uploadObj = toObject(uploadResult);
+    const uploadData = toObject(uploadObj.data);
+    const fileKey = toString(uploadObj.file_key) || toString(uploadData.file_key);
+    if (!fileKey) {
+      const code = toString(uploadObj.code);
+      const msg = toString(uploadObj.msg);
+      throw new Error(`failed to upload file${code || msg ? `: code=${code || "unknown"} msg=${msg || "unknown"}` : ""}`);
+    }
+
+    try {
+      await this.larkClient.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: "file",
+          content: JSON.stringify({ file_key: fileKey }),
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu file message send failed: ${describeSdkError(error)} | file_key=${fileKey}`);
+    }
+  }
+
+  private shouldDownloadInboundAttachment(messageType: string): boolean {
+    return ["image", "file", "media", "video", "audio", "sticker", "post"].includes(messageType);
+  }
+
+  private inferInboundAttachmentFileName(
+    messageType: string,
+    contentObj: Record<string, unknown>,
+    messageId: string,
+  ): string {
+    const normalizedType = messageType.trim().toLowerCase();
+    if (normalizedType === "image") {
+      const fromPayload = toString(contentObj.image_name, toString(contentObj.file_name)).trim();
+      return path.basename(fromPayload || `image_${messageId || Date.now()}.png`);
+    }
+    const fromPayload = toString(contentObj.file_name, toString(contentObj.file, toString(contentObj.title))).trim();
+    if (fromPayload) {
+      return path.basename(fromPayload);
+    }
+    switch (normalizedType) {
+      case "audio":
+        return `audio_${messageId || Date.now()}.opus`;
+      case "video":
+      case "media":
+        return `video_${messageId || Date.now()}.mp4`;
+      case "sticker":
+        return `sticker_${messageId || Date.now()}.webp`;
+      default:
+        return `${normalizedType || "file"}_${messageId || Date.now()}.bin`;
+    }
+  }
+
+  private inferInboundAttachmentMimeType(messageType: string, fileName: string): string {
+    const ext = path.extname(fileName).trim().toLowerCase();
+    if (ext) {
+      switch (ext) {
+        case ".png":
+          return "image/png";
+        case ".jpg":
+        case ".jpeg":
+          return "image/jpeg";
+        case ".webp":
+          return "image/webp";
+        case ".gif":
+          return "image/gif";
+        case ".pdf":
+          return "application/pdf";
+        case ".txt":
+          return "text/plain";
+        case ".csv":
+          return "text/csv";
+        case ".json":
+          return "application/json";
+        case ".mp3":
+          return "audio/mpeg";
+        case ".wav":
+          return "audio/wav";
+        case ".ogg":
+        case ".opus":
+          return "audio/ogg";
+        case ".mp4":
+          return "video/mp4";
+        default:
+          return "application/octet-stream";
+      }
+    }
+    switch (messageType) {
+      case "image":
+        return "image/png";
+      case "audio":
+        return "audio/ogg";
+      case "video":
+      case "media":
+        return "video/mp4";
+      case "sticker":
+        return "image/webp";
+      default:
+        return "application/octet-stream";
+    }
+  }
+
+  private buildInboundAttachmentTargets(
+    messageType: string,
+    contentObj: Record<string, unknown>,
+    messageId: string,
+  ): Array<{
+    logicalType: string;
+    resourceType: "image" | "file";
+    fileKey: string;
+    fileName: string;
+    mimeType: string;
+  }> {
+    const normalizedType = messageType.trim().toLowerCase();
+    if (!this.shouldDownloadInboundAttachment(normalizedType)) {
+      return [];
+    }
+
+    if (normalizedType === "post") {
+      const parsedPost = parseFeishuPostContent(contentObj);
+      const targets: Array<{
+        logicalType: string;
+        resourceType: "image" | "file";
+        fileKey: string;
+        fileName: string;
+        mimeType: string;
+      }> = [];
+      for (let idx = 0; idx < parsedPost.imageKeys.length; idx += 1) {
+        const key = parsedPost.imageKeys[idx]!;
+        const fileName = `post_image_${idx + 1}_${messageId || Date.now()}.png`;
+        targets.push({
+          logicalType: "image",
+          resourceType: "image",
+          fileKey: key,
+          fileName,
+          mimeType: this.inferInboundAttachmentMimeType("image", fileName),
+        });
+      }
+      for (let idx = 0; idx < parsedPost.mediaKeys.length; idx += 1) {
+        const media = parsedPost.mediaKeys[idx]!;
+        const fallbackName = `post_media_${idx + 1}_${messageId || Date.now()}.bin`;
+        const fileName = path.basename(media.fileName || fallbackName);
+        targets.push({
+          logicalType: "file",
+          resourceType: "file",
+          fileKey: media.fileKey,
+          fileName,
+          mimeType: this.inferInboundAttachmentMimeType("file", fileName),
+        });
+      }
+      return targets;
+    }
+
+    const fileKey = normalizedType === "image"
+      ? toString(contentObj.image_key).trim()
+      : toString(contentObj.file_key, toString(contentObj.media_id)).trim();
+    if (!fileKey) {
+      return [];
+    }
+    const fileName = this.inferInboundAttachmentFileName(normalizedType, contentObj, messageId);
+    return [
+      {
+        logicalType: normalizedType === "sticker" ? "image" : normalizedType,
+        resourceType: normalizedType === "image" ? "image" : "file",
+        fileKey,
+        fileName,
+        mimeType: this.inferInboundAttachmentMimeType(normalizedType, fileName),
+      },
+    ];
+  }
+
+  private async readFeishuBinaryResponse(response: unknown): Promise<Buffer> {
+    if (Buffer.isBuffer(response)) {
+      return response;
+    }
+    if (response instanceof ArrayBuffer) {
+      return Buffer.from(response);
+    }
+    const responseObj = response as {
+      code?: unknown;
+      msg?: unknown;
+      data?: unknown;
+      getReadableStream?: () => AsyncIterable<Uint8Array | Buffer>;
+      writeFile?: (pathValue: string) => Promise<void>;
+      [Symbol.asyncIterator]?: () => AsyncIterable<Uint8Array | Buffer>;
+    };
+    const code = toNumber(responseObj.code, 0);
+    if (responseObj.code !== undefined && code !== 0) {
+      throw new Error(`code=${code} msg=${toString(responseObj.msg, "unknown")}`);
+    }
+    if (Buffer.isBuffer(responseObj.data)) {
+      return responseObj.data;
+    }
+    if (responseObj.data instanceof ArrayBuffer) {
+      return Buffer.from(responseObj.data);
+    }
+    if (typeof responseObj.getReadableStream === "function") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of responseObj.getReadableStream()) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks);
+    }
+    if (typeof responseObj[Symbol.asyncIterator] === "function") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of responseObj as unknown as AsyncIterable<Uint8Array | Buffer>) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks);
+    }
+    if (typeof responseObj.writeFile === "function") {
+      const tmpPath = path.join(
+        os.tmpdir(),
+        `tfclaw-feishu-download-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`,
+      );
+      try {
+        await responseObj.writeFile(tmpPath);
+        return fs.readFileSync(tmpPath);
+      } finally {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          // no-op
+        }
+      }
+    }
+    throw new Error("unexpected feishu binary response format");
+  }
+
+  private async downloadInboundAttachments(
+    messageType: string,
+    contentObj: Record<string, unknown>,
+    messageId: string,
+  ): Promise<BridgeInboundAttachment[]> {
+    if (!this.larkClient || !messageId || !this.shouldDownloadInboundAttachment(messageType)) {
+      return [];
+    }
+    const normalizedType = messageType.trim().toLowerCase();
+    const targets = this.buildInboundAttachmentTargets(normalizedType, contentObj, messageId);
+    if (targets.length === 0) {
+      return [];
+    }
+    const results: BridgeInboundAttachment[] = [];
+    const seen = new Set<string>();
+
+    for (const target of targets) {
+      const dedupKey = `${target.resourceType}:${target.fileKey}`;
+      if (seen.has(dedupKey)) {
+        continue;
+      }
+      seen.add(dedupKey);
+      try {
+        const response = await this.larkClient.im.v1.messageResource.get({
+          path: {
+            message_id: messageId,
+            file_key: target.fileKey,
+          },
+          params: {
+            type: target.resourceType,
+          },
+        });
+        const buffer = await this.readFeishuBinaryResponse(response);
+        if (buffer.byteLength === 0) {
+          continue;
+        }
+        if (buffer.byteLength > OPENCLAW_BRIDGE_INBOUND_MAX_FILE_BYTES) {
+          throw new Error(`attachment too large (${buffer.byteLength} bytes)`);
+        }
+        results.push({
+          messageType: target.logicalType,
+          fileName: target.fileName,
+          mimeType: target.mimeType,
+          contentBase64: buffer.toString("base64"),
+          sourceFileKey: target.fileKey,
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `[gateway] feishu inbound attachment download failed: ${msg} | message_id=${messageId} type=${normalizedType} file_key=${target.fileKey}`,
+        );
+      }
+    }
+    return results;
+  }
+
   private async handleInboundEvent(data: unknown): Promise<void> {
     const root = toObject(data);
     const eventPayload = toObject(root.event);
@@ -4832,19 +6382,30 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       }
     }
     const rawText = messageType === "text" ? toString(contentObj.text, rawContent) : "";
+    const attachments = await this.downloadInboundAttachments(messageType, contentObj, messageId);
     const mentions = extractFeishuMentions(message, contentObj);
+    const postParsed = messageType === "post" ? parseFeishuPostContent(contentObj) : undefined;
+    if (postParsed?.mentionedIds.length) {
+      for (const mentionedId of postParsed.mentionedIds) {
+        mentions.push({
+          key: "",
+          name: "",
+          openId: mentionedId,
+          userId: mentionedId,
+        });
+      }
+    }
     const inlineMentionKeys = messageType === "text" ? extractFeishuInlineMentionKeys(rawText) : [];
     const mentionKeyList = Array.from(new Set([...mentionKeys(mentions), ...inlineMentionKeys]));
     const atTags = messageType === "text" ? extractFeishuAtTags(rawText) : [];
-    const resourceHint = buildFeishuResourceHint(messageType, contentObj, messageId);
     const text = messageType === "text" ? normalizeFeishuInboundText(rawText, mentionKeyList) : "";
     const llmBaseText = messageType === "text"
       ? normalizeFeishuInboundText(
         replaceFeishuMentionTokens(rawText, mentions, this.botOpenId, this.botName),
         mentionKeyList,
       )
-      : resourceHint;
-    const feishuDocHint = messageType === "text" ? buildFeishuDocToolHint(llmBaseText) : "";
+      : buildFeishuNonTextBaseText(messageType, contentObj, messageId);
+    const feishuDocHint = buildFeishuDocToolHint(llmBaseText);
     const llmText = feishuDocHint ? `${llmBaseText}\n\n${feishuDocHint}` : llmBaseText;
     const isMentioned = chatType !== "group"
       ? true
@@ -4884,6 +6445,7 @@ class FeishuChatApp implements ChatApp, MessageResponder {
         messageType,
         contentRaw: rawContent,
         contentObj,
+        attachments,
         text,
         llmText: llmText || text,
         rawEvent: inboundPayload,
