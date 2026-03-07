@@ -40,6 +40,8 @@ TFClaw 是一个“面向 terminal 的远程桌面”MVP，并提供对应的app
   - `/tfadmin list|add|remove ...`（管理员管理；add/remove 仅 super_root 可用）
   - `/tfusers`（查看全量用户与角色）
   - `/tfroot show`（只读；super_root 仅可通过本地文件 `<openclawBridge.stateDir>/super-root.local.json` 配置）
+  - `/tfenv list|set|unset ...`（管理“当前用户”私有 OpenClaw 环境变量）
+  - `/tfapikey <ENV_KEY> <api_key>`（保存 API Key 到“当前用户”私有 OpenClaw 环境变量）
   - `/tfadmin add/remove` 与 `/tfgroup add/remove` 的用户参数支持：`feishuId | feishuName | linuxUser | me`
     - `/tmux help查看所有支持命令`
     - `/tmux status|sessions|panes|new|target|close|socket|lines|wait|stream|capture|key|send`

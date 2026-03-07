@@ -55,6 +55,8 @@ TFClaw is a **“terminal-oriented remote desktop” MVP**, with a companion mob
 - `/tfmode status|list|personal|group <groupName>` (switch personal/group OpenClaw route)
 - `/tfusers` (list all users and roles)
 - `/tfroot show` (super_root is read-only in chat; configured only by local file `openclawBridge.stateDir/super-root.local.json`)
+- `/tfenv list|set|unset ...` (manage current user's private OpenClaw env vars)
+- `/tfapikey <ENV_KEY> <api_key>` (save API key to current user's private OpenClaw env vars)
 - `/tfadmin add/remove` and `/tfgroup add/remove` user argument supports: `feishuId | feishuName | linuxUser | me`
 - Passthrough mode: normal messages continuously sent to tmux until `/pt off`
 - `/capture` returns screen/window ID list; reply with number to receive image

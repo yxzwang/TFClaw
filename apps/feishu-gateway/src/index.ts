@@ -44,6 +44,8 @@ interface DiscordChannelConfig extends BaseChannelConfig {
   intents: number;
 }
 
+type FeishuRenderMode = "auto" | "raw" | "card";
+
 interface FeishuChannelConfig extends BaseChannelConfig {
   appId: string;
   appSecret: string;
@@ -51,6 +53,7 @@ interface FeishuChannelConfig extends BaseChannelConfig {
   verificationToken: string;
   disableProxy: boolean;
   noProxyHosts: string[];
+  renderMode: FeishuRenderMode;
 }
 
 interface MochatChannelConfig extends BaseChannelConfig {
@@ -191,6 +194,12 @@ interface RenderedTerminalOutput {
 interface MessageResponder {
   replyText(chatId: string, text: string): Promise<void>;
   replyImage(chatId: string, imageBase64: string): Promise<void>;
+  replyAudio?(
+    chatId: string,
+    audioBase64: string,
+    fileName?: string,
+    mimeType?: string,
+  ): Promise<void>;
   replyFile?(
     chatId: string,
     fileBase64: string,
@@ -452,6 +461,17 @@ function toString(value: unknown, fallback = ""): string {
     return value;
   }
   return fallback;
+}
+
+function resolvePathFromBase(rawPath: string, baseDir: string, options?: { allowEmpty?: boolean }): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    return options?.allowEmpty ? "" : path.resolve(baseDir);
+  }
+  if (path.isAbsolute(trimmed)) {
+    return path.resolve(trimmed);
+  }
+  return path.resolve(baseDir, trimmed);
 }
 
 function toNumber(value: unknown, fallback: number): number {
@@ -1321,6 +1341,12 @@ interface OpenClawResolvedUserBinding extends OpenClawUserBinding {
   account: LinuxUserAccount;
 }
 
+interface OpenClawUserEnvFile {
+  version: 1;
+  vars: Record<string, string>;
+  updatedAt: string;
+}
+
 interface OpenClawExecutionScope {
   userKey: string;
   linuxUser: string;
@@ -1337,11 +1363,15 @@ const OPENCLAW_BRIDGE_FORCED_MAX_TOKENS = 8192;
 const OPENCLAW_BRIDGE_COMPACTION_RESERVE_TOKENS_FLOOR = 20000;
 const OPENCLAW_BRIDGE_WORKDIR_CONST_NAME = "TFCLAW_USER_WORKDIR";
 const OPENCLAW_BRIDGE_WORKDIR_SEPARATOR = "——————————————————————";
+const OPENCLAW_BRIDGE_USER_ENV_FILE_NAME = "user.env.json";
+const OPENCLAW_BRIDGE_ENV_VAR_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const OPENCLAW_BRIDGE_ENV_VALUE_MAX_LENGTH = 16 * 1024;
 const OPENCLAW_BRIDGE_INBOUND_MAX_FILE_BYTES = 30 * 1024 * 1024;
 const OPENCLAW_BRIDGE_OUTBOUND_MAX_FILE_BYTES = 30 * 1024 * 1024;
 const OPENCLAW_BRIDGE_MEDIA_FETCH_TIMEOUT_MS = 20_000;
 const FEISHU_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const FEISHU_MAX_FILE_BYTES = 30 * 1024 * 1024;
+const FEISHU_WITHDRAWN_REPLY_ERROR_CODES = new Set([230011, 231003]);
 const OPENCLAW_BUILTIN_SLASH_COMMANDS = new Set([
   "help",
   "commands",
@@ -1395,9 +1425,13 @@ class OpenClawPerUserBridge {
 
   constructor(private readonly config: OpenClawBridgeConfig) {
     const root = path.resolve(config.openclawRoot || ".");
+    const stateDir = path.resolve(config.stateDir || path.join(process.cwd(), ".runtime", "openclaw_bridge"));
+    const userHomeRoot = path.resolve(config.userHomeRoot || path.join(process.cwd(), ".home"));
     this.config.openclawRoot = root;
+    this.config.stateDir = stateDir;
+    this.config.userHomeRoot = userHomeRoot;
     this.enabled = config.enabled && root.trim().length > 0;
-    this.mapFilePath = path.join(path.resolve(config.stateDir), "feishu-user-map.json");
+    this.mapFilePath = path.join(stateDir, "feishu-user-map.json");
     this.openclawEntryPath = path.join(root, "openclaw.mjs");
     this.distEntryCandidates = [
       path.join(root, "dist", "entry.js"),
@@ -1826,9 +1860,13 @@ class OpenClawPerUserBridge {
       username,
       uid,
       gid,
-      home: home || path.join(this.config.userHomeRoot, username),
+      home: home || this.expectedLinuxHomeDir(username),
       shell: shell || "/bin/bash",
     };
+  }
+
+  private expectedLinuxHomeDir(username: string): string {
+    return path.join(path.resolve(this.config.userHomeRoot), username);
   }
 
   private ensureLinuxHomePermissions(account: LinuxUserAccount): void {
@@ -1841,6 +1879,40 @@ class OpenClawPerUserBridge {
     }
     fs.mkdirSync(account.home, { recursive: true });
     this.ensurePathOwnerAndMode(account.home, account.uid, account.gid, 0o700);
+  }
+
+  private async ensureLinuxUserHomeRoot(account: LinuxUserAccount): Promise<LinuxUserAccount> {
+    const expectedHome = this.expectedLinuxHomeDir(account.username);
+    const currentHome = path.resolve(account.home);
+    if (currentHome === expectedHome) {
+      return account;
+    }
+    const uid = process.getuid?.();
+    if (uid !== 0) {
+      throw new Error(
+        `linux user ${account.username} home mismatch (${currentHome} != ${expectedHome}). run gateway as root once to migrate home.`,
+      );
+    }
+
+    fs.mkdirSync(path.dirname(expectedHome), { recursive: true });
+    const migrated = await this.runCommand("usermod", ["-d", expectedHome, "-m", account.username], {
+      timeoutMs: 60_000,
+    });
+    if (migrated.code !== 0) {
+      const refreshedAfterFailure = await this.queryLinuxUser(account.username);
+      if (refreshedAfterFailure && path.resolve(refreshedAfterFailure.home) === expectedHome) {
+        return refreshedAfterFailure;
+      }
+      const details = migrated.stderr.trim() || migrated.stdout.trim() || "unknown error";
+      throw new Error(
+        `failed to migrate linux user ${account.username} home (${currentHome} -> ${expectedHome}): ${details}`,
+      );
+    }
+    const refreshed = await this.queryLinuxUser(account.username);
+    if (!refreshed) {
+      throw new Error(`linux user ${account.username} home migrated but account lookup failed`);
+    }
+    return refreshed;
   }
 
   private async queryLinuxUser(username: string): Promise<LinuxUserAccount | undefined> {
@@ -1861,8 +1933,9 @@ class OpenClawPerUserBridge {
   private async ensureLinuxUser(username: string): Promise<LinuxUserAccount> {
     const existing = await this.queryLinuxUser(username);
     if (existing) {
-      this.ensureLinuxHomePermissions(existing);
-      return existing;
+      const normalized = await this.ensureLinuxUserHomeRoot(existing);
+      this.ensureLinuxHomePermissions(normalized);
+      return normalized;
     }
     if (!this.config.allowAutoCreateUser) {
       throw new Error(`linux user ${username} does not exist and auto-create is disabled`);
@@ -1871,7 +1944,7 @@ class OpenClawPerUserBridge {
     if (uid !== 0) {
       throw new Error(`linux user ${username} does not exist. run gateway as root to auto-create users`);
     }
-    const homeDir = path.join(path.resolve(this.config.userHomeRoot), username);
+    const homeDir = this.expectedLinuxHomeDir(username);
     fs.mkdirSync(path.dirname(homeDir), { recursive: true });
     const created = await this.runCommand("useradd", ["-m", "-d", homeDir, "-s", "/bin/bash", username], {
       timeoutMs: 10_000,
@@ -2012,10 +2085,158 @@ class OpenClawPerUserBridge {
     });
   }
 
+  private userRuntimeDir(binding: OpenClawResolvedUserBinding): string {
+    return path.join(binding.account.home, ".tfclaw-openclaw");
+  }
+
+  private userDefaultWorkspaceDir(binding: OpenClawResolvedUserBinding): string {
+    return path.join(this.userRuntimeDir(binding), "workspace");
+  }
+
+  private userEnvFilePath(binding: OpenClawResolvedUserBinding): string {
+    return path.join(this.userRuntimeDir(binding), OPENCLAW_BRIDGE_USER_ENV_FILE_NAME);
+  }
+
+  private normalizeEnvVarKey(rawKey: string): string {
+    const key = rawKey.trim();
+    if (!key || !OPENCLAW_BRIDGE_ENV_VAR_PATTERN.test(key)) {
+      throw new Error(`invalid env key: ${rawKey}`);
+    }
+    return key;
+  }
+
+  private normalizeUserEnvVars(input: Record<string, unknown>): Record<string, string> {
+    const vars: Record<string, string> = {};
+    for (const [rawKey, rawValue] of Object.entries(input)) {
+      const key = rawKey.trim();
+      if (!key || !OPENCLAW_BRIDGE_ENV_VAR_PATTERN.test(key)) {
+        continue;
+      }
+      if (typeof rawValue !== "string") {
+        continue;
+      }
+      const value = rawValue;
+      if (!value || value.length > OPENCLAW_BRIDGE_ENV_VALUE_MAX_LENGTH) {
+        continue;
+      }
+      vars[key] = value;
+    }
+    return vars;
+  }
+
+  private writeUserPrivateEnvFile(
+    binding: OpenClawResolvedUserBinding,
+    envFilePath: string,
+    vars: Record<string, string>,
+  ): void {
+    const runtimeDir = path.dirname(envFilePath);
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    const payload: OpenClawUserEnvFile = {
+      version: 1,
+      vars,
+      updatedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(envFilePath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    this.ensurePathOwnerAndMode(runtimeDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(envFilePath, binding.account.uid, binding.account.gid, 0o600);
+  }
+
+  private loadUserPrivateEnvVars(binding: OpenClawResolvedUserBinding): {
+    envFilePath: string;
+    vars: Record<string, string>;
+  } {
+    const envFilePath = this.userEnvFilePath(binding);
+    const privateWorkspaceDir = path.resolve(this.userDefaultWorkspaceDir(binding));
+    let vars: Record<string, string> = {};
+
+    if (fs.existsSync(envFilePath)) {
+      try {
+        const parsed = toObject(JSON.parse(fs.readFileSync(envFilePath, "utf8")));
+        const rawVars = Object.prototype.hasOwnProperty.call(parsed, "vars")
+          ? toObject(parsed.vars)
+          : parsed;
+        vars = this.normalizeUserEnvVars(rawVars);
+      } catch {
+        vars = {};
+      }
+    }
+
+    // Keep CLAWHUB tools pinned to the user workspace root by default.
+    vars.CLAWHUB_WORKDIR = privateWorkspaceDir;
+    this.writeUserPrivateEnvFile(binding, envFilePath, vars);
+    return { envFilePath, vars };
+  }
+
+  async listUserPrivateEnvVars(userKey: string): Promise<{
+    envFilePath: string;
+    vars: Record<string, string>;
+  }> {
+    if (!this.enabled) {
+      throw new Error("openclaw bridge is disabled");
+    }
+    const binding = await this.ensureUserBinding({ routingUserKey: userKey });
+    return this.loadUserPrivateEnvVars(binding);
+  }
+
+  async setUserPrivateEnvVar(userKey: string, rawKey: string, rawValue: string): Promise<{
+    key: string;
+    envFilePath: string;
+  }> {
+    if (!this.enabled) {
+      throw new Error("openclaw bridge is disabled");
+    }
+    const key = this.normalizeEnvVarKey(rawKey);
+    const value = rawValue.trim();
+    if (!value) {
+      throw new Error("env value cannot be empty");
+    }
+    if (value.length > OPENCLAW_BRIDGE_ENV_VALUE_MAX_LENGTH) {
+      throw new Error(`env value too long (max ${OPENCLAW_BRIDGE_ENV_VALUE_MAX_LENGTH} chars)`);
+    }
+
+    const binding = await this.ensureUserBinding({ routingUserKey: userKey });
+    const envState = this.loadUserPrivateEnvVars(binding);
+    envState.vars[key] = value;
+    this.writeUserPrivateEnvFile(binding, envState.envFilePath, envState.vars);
+
+    const runtime = this.prepareUserRuntime(binding);
+    await this.ensureTmuxOpenClawProcess(binding, runtime, { forceRestart: true });
+    return { key, envFilePath: envState.envFilePath };
+  }
+
+  async unsetUserPrivateEnvVar(userKey: string, rawKey: string): Promise<{
+    key: string;
+    removed: boolean;
+    envFilePath: string;
+  }> {
+    if (!this.enabled) {
+      throw new Error("openclaw bridge is disabled");
+    }
+    const key = this.normalizeEnvVarKey(rawKey);
+    if (key === "CLAWHUB_WORKDIR") {
+      throw new Error("CLAWHUB_WORKDIR is managed by tfclaw and cannot be removed");
+    }
+
+    const binding = await this.ensureUserBinding({ routingUserKey: userKey });
+    const envState = this.loadUserPrivateEnvVars(binding);
+    const removed = Object.prototype.hasOwnProperty.call(envState.vars, key);
+    if (removed) {
+      delete envState.vars[key];
+      this.writeUserPrivateEnvFile(binding, envState.envFilePath, envState.vars);
+      const runtime = this.prepareUserRuntime(binding);
+      await this.ensureTmuxOpenClawProcess(binding, runtime, { forceRestart: true });
+    }
+    return { key, removed, envFilePath: envState.envFilePath };
+  }
+
   private buildOpenClawConfig(
     baseConfig: Record<string, unknown>,
     binding: OpenClawResolvedUserBinding,
     workspaceRoot: string,
+    userEnvVars: Record<string, string>,
   ): Record<string, unknown> {
     let cfg: Record<string, unknown> = {};
     try {
@@ -2025,6 +2246,7 @@ class OpenClawPerUserBridge {
     }
 
     const userSkillsDir = path.join(binding.account.home, "skills");
+    const workspaceSkillsDir = path.join(workspaceRoot, "skills");
     const sharedSkillsDir = path.resolve(this.config.sharedSkillsDir);
 
     const gateway = toObject(cfg.gateway);
@@ -2097,11 +2319,26 @@ class OpenClawPerUserBridge {
     const skills = toObject(cfg.skills);
     const load = toObject(skills.load);
     const normalizedUserSkillsDir = path.resolve(userSkillsDir);
+    const normalizedWorkspaceSkillsDir = path.resolve(workspaceSkillsDir);
     const normalizedSharedSkillsDir = path.resolve(sharedSkillsDir);
-    // Keep skills sources deterministic: shared + per-user private.
-    load.extraDirs = [normalizedSharedSkillsDir, normalizedUserSkillsDir];
+    // Keep skills sources deterministic: shared + per-user private (+ per-user workspace skills).
+    load.extraDirs = [normalizedSharedSkillsDir, normalizedUserSkillsDir, normalizedWorkspaceSkillsDir];
     skills.load = load;
     cfg.skills = skills;
+
+    const env = toObject(cfg.env);
+    const envVars = toObject(env.vars);
+    for (const [key, value] of Object.entries(userEnvVars)) {
+      if (!OPENCLAW_BRIDGE_ENV_VAR_PATTERN.test(key)) {
+        continue;
+      }
+      if (typeof value !== "string" || !value || value.length > OPENCLAW_BRIDGE_ENV_VALUE_MAX_LENGTH) {
+        continue;
+      }
+      envVars[key] = value;
+    }
+    env.vars = envVars;
+    cfg.env = env;
 
     // Per-user bridge is the only ingress/egress; disable template bindings to avoid cross-user drift.
     cfg.bindings = [];
@@ -2209,7 +2446,11 @@ class OpenClawPerUserBridge {
       'WORKSPACE="${TFCLAW_EXEC_WORKSPACE:-${PWD}}"',
       'USER_HOME="${TFCLAW_EXEC_HOME:-${HOME:-$WORKSPACE}}"',
       'USER_NAME="${USER:-$(id -un 2>/dev/null || echo user)}"',
+      'NODE_BIN_DIR="${TFCLAW_EXEC_NODE_BIN_DIR:-}"',
       'PATH_DEFAULT="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"',
+      'if [[ -n "$NODE_BIN_DIR" && -d "$NODE_BIN_DIR" ]]; then',
+      '  PATH_DEFAULT="$NODE_BIN_DIR:$PATH_DEFAULT"',
+      "fi",
       "",
       'if [[ "${1:-}" != "-c" || $# -lt 2 ]]; then',
       '  exec "$REAL_SHELL" "$@"',
@@ -2224,15 +2465,27 @@ class OpenClawPerUserBridge {
       'if [[ ! -d "$USER_HOME" ]]; then',
       '  USER_HOME="$WORKSPACE"',
       "fi",
+      'NPM_CACHE_DIR="${WORKSPACE}/.npm-cache"',
+      'NPM_PREFIX_DIR="${WORKSPACE}/.npm-global"',
+      'NPM_USERCONFIG="${WORKSPACE}/.npmrc"',
+      'mkdir -p "$NPM_CACHE_DIR" "$NPM_PREFIX_DIR/bin"',
       "",
       'cd "$WORKSPACE"',
-      'export PATH="$PATH_DEFAULT"',
+      'export PATH="$NPM_PREFIX_DIR/bin:$PATH_DEFAULT"',
       'export HOME="$USER_HOME"',
       'export USER="$USER_NAME"',
       'export LOGNAME="$USER_NAME"',
       'export SHELL="$REAL_SHELL"',
       'export TERM="${TERM:-xterm-256color}"',
       'export LANG="${LANG:-C.UTF-8}"',
+      'export NPM_CONFIG_CACHE="$NPM_CACHE_DIR"',
+      'export npm_config_cache="$NPM_CACHE_DIR"',
+      'export NPM_CONFIG_PREFIX="$NPM_PREFIX_DIR"',
+      'export npm_config_prefix="$NPM_PREFIX_DIR"',
+      'export NPM_CONFIG_USERCONFIG="$NPM_USERCONFIG"',
+      'export npm_config_userconfig="$NPM_USERCONFIG"',
+      'export NPM_CONFIG_UPDATE_NOTIFIER=false',
+      'export npm_config_update_notifier=false',
       'exec "$REAL_SHELL" -lc "$CMD"',
     ].join("\n");
   }
@@ -2260,10 +2513,13 @@ class OpenClawPerUserBridge {
     workspaceConstDeclaration: string;
     workspaceDir: string;
   } {
-    const runtimeDir = path.join(binding.account.home, ".tfclaw-openclaw");
+    const runtimeDir = this.userRuntimeDir(binding);
+    const privateWorkspaceDir = this.userDefaultWorkspaceDir(binding);
+    const privateWorkspaceSkillsDir = path.join(privateWorkspaceDir, "skills");
     const workspaceDir = workspaceOverrideDir?.trim()
       ? path.resolve(workspaceOverrideDir.trim())
-      : path.join(runtimeDir, "workspace");
+      : privateWorkspaceDir;
+    const workspaceSkillsDir = path.join(workspaceDir, "skills");
     const agentsDir = path.join(runtimeDir, "agents");
     const shellWrapperDir = path.join(runtimeDir, "bin");
     const shellWrapperPath = path.join(shellWrapperDir, "tfclaw-jail-shell.sh");
@@ -2272,7 +2528,10 @@ class OpenClawPerUserBridge {
     const workspaceConstRuntimePath = path.join(runtimeDir, "WORKDIR.const.js");
     const workspaceConstWorkspacePath = path.join(workspaceDir, "WORKDIR.const.js");
     fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.mkdirSync(privateWorkspaceDir, { recursive: true });
+    fs.mkdirSync(privateWorkspaceSkillsDir, { recursive: true });
     fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.mkdirSync(workspaceSkillsDir, { recursive: true });
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.mkdirSync(shellWrapperDir, { recursive: true });
     fs.mkdirSync(skillsDir, { recursive: true });
@@ -2288,7 +2547,8 @@ class OpenClawPerUserBridge {
     });
 
     const baseConfig = this.loadBaseOpenClawConfig();
-    const configObj = this.buildOpenClawConfig(baseConfig, binding, workspaceDir);
+    const envState = this.loadUserPrivateEnvVars(binding);
+    const configObj = this.buildOpenClawConfig(baseConfig, binding, workspaceDir, envState.vars);
     const configPath = path.join(runtimeDir, "openclaw.json");
 
     fs.writeFileSync(configPath, `${JSON.stringify(configObj, null, 2)}\n`, {
@@ -2302,7 +2562,10 @@ class OpenClawPerUserBridge {
     this.writeExecApprovalsForUser(binding);
     this.ensurePathOwnerAndMode(binding.account.home, binding.account.uid, binding.account.gid, 0o700);
     this.ensurePathOwnerAndMode(runtimeDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(privateWorkspaceDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(privateWorkspaceSkillsDir, binding.account.uid, binding.account.gid, 0o700);
     this.ensurePathOwnerAndMode(workspaceDir, binding.account.uid, binding.account.gid, 0o700);
+    this.ensurePathOwnerAndMode(workspaceSkillsDir, binding.account.uid, binding.account.gid, 0o700);
     this.ensurePathOwnerAndMode(agentsDir, binding.account.uid, binding.account.gid, 0o700);
     this.ensurePathOwnerAndMode(shellWrapperDir, binding.account.uid, binding.account.gid, 0o700);
     this.ensurePathOwnerAndMode(shellWrapperPath, binding.account.uid, binding.account.gid, 0o700);
@@ -2313,11 +2576,12 @@ class OpenClawPerUserBridge {
     this.ensurePathOwnerAndMode(workspaceConstWorkspacePath, binding.account.uid, binding.account.gid, 0o600);
 
     const nodePath = path.resolve(this.config.nodePath || process.execPath);
+    const nodeBinDir = path.dirname(nodePath);
     const startCommand = [
       "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy npm_config_proxy npm_config_https_proxy npm_config_http_proxy npm_config_noproxy",
       "umask 077",
       `cd ${shellQuote(this.config.openclawRoot)}`,
-      `HOME=${shellQuote(binding.account.home)} USER=${shellQuote(binding.account.username)} LOGNAME=${shellQuote(binding.account.username)} SHELL=${shellQuote(shellWrapperPath)} TFCLAW_EXEC_WORKSPACE=${shellQuote(workspaceDir)} TFCLAW_EXEC_HOME=${shellQuote(binding.account.home)} TFCLAW_EXEC_REAL_SHELL='/bin/bash' OPENCLAW_HOME=${shellQuote(binding.account.home)} CLAWHUB_WORKDIR=${shellQuote(binding.account.home)} OPENCLAW_CONFIG_PATH=${shellQuote(configPath)} OPENCLAW_GATEWAY_TOKEN=${shellQuote(binding.gatewayToken)} exec ${shellQuote(nodePath)} ${shellQuote(this.openclawEntryPath)} gateway --allow-unconfigured --port ${binding.gatewayPort} --bind loopback --auth token --token ${shellQuote(binding.gatewayToken)}`,
+      `HOME=${shellQuote(binding.account.home)} USER=${shellQuote(binding.account.username)} LOGNAME=${shellQuote(binding.account.username)} SHELL=${shellQuote(shellWrapperPath)} TFCLAW_EXEC_WORKSPACE=${shellQuote(workspaceDir)} TFCLAW_EXEC_HOME=${shellQuote(binding.account.home)} TFCLAW_EXEC_REAL_SHELL='/bin/bash' TFCLAW_EXEC_NODE_BIN_DIR=${shellQuote(nodeBinDir)} OPENCLAW_HOME=${shellQuote(binding.account.home)} CLAWHUB_WORKDIR=${shellQuote(envState.vars.CLAWHUB_WORKDIR || privateWorkspaceDir)} OPENCLAW_CONFIG_PATH=${shellQuote(configPath)} OPENCLAW_GATEWAY_TOKEN=${shellQuote(binding.gatewayToken)} exec ${shellQuote(nodePath)} ${shellQuote(this.openclawEntryPath)} gateway --allow-unconfigured --port ${binding.gatewayPort} --bind loopback --auth token --token ${shellQuote(binding.gatewayToken)}`,
     ].join(" && ");
 
     const sessionRaw = `${this.config.tmuxSessionPrefix}${binding.account.username}`;
@@ -2333,8 +2597,11 @@ class OpenClawPerUserBridge {
   private async ensureTmuxOpenClawProcess(
     binding: OpenClawResolvedUserBinding,
     runtime: { sessionName: string; startCommand: string },
+    options?: { forceRestart?: boolean },
   ): Promise<void> {
-    if (await this.isPortOpen(this.config.gatewayHost, binding.gatewayPort)) {
+    const forceRestart = options?.forceRestart === true;
+    const portAlreadyOpen = await this.isPortOpen(this.config.gatewayHost, binding.gatewayPort);
+    if (!forceRestart && portAlreadyOpen) {
       return;
     }
 
@@ -2349,6 +2616,10 @@ class OpenClawPerUserBridge {
         "-t",
         runtime.sessionName,
       ]);
+    } else if (forceRestart && portAlreadyOpen) {
+      throw new Error(
+        `openclaw process for ${binding.account.username} is listening on ${this.config.gatewayHost}:${binding.gatewayPort}, but tmux session ${runtime.sessionName} is missing`,
+      );
     }
 
     const started = await this.runAsUser(
@@ -3490,6 +3761,7 @@ function renderTerminalStream(raw: string): RenderedTerminalOutput {
 
 function loadGatewayConfig(): LoadedGatewayConfig {
   const configPath = path.resolve(process.env.TFCLAW_CONFIG_PATH ?? "config.json");
+  const configDir = path.dirname(configPath);
   let fromFile = false;
   let rawConfig: Record<string, unknown> = {};
 
@@ -3519,6 +3791,13 @@ function loadGatewayConfig(): LoadedGatewayConfig {
   const hasFeishuEnabled = Object.prototype.hasOwnProperty.call(rawFeishu, "enabled");
   const feishuEnabled = hasFeishuEnabled ? toBoolean(rawFeishu.enabled, feishuEnabledFallback) : feishuEnabledFallback;
   const feishuAllowFromFallback = parseCsv(process.env.FEISHU_ALLOW_FROM);
+  const rawFeishuRenderMode = toString(
+    rawFeishu.renderMode,
+    process.env.TFCLAW_FEISHU_RENDER_MODE ?? "auto",
+  ).trim().toLowerCase();
+  const feishuRenderMode: FeishuRenderMode = rawFeishuRenderMode === "raw" || rawFeishuRenderMode === "card"
+    ? rawFeishuRenderMode
+    : "auto";
 
   const rawTelegram = toObject(rawChannels.telegram);
   const rawWhatsApp = toObject(rawChannels.whatsapp);
@@ -3538,22 +3817,39 @@ function loadGatewayConfig(): LoadedGatewayConfig {
     Math.min(10 * 60 * 1000, toNumber(rawNexChatBot.timeoutMs, toNumber(process.env.TFCLAW_NEXCHATBOT_TIMEOUT_MS, 90_000))),
   );
 
-  const openclawRootFallback = path.resolve(
-    toString(rawOpenClawBridge.openclawRoot, process.env.TFCLAW_OPENCLAW_ROOT ?? path.join(process.cwd(), "..", "openclaw")),
+  const openclawRootFallback = resolvePathFromBase(
+    toString(rawOpenClawBridge.openclawRoot, process.env.TFCLAW_OPENCLAW_ROOT ?? path.join("..", "openclaw")),
+    configDir,
   );
   const openclawBridgeEnabledFallback = toBoolean(process.env.TFCLAW_OPENCLAW_ENABLED, false);
-  const openclawSharedSkillsDirFallback = path.resolve(
+  const openclawSharedSkillsDirFallback = resolvePathFromBase(
     toString(
       rawOpenClawBridge.sharedSkillsDir,
       process.env.TFCLAW_OPENCLAW_SHARED_SKILLS_DIR ?? path.join(openclawRootFallback, "skills"),
     ),
+    configDir,
   );
-  const openclawUserHomeRootFallback = path.resolve(
+  const openclawUserHomeRootFallback = resolvePathFromBase(
     toString(
       rawOpenClawBridge.userHomeRoot,
-      process.env.TFCLAW_OPENCLAW_USER_HOME_ROOT ??
-        "/inspire/hdd/project/cq-scientific-cooperation-zone/ky26016/.home",
+      process.env.TFCLAW_OPENCLAW_USER_HOME_ROOT ?? ".home",
     ),
+    configDir,
+  );
+  const openclawStateDir = resolvePathFromBase(
+    toString(
+      rawOpenClawBridge.stateDir,
+      process.env.TFCLAW_OPENCLAW_STATE_DIR ?? path.join(".runtime", "openclaw_bridge"),
+    ),
+    configDir,
+  );
+  const openclawConfigTemplatePath = resolvePathFromBase(
+    toString(
+      rawOpenClawBridge.configTemplatePath,
+      process.env.TFCLAW_OPENCLAW_CONFIG_TEMPLATE_PATH ?? "",
+    ),
+    configDir,
+    { allowEmpty: true },
   );
   const openclawGatewayPortBase = Math.max(
     1025,
@@ -3569,7 +3865,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
   );
   const openclawRequestTimeoutMs = Math.max(
     1000,
-    Math.min(30 * 60 * 1000, toNumber(rawOpenClawBridge.requestTimeoutMs, toNumber(process.env.TFCLAW_OPENCLAW_REQUEST_TIMEOUT_MS, 180_000))),
+    Math.min(30 * 60 * 1000, toNumber(rawOpenClawBridge.requestTimeoutMs, toNumber(process.env.TFCLAW_OPENCLAW_REQUEST_TIMEOUT_MS, 600_000))),
   );
 
   const relayToken = toString(rawRelay.token, process.env.TFCLAW_TOKEN ?? "");
@@ -3592,12 +3888,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
     openclawBridge: {
       enabled: toBoolean(rawOpenClawBridge.enabled, openclawBridgeEnabledFallback),
       openclawRoot: openclawRootFallback,
-      stateDir: path.resolve(
-        toString(
-          rawOpenClawBridge.stateDir,
-          process.env.TFCLAW_OPENCLAW_STATE_DIR ?? path.join(process.cwd(), ".runtime", "openclaw_bridge"),
-        ),
-      ),
+      stateDir: openclawStateDir,
       sharedSkillsDir: openclawSharedSkillsDirFallback,
       userHomeRoot: openclawUserHomeRootFallback,
       userPrefix: toString(rawOpenClawBridge.userPrefix, process.env.TFCLAW_OPENCLAW_USER_PREFIX ?? "tfoc_"),
@@ -3612,10 +3903,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
       requestTimeoutMs: openclawRequestTimeoutMs,
       sessionKey: toString(rawOpenClawBridge.sessionKey, process.env.TFCLAW_OPENCLAW_SESSION_KEY ?? "main"),
       nodePath: toString(rawOpenClawBridge.nodePath, process.env.TFCLAW_OPENCLAW_NODE_PATH ?? process.execPath),
-      configTemplatePath: toString(
-        rawOpenClawBridge.configTemplatePath,
-        process.env.TFCLAW_OPENCLAW_CONFIG_TEMPLATE_PATH ?? "",
-      ),
+      configTemplatePath: openclawConfigTemplatePath,
       autoBuildDist: toBoolean(
         rawOpenClawBridge.autoBuildDist,
         toBoolean(process.env.TFCLAW_OPENCLAW_AUTO_BUILD_DIST, false),
@@ -3676,6 +3964,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
           "open.larksuite.com",
           ".larksuite.com",
         ]),
+        renderMode: feishuRenderMode,
       },
       mochat: {
         enabled: toBoolean(rawMochat.enabled, false),
@@ -4066,15 +4355,29 @@ class TfclawAccessManager {
   private readonly stateFilePath: string;
   private readonly superRootConfigPath: string;
   private readonly groupWorkspaceRoot: string;
+  private readonly legacyGroupWorkspaceRoot: string;
   private lock: Promise<void> = Promise.resolve();
 
-  constructor(stateDir: string) {
+  constructor(stateDir: string, userHomeRoot: string) {
     const resolvedStateDir = path.resolve(stateDir);
+    const resolvedUserHomeRoot = path.resolve(userHomeRoot);
     fs.mkdirSync(resolvedStateDir, { recursive: true });
+    fs.mkdirSync(resolvedUserHomeRoot, { recursive: true });
     this.stateFilePath = path.join(resolvedStateDir, "access-control.json");
     this.superRootConfigPath = path.join(resolvedStateDir, "super-root.local.json");
-    this.groupWorkspaceRoot = path.join(resolvedStateDir, "group_workspaces");
+    this.legacyGroupWorkspaceRoot = path.join(resolvedStateDir, "group_workspaces");
+    this.groupWorkspaceRoot = path.join(resolvedUserHomeRoot, "_groups");
     fs.mkdirSync(this.groupWorkspaceRoot, { recursive: true });
+    try {
+      fs.chmodSync(resolvedUserHomeRoot, 0o711);
+    } catch {
+      // Ignore mode errors and continue.
+    }
+    try {
+      fs.chmodSync(this.groupWorkspaceRoot, 0o711);
+    } catch {
+      // Ignore mode errors and continue.
+    }
   }
 
   private defaultState(): TfclawAccessStateFile {
@@ -4101,6 +4404,39 @@ class TfclawAccessManager {
 
   private normalizeDisplayName(value: string): string {
     return value.trim().replace(/\s+/g, " ");
+  }
+
+  private isPathInsideRoot(candidatePath: string, rootPath: string): boolean {
+    const relative = path.relative(rootPath, candidatePath);
+    return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  }
+
+  private resolveDefaultGroupWorkspaceDir(groupName: string): string {
+    return path.join(this.groupWorkspaceRoot, groupName, "workspace");
+  }
+
+  private migrateLegacyGroupWorkspaceDir(groupName: string, workspaceDir: string): string {
+    const resolvedWorkspace = path.resolve(workspaceDir);
+    if (!this.isPathInsideRoot(resolvedWorkspace, this.legacyGroupWorkspaceRoot)) {
+      return resolvedWorkspace;
+    }
+    const relative = path.relative(this.legacyGroupWorkspaceRoot, resolvedWorkspace);
+    const fallbackRelative = path.join(groupName, "workspace");
+    const targetRelative = relative.trim() ? relative : fallbackRelative;
+    const targetWorkspace = path.resolve(path.join(this.groupWorkspaceRoot, targetRelative));
+    if (targetWorkspace === resolvedWorkspace) {
+      return resolvedWorkspace;
+    }
+    if (fs.existsSync(resolvedWorkspace) && !fs.existsSync(targetWorkspace)) {
+      fs.mkdirSync(path.dirname(targetWorkspace), { recursive: true });
+      try {
+        fs.renameSync(resolvedWorkspace, targetWorkspace);
+      } catch {
+        fs.cpSync(resolvedWorkspace, targetWorkspace, { recursive: true });
+      }
+    }
+    fs.mkdirSync(targetWorkspace, { recursive: true });
+    return targetWorkspace;
   }
 
   private looksLikeFeishuUserIdentifier(value: string): boolean {
@@ -4229,8 +4565,11 @@ class TfclawAccessManager {
           ? Array.from(new Set(value.members.map((item) => this.normalizeUserKey(toString(item))).filter(Boolean)))
           : [];
         const displayName = toString(value.displayName, key).trim() || key;
-        const workspaceDir = this.ensureAbsoluteWorkspacePath(
-          toString(value.workspaceDir, path.join(this.groupWorkspaceRoot, key)),
+        const workspaceDir = this.migrateLegacyGroupWorkspaceDir(
+          key,
+          this.ensureAbsoluteWorkspacePath(
+            toString(value.workspaceDir, this.resolveDefaultGroupWorkspaceDir(key)),
+          ),
         );
         groups[key] = {
           name: key,
@@ -4463,7 +4802,7 @@ class TfclawAccessManager {
         throw new Error(`group already exists: ${normalizedName}`);
       }
       const workspaceDir = this.ensureAbsoluteWorkspacePath(
-        workspacePath?.trim() || path.join(this.groupWorkspaceRoot, normalizedName, "workspace"),
+        workspacePath?.trim() || this.resolveDefaultGroupWorkspaceDir(normalizedName),
       );
       const now = new Date().toISOString();
       const group: TfclawAccessGroup = {
@@ -5480,6 +5819,8 @@ class TfclawCommandRouter {
       "15) /tfgroup list|create|workspace|add|remove ... - manage groups",
       "16) /tfmode status|list|personal|group <groupName> - switch personal/group openclaw",
       "17) user target in /tfadmin add/remove and /tfgroup add/remove supports: feishuId | feishuName | linuxUser | me",
+      "18) /tfenv list|set|unset ... - manage your private openclaw env vars",
+      "19) /tfapikey <ENV_KEY> <api_key> - save API key into your private env vars",
     ].join("\n");
   }
 
@@ -5582,34 +5923,22 @@ class TfclawCommandRouter {
     };
   }
 
-  private normalizeDisplayUserName(value: string): string {
-    const trimmed = value.trim().replace(/\s+/g, " ");
-    if (!trimmed) {
-      return "";
+  private displayLinuxUserFromMap(userKey: string, linuxUsers: Map<string, string>): string {
+    const linuxUser = (linuxUsers.get(userKey) || "").trim();
+    if (linuxUser) {
+      return linuxUser;
     }
-    if (this.looksLikeFeishuUserIdentifier(trimmed)) {
-      return "";
-    }
-    if (/^tfoc_[a-f0-9]+$/i.test(trimmed)) {
-      return "";
-    }
-    return trimmed;
+    return userKey;
   }
 
-  private displayUserNameFromMap(userKey: string, nameMap: Map<string, string>): string {
-    const displayName = this.normalizeDisplayUserName(nameMap.get(userKey) || "");
-    if (displayName) {
-      return displayName;
+  private async displayLinuxUser(userKey: string): Promise<string> {
+    const normalized = userKey.trim();
+    if (!normalized) {
+      return "unknown";
     }
-    return "未登记姓名用户";
-  }
-
-  private async displayUserName(userKey: string): Promise<string> {
-    const displayName = this.normalizeDisplayUserName(await this.accessManager.getUserDisplayName(userKey) || "");
-    if (displayName) {
-      return displayName;
-    }
-    return "未登记姓名用户";
+    const bindings = await this.openclawBridge.listUserBindings();
+    const hit = bindings.find((item) => item.userKey === normalized);
+    return (hit?.linuxUser || normalized).trim();
   }
 
   private formatRole(role: TfclawUserRole): string {
@@ -5663,12 +5992,59 @@ class TfclawCommandRouter {
     return undefined;
   }
 
+  private parseEnvSetArgs(raw: string): { key: string; value: string } | undefined {
+    let body = raw.trim();
+    body = body.replace(/^(?:set|add|put)\s+/i, "").trim();
+    if (!body) {
+      return undefined;
+    }
+    const eqIndex = body.indexOf("=");
+    if (eqIndex > 0) {
+      const key = body.slice(0, eqIndex).trim();
+      const value = body.slice(eqIndex + 1).trim();
+      if (!key || !value) {
+        return undefined;
+      }
+      return { key, value };
+    }
+    const firstSpace = body.search(/\s/);
+    if (firstSpace <= 0) {
+      return undefined;
+    }
+    const key = body.slice(0, firstSpace).trim();
+    const value = body.slice(firstSpace + 1).trim();
+    if (!key || !value) {
+      return undefined;
+    }
+    return { key, value };
+  }
+
+  private maskEnvValueForDisplay(key: string, value: string): string {
+    if (key === "CLAWHUB_WORKDIR") {
+      return value;
+    }
+    if (!value) {
+      return "(empty)";
+    }
+    const upperKey = key.toUpperCase();
+    if (/(KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL)/.test(upperKey)) {
+      if (value.length <= 6) {
+        return "*".repeat(value.length);
+      }
+      return `${value.slice(0, 3)}***${value.slice(-2)}`;
+    }
+    if (value.length > 96) {
+      return `${value.slice(0, 48)}...(len=${value.length})`;
+    }
+    return value;
+  }
+
   private async resolveOpenClawRouteScope(
     selectionKey: string,
     userScope: RouterUserScope,
   ): Promise<OpenClawRouteScope> {
     const selected = this.chatOpenClawRouteScopes.get(selectionKey);
-    const personalLabel = await this.displayUserName(userScope.userKey);
+    const personalLabel = await this.displayLinuxUser(userScope.userKey);
     if (!selected || selected.kind === "personal") {
       return {
         kind: "personal",
@@ -5723,12 +6099,146 @@ class TfclawCommandRouter {
     const cmd = (cmdRaw ?? "").toLowerCase();
     const argsText = rest.join(" ").trim();
 
+    if (cmd === "tfapikey") {
+      const parsed = this.parseEnvSetArgs(argsText);
+      if (!parsed) {
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          "usage: /tfapikey <ENV_KEY> <api_key>\nexample: /tfapikey OPENAI_API_KEY sk-xxx",
+        );
+        return true;
+      }
+      try {
+        const saved = await this.openclawBridge.setUserPrivateEnvVar(
+          userScope.userKey,
+          parsed.key,
+          parsed.value,
+        );
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `private api key saved: ${saved.key} (value hidden)\nopenclaw restarted for this user\nenv file: ${saved.envFilePath}`,
+        );
+      } catch (error) {
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `tfapikey failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return true;
+    }
+
+    if (cmd === "tfenv") {
+      const trimmedArgs = argsText.trim();
+      const [actionRaw, ...restArgs] = trimmedArgs ? trimmedArgs.split(/\s+/) : [];
+      const action = (actionRaw ?? "list").toLowerCase();
+
+      if (!trimmedArgs || action === "list" || action === "ls" || action === "show" || action === "status") {
+        try {
+          const envInfo = await this.openclawBridge.listUserPrivateEnvVars(userScope.userKey);
+          const rows = Object.entries(envInfo.vars)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([key, value]) => `- ${key}=${this.maskEnvValueForDisplay(key, value)}`);
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            rows.length > 0 ? `private env vars:\n${rows.join("\n")}\nenv file: ${envInfo.envFilePath}` : "private env vars: (none)",
+          );
+        } catch (error) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `tfenv list failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return true;
+      }
+
+      if (action === "unset" || action === "remove" || action === "rm" || action === "delete") {
+        const key = restArgs.join(" ").trim();
+        if (!key) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            "usage: /tfenv unset <ENV_KEY>",
+          );
+          return true;
+        }
+        try {
+          const result = await this.openclawBridge.unsetUserPrivateEnvVar(userScope.userKey, key);
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            result.removed
+              ? `private env removed: ${result.key}\nopenclaw restarted for this user\nenv file: ${result.envFilePath}`
+              : `private env not set: ${result.key}\nenv file: ${result.envFilePath}`,
+          );
+        } catch (error) {
+          await this.replyWithMode(
+            ctx.chatId,
+            ctx.responder,
+            selectionKey,
+            `tfenv unset failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return true;
+      }
+
+      const parsed = this.parseEnvSetArgs(trimmedArgs);
+      if (!parsed) {
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          [
+            "usage:",
+            "/tfenv list",
+            "/tfenv set <ENV_KEY> <value>",
+            "/tfenv set <ENV_KEY>=<value>",
+            "/tfenv unset <ENV_KEY>",
+            "/tfapikey <ENV_KEY> <api_key>",
+          ].join("\n"),
+        );
+        return true;
+      }
+      try {
+        const saved = await this.openclawBridge.setUserPrivateEnvVar(
+          userScope.userKey,
+          parsed.key,
+          parsed.value,
+        );
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `private env saved: ${saved.key} (value hidden)\nopenclaw restarted for this user\nenv file: ${saved.envFilePath}`,
+        );
+      } catch (error) {
+        await this.replyWithMode(
+          ctx.chatId,
+          ctx.responder,
+          selectionKey,
+          `tfenv set failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return true;
+    }
+
     if (cmd === "tfroot") {
       const [actionRaw] = argsText.split(/\s+/, 2);
       const action = (actionRaw ?? "show").toLowerCase();
       if (action === "show" || action === "who" || action === "status") {
         const rootUser = await this.accessManager.getSuperRootUserKey();
-        const rootDisplayName = rootUser ? await this.displayUserName(rootUser) : "";
+        const rootDisplayName = rootUser ? await this.displayLinuxUser(rootUser) : "";
         await this.replyWithMode(
           ctx.chatId,
           ctx.responder,
@@ -5755,9 +6265,9 @@ class TfclawCommandRouter {
           return true;
         }
         const bindings = await this.openclawBridge.listUserBindings();
+        const linuxUsers = new Map(bindings.map((item) => [item.userKey, item.linuxUser]));
         const roles = await this.accessManager.listUsersWithRoles(bindings.map((item) => item.userKey));
-        const displayNames = await this.accessManager.getUserDisplayNames(roles.map((item) => item.userKey));
-        const lines = roles.map((item) => `- ${this.displayUserNameFromMap(item.userKey, displayNames)} | ${this.formatRole(item.role)}`);
+        const lines = roles.map((item) => `- ${this.displayLinuxUserFromMap(item.userKey, linuxUsers)} | ${this.formatRole(item.role)}`);
         await this.replyWithMode(
           ctx.chatId,
           ctx.responder,
@@ -5779,7 +6289,7 @@ class TfclawCommandRouter {
         }
         try {
           await this.accessManager.setAdmin(userScope.userKey, targetUser, action === "add");
-          const targetDisplayName = await this.displayUserName(targetUser);
+          const targetDisplayName = await this.displayLinuxUser(targetUser);
           await this.replyWithMode(
             ctx.chatId,
             ctx.responder,
@@ -5811,10 +6321,10 @@ class TfclawCommandRouter {
         return true;
       }
       const bindings = await this.openclawBridge.listUserBindings();
+      const linuxUsers = new Map(bindings.map((item) => [item.userKey, item.linuxUser]));
       const roles = await this.accessManager.listUsersWithRoles(bindings.map((item) => item.userKey));
-      const displayNames = await this.accessManager.getUserDisplayNames(roles.map((item) => item.userKey));
       const rows = roles.map((item) =>
-        `- ${this.displayUserNameFromMap(item.userKey, displayNames)} | ${this.formatRole(item.role)}`);
+        `- ${this.displayLinuxUserFromMap(item.userKey, linuxUsers)} | ${this.formatRole(item.role)}`);
       await this.replyWithMode(
         ctx.chatId,
         ctx.responder,
@@ -5926,7 +6436,7 @@ class TfclawCommandRouter {
           const group = action === "add"
             ? await this.accessManager.addGroupMember(userScope.userKey, groupName, targetUser)
             : await this.accessManager.removeGroupMember(userScope.userKey, groupName, targetUser);
-          const targetDisplayName = await this.displayUserName(targetUser);
+          const targetDisplayName = await this.displayLinuxUser(targetUser);
           await this.replyWithMode(
             ctx.chatId,
             ctx.responder,
@@ -5986,7 +6496,7 @@ class TfclawCommandRouter {
       }
       if (action === "personal" || action === "user") {
         this.chatOpenClawRouteScopes.delete(selectionKey);
-        const selfDisplayName = await this.displayUserName(userScope.userKey);
+        const selfDisplayName = await this.displayLinuxUser(userScope.userKey);
         await this.replyWithMode(
           ctx.chatId,
           ctx.responder,
@@ -6589,6 +7099,24 @@ class TfclawCommandRouter {
         if (shouldSendAsImage) {
           await ctx.responder.replyImage(ctx.chatId, mediaBase64);
           continue;
+        }
+
+        const normalizedMimeType = (media.mimeType || "").trim().toLowerCase();
+        const looksLikeAudio = normalizedMimeType.startsWith("audio/")
+          || /\.(?:opus|ogg|mp3|wav|m4a|aac|flac|amr)$/i.test(media.fileName || "");
+        if (looksLikeAudio && typeof ctx.responder.replyAudio === "function") {
+          try {
+            await ctx.responder.replyAudio(
+              ctx.chatId,
+              mediaBase64,
+              media.fileName || `openclaw-${Date.now()}.opus`,
+              media.mimeType,
+            );
+            continue;
+          } catch (audioError) {
+            const msg = audioError instanceof Error ? audioError.message : String(audioError);
+            console.warn(`[gateway] feishu audio send failed, fallback to file: ${msg}`);
+          }
         }
 
         if (typeof ctx.responder.replyFile === "function") {
@@ -7404,46 +7932,166 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       throw new Error("feishu client not initialized");
     }
 
-    const normalizedChatType = toString(options?.chatType).trim().toLowerCase();
+    const normalizedText = text.replace(/\r/g, "");
     const replyToMessageId = toString(options?.replyToMessageId).trim();
-    if (normalizedChatType === "group" && replyToMessageId) {
+    const payload = this.buildFeishuTextPayload(normalizedText);
+
+    if (replyToMessageId) {
       try {
         const replyResult = await this.larkClient.im.v1.message.reply({
           path: {
             message_id: replyToMessageId,
           },
           data: {
-            msg_type: "text",
-            content: JSON.stringify({ text }),
+            msg_type: payload.msgType,
+            content: payload.content,
           },
         });
         const replyObj = toObject(replyResult);
-        const replyDataObj = toObject(replyObj.data);
+        if (this.shouldFallbackFromReplyTarget(replyObj)) {
+          return this.sendFeishuDirectMessage(chatId, payload.msgType, payload.content);
+        }
+        this.assertFeishuMessageApiSuccess(replyResult, "feishu reply failed");
         return {
-          messageId: toString(replyDataObj.message_id) || toString(replyObj.message_id),
+          messageId: this.extractFeishuMessageId(replyResult),
         };
       } catch (error) {
-        console.warn(
-          `[gateway] feishu group reply failed, fallback to chat send: ${describeSdkError(error)} | chat_id=${chatId} source_message_id=${replyToMessageId}`,
-        );
+        if (this.isWithdrawnReplyError(error)) {
+          return this.sendFeishuDirectMessage(chatId, payload.msgType, payload.content);
+        }
+        throw new Error(`feishu reply failed: ${describeSdkError(error)} | chat_id=${chatId} source_message_id=${replyToMessageId}`);
       }
     }
 
+    return this.sendFeishuDirectMessage(chatId, payload.msgType, payload.content);
+  }
+
+  private extractFeishuMessageId(result: unknown): string | undefined {
+    const resultObj = toObject(result);
+    const dataObj = toObject(resultObj.data);
+    return toString(dataObj.message_id) || toString(resultObj.message_id) || undefined;
+  }
+
+  private resolveFeishuRenderMode(): FeishuRenderMode {
+    const mode = this.config.renderMode.trim().toLowerCase();
+    if (mode === "raw" || mode === "card") {
+      return mode;
+    }
+    return "auto";
+  }
+
+  private shouldUseFeishuCard(text: string): boolean {
+    return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+  }
+
+  private buildFeishuPostMessagePayload(text: string): { msgType: "post"; content: string } {
+    return {
+      msgType: "post",
+      content: JSON.stringify({
+        zh_cn: {
+          content: [
+            [
+              {
+                tag: "md",
+                text,
+              },
+            ],
+          ],
+        },
+      }),
+    };
+  }
+
+  private buildFeishuMarkdownCardContent(text: string): string {
+    return JSON.stringify({
+      schema: "2.0",
+      config: {
+        wide_screen_mode: true,
+      },
+      body: {
+        elements: [
+          {
+            tag: "markdown",
+            content: text,
+          },
+        ],
+      },
+    });
+  }
+
+  private buildFeishuTextPayload(text: string): { msgType: "post" | "interactive"; content: string } {
+    const renderMode = this.resolveFeishuRenderMode();
+    const useCard = renderMode === "card" || (renderMode === "auto" && this.shouldUseFeishuCard(text));
+    if (useCard) {
+      return {
+        msgType: "interactive",
+        content: this.buildFeishuMarkdownCardContent(text),
+      };
+    }
+    return this.buildFeishuPostMessagePayload(text);
+  }
+
+  private shouldFallbackFromReplyTarget(response: Record<string, unknown>): boolean {
+    const code = response.code;
+    if (typeof code === "number" && FEISHU_WITHDRAWN_REPLY_ERROR_CODES.has(code)) {
+      return true;
+    }
+    const msg = toString(response.msg).toLowerCase();
+    return msg.includes("withdrawn") || msg.includes("not found");
+  }
+
+  private isWithdrawnReplyError(error: unknown): boolean {
+    if (!error || typeof error !== "object") {
+      return false;
+    }
+    const errObj = error as {
+      code?: unknown;
+      response?: {
+        data?: {
+          code?: unknown;
+        };
+      };
+    };
+    if (typeof errObj.code === "number" && FEISHU_WITHDRAWN_REPLY_ERROR_CODES.has(errObj.code)) {
+      return true;
+    }
+    const nestedCode = errObj.response?.data?.code;
+    if (typeof nestedCode === "number" && FEISHU_WITHDRAWN_REPLY_ERROR_CODES.has(nestedCode)) {
+      return true;
+    }
+    return false;
+  }
+
+  private assertFeishuMessageApiSuccess(response: unknown, errorPrefix: string): void {
+    const obj = toObject(response);
+    const code = obj.code;
+    if (typeof code === "number" && code !== 0) {
+      const msg = toString(obj.msg) || `code ${code}`;
+      throw new Error(`${errorPrefix}: ${msg}`);
+    }
+  }
+
+  private async sendFeishuDirectMessage(
+    chatId: string,
+    msgType: "post" | "interactive",
+    content: string,
+  ): Promise<{ messageId?: string }> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
     const result = await this.larkClient.im.v1.message.create({
       params: {
         receive_id_type: "chat_id",
       },
       data: {
         receive_id: chatId,
-        msg_type: "text",
-        content: JSON.stringify({ text }),
+        msg_type: msgType,
+        content,
       },
     });
-
-    const resultObj = toObject(result);
-    const dataObj = toObject(resultObj.data);
+    this.assertFeishuMessageApiSuccess(result, "feishu send failed");
     return {
-      messageId: toString(dataObj.message_id) || toString(resultObj.message_id),
+      messageId: this.extractFeishuMessageId(result),
     };
   }
 
@@ -7471,6 +8119,9 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       },
       replyImage: async (chatId: string, imageBase64: string): Promise<void> => {
         await this.replyImage(chatId, imageBase64);
+      },
+      replyAudio: async (chatId: string, audioBase64: string, fileName?: string, mimeType?: string): Promise<void> => {
+        await this.replyAudio(chatId, audioBase64, fileName, mimeType);
       },
       replyFile: async (chatId: string, fileBase64: string, fileName: string, mimeType?: string): Promise<void> => {
         await this.replyFile(chatId, fileBase64, fileName, mimeType);
@@ -7659,6 +8310,86 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       });
     } catch (error) {
       throw new Error(`feishu file message send failed: ${describeSdkError(error)} | file_key=${fileKey}`);
+    }
+  }
+
+  async replyAudio(
+    chatId: string,
+    audioBase64: string,
+    fileName?: string,
+    _mimeType?: string,
+  ): Promise<void> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+
+    const audioBuffer = Buffer.from(audioBase64, "base64");
+    if (audioBuffer.byteLength === 0) {
+      throw new Error("empty audio");
+    }
+    if (audioBuffer.byteLength > FEISHU_MAX_FILE_BYTES) {
+      throw new Error("audio too large (>30MB)");
+    }
+
+    const safeFileName = path.basename(fileName || `openclaw-${Date.now()}.opus`)
+      .replace(/[\/\\]/g, "_")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim() || `openclaw-${Date.now()}.opus`;
+    const uploadFileName = safeFileName.slice(0, 120) || `openclaw-${Date.now()}.opus`;
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `tfclaw-feishu-${Date.now()}-${Math.random().toString(16).slice(2)}.opus`,
+    );
+    fs.writeFileSync(tmpPath, audioBuffer);
+
+    let uploadResult: unknown;
+    let audioStream: fs.ReadStream | undefined;
+    try {
+      audioStream = fs.createReadStream(tmpPath);
+      uploadResult = await this.larkClient.im.v1.file.create({
+        data: {
+          file_type: "opus",
+          file_name: uploadFileName,
+          file: audioStream,
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu audio upload failed: ${describeSdkError(error)}`);
+    } finally {
+      try {
+        audioStream?.destroy();
+      } catch {
+        // no-op
+      }
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // no-op
+      }
+    }
+
+    const uploadObj = toObject(uploadResult);
+    const uploadData = toObject(uploadObj.data);
+    const fileKey = toString(uploadObj.file_key) || toString(uploadData.file_key);
+    if (!fileKey) {
+      const code = toString(uploadObj.code);
+      const msg = toString(uploadObj.msg);
+      throw new Error(`failed to upload audio${code || msg ? `: code=${code || "unknown"} msg=${msg || "unknown"}` : ""}`);
+    }
+
+    try {
+      await this.larkClient.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          msg_type: "audio",
+          content: JSON.stringify({ file_key: fileKey }),
+        },
+      });
+    } catch (error) {
+      throw new Error(`feishu audio message send failed: ${describeSdkError(error)} | file_key=${fileKey}`);
     }
   }
 
@@ -8292,7 +9023,10 @@ async function bootstrap(): Promise<void> {
   const relay = new RelayBridge(loaded.config.relay.url, loaded.config.relay.token, "feishu");
   const nexChatBridge = new NexChatBridgeClient(loaded.config.nexchatbot);
   const openclawBridge = new OpenClawPerUserBridge(loaded.config.openclawBridge);
-  const accessManager = new TfclawAccessManager(loaded.config.openclawBridge.stateDir);
+  const accessManager = new TfclawAccessManager(
+    loaded.config.openclawBridge.stateDir,
+    loaded.config.openclawBridge.userHomeRoot,
+  );
   const configuredSuperRoot = accessManager.readConfiguredSuperRootIdentifier();
   if (configuredSuperRoot) {
     const bindings = await openclawBridge.listUserBindings();

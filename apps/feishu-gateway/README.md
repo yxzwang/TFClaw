@@ -25,7 +25,7 @@ cp config.example.json config.json
 - `openclawBridge.openclawRoot`
 - `openclawBridge.stateDir`
 - `openclawBridge.sharedSkillsDir`（公用 skills 目录）
-- `openclawBridge.userHomeRoot`（子用户 home 根目录）
+- `openclawBridge.userHomeRoot`（子用户 home 根目录，支持相对 `config.json` 目录；默认 `.home`）
 - `openclawBridge.userPrefix`
 - `openclawBridge.tmuxSessionPrefix`
 - `openclawBridge.gatewayPortBase`
@@ -118,6 +118,8 @@ npm run start:gateway
 - `/tfadmin list|add|remove ...`
 - `/tfusers`
 - `/tfroot show`（只读，`/tfroot set` 已禁用）
+- `/tfenv list|set|unset ...`（管理当前用户私有 env）
+- `/tfapikey <ENV_KEY> <api_key>`（将 API Key 写入当前用户私有 env）
 
 ### 权限与参数说明
 
@@ -127,3 +129,4 @@ npm run start:gateway
   - 飞书用户名（如 `汪燠欣`）
   - Linux 用户名（如 `tfoc_xxx`）
   - `me`
+- `/tfenv` 与 `/tfapikey` 仅作用于当前发送消息用户，不会修改其他用户环境变量。
