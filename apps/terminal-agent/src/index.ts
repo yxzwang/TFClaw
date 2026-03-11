@@ -68,6 +68,7 @@ interface TmuxControlState {
   waitMs: number;
   streamMode: TmuxStreamMode;
   paneIndexMap: Record<string, string>;
+  paneBootstrapRequested?: boolean;
 }
 
 interface TmuxPaneRow {
@@ -1455,6 +1456,9 @@ function getTmuxControlState(sessionKeyRaw: string | undefined): TmuxControlStat
   const sessionKey = normalizeControlSessionKey(sessionKeyRaw);
   const existing = tmuxControlStateBySession.get(sessionKey);
   if (existing) {
+    if (!existing.paneBootstrapRequested) {
+      queueSilentTmuxPaneRefresh(sessionKey);
+    }
     return existing;
   }
 
@@ -1466,14 +1470,52 @@ function getTmuxControlState(sessionKeyRaw: string | undefined): TmuxControlStat
     waitMs: 250,
     streamMode: "auto",
     paneIndexMap: {},
+    paneBootstrapRequested: false,
   };
   tmuxControlStateBySession.set(sessionKey, state);
+  queueSilentTmuxPaneRefresh(sessionKey);
   return state;
 }
 
 function updateTmuxControlState(sessionKeyRaw: string | undefined, state: TmuxControlState): void {
   const sessionKey = normalizeControlSessionKey(sessionKeyRaw);
   tmuxControlStateBySession.set(sessionKey, state);
+}
+
+function queueSilentTmuxPaneRefresh(sessionKeyRaw: string | undefined): void {
+  const sessionKey = normalizeControlSessionKey(sessionKeyRaw);
+  const state = tmuxControlStateBySession.get(sessionKey);
+  if (!state || state.paneBootstrapRequested) {
+    return;
+  }
+  state.paneBootstrapRequested = true;
+  tmuxControlStateBySession.set(sessionKey, state);
+
+  void (async (): Promise<void> => {
+    const latest = tmuxControlStateBySession.get(sessionKey);
+    if (!latest) {
+      return;
+    }
+    const listed = await listTmuxPanesData(latest.socket || undefined);
+    if (listed.error) {
+      return;
+    }
+
+    const nextMap: Record<string, string> = {};
+    listed.panes.forEach((pane, index) => {
+      nextMap[String(index + 1)] = pane.target;
+    });
+
+    const current = tmuxControlStateBySession.get(sessionKey);
+    if (!current) {
+      return;
+    }
+    current.paneIndexMap = nextMap;
+    tmuxControlStateBySession.set(sessionKey, current);
+  })().catch((error) => {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.warn(`[terminal-agent] silent tmux panes bootstrap failed: ${msg}`);
+  });
 }
 
 function formatTmuxStatus(state: TmuxControlState): string {
@@ -1705,6 +1747,18 @@ async function captureTmuxTarget(target: string, lines = 120, socketPath?: strin
   return out || "(pane has no output)";
 }
 
+async function captureTmuxSnapshot(target: string, socketPath?: string): Promise<string> {
+  const result = await runTmuxControl(
+    ["capture-pane", "-p", "-J", "-t", target],
+    socketPath,
+  );
+  if (!result.ok) {
+    return result.output;
+  }
+  const out = result.output.trimEnd();
+  return out || "(pane has no output)";
+}
+
 async function tmuxPaneCurrentCommand(target: string, socketPath?: string): Promise<string> {
   const result = await runTmuxControl(
     ["display-message", "-p", "-t", target, "#{pane_current_command}"],
@@ -1756,12 +1810,18 @@ function formatTmuxUpdateMessage(target: string, content: string): string {
   return `[tmux ${target} update]\n${trimCommandOutput(body)}`;
 }
 
+function formatTmuxSnapshotMessage(target: string, content: string): string {
+  const body = (content.trim() || "(pane snapshot)");
+  return `[tmux ${target}]\n${trimCommandOutput(body)}`;
+}
+
 async function streamCaptureUpdates(
   target: string,
   initialCapture: string,
   captureLines: number,
   socketPath: string | undefined,
   onUpdate: ((content: string) => Promise<void>) | undefined,
+  snapshotOnly = false,
 ): Promise<string> {
   const windowMs = Math.max(0, TMUX_STREAM_WINDOW_MS);
   if (windowMs <= 0) {
@@ -1779,7 +1839,9 @@ async function streamCaptureUpdates(
 
   while (Date.now() - startedAt < windowMs) {
     await sleepMs(pollMs);
-    const current = await captureTmuxTarget(target, captureLines, socketPath);
+    const current = snapshotOnly
+      ? await captureTmuxSnapshot(target, socketPath)
+      : await captureTmuxTarget(target, captureLines, socketPath);
     if (current.startsWith("Error:")) {
       return current;
     }
@@ -1907,6 +1969,14 @@ async function tmuxPassthrough(
     return "Error: empty command";
   }
 
+  let baselineCapture = "";
+  if (streamMode !== "off") {
+    baselineCapture = await captureTmuxTarget(target, captureLines, socketPath);
+    if (baselineCapture.startsWith("Error:")) {
+      baselineCapture = "";
+    }
+  }
+
   const sendError = await sendLiteralToTmux(target, text, socketPath, true);
   if (sendError) {
     return sendError;
@@ -1921,7 +1991,27 @@ async function tmuxPassthrough(
   if (streamMode !== "off") {
     const streamEnabled = streamMode === "on" || await shouldStreamTmuxUpdates(target, socketPath);
     if (streamEnabled) {
-      capture = await streamCaptureUpdates(target, capture, captureLines, socketPath, onUpdate);
+      if (onUpdate) {
+        try {
+          if (baselineCapture) {
+            await onUpdate(formatTmuxSnapshotMessage(target, baselineCapture));
+          } else {
+            await onUpdate(formatTmuxSnapshotMessage(target, capture));
+          }
+        } catch {
+          // Ignore progress callback failures.
+        }
+      }
+      if (onUpdate && baselineCapture && capture !== baselineCapture) {
+        const delta = captureDelta(baselineCapture, capture);
+        const chunk = delta || capture;
+        try {
+          await onUpdate(formatTmuxUpdateMessage(target, chunk));
+        } catch {
+          // Ignore progress callback failures.
+        }
+      }
+      capture = await streamCaptureUpdates(target, capture, captureLines, socketPath, onUpdate, false);
     }
   }
 
@@ -1937,6 +2027,14 @@ async function tmuxKeyPassthrough(
   streamMode: TmuxStreamMode,
   onUpdate?: TmuxProgressCallback,
 ): Promise<string> {
+  let baselineCapture = "";
+  if (streamMode !== "off") {
+    baselineCapture = await captureTmuxTarget(target, captureLines, socketPath);
+    if (baselineCapture.startsWith("Error:")) {
+      baselineCapture = "";
+    }
+  }
+
   const sendError = await sendKeysToTmux(target, keys, socketPath);
   if (sendError) {
     return sendError;
@@ -1951,7 +2049,27 @@ async function tmuxKeyPassthrough(
   if (streamMode !== "off") {
     const streamEnabled = streamMode === "on" || await shouldStreamTmuxUpdates(target, socketPath);
     if (streamEnabled) {
-      capture = await streamCaptureUpdates(target, capture, captureLines, socketPath, onUpdate);
+      if (onUpdate) {
+        try {
+          if (baselineCapture) {
+            await onUpdate(formatTmuxSnapshotMessage(target, baselineCapture));
+          } else {
+            await onUpdate(formatTmuxSnapshotMessage(target, capture));
+          }
+        } catch {
+          // Ignore progress callback failures.
+        }
+      }
+      if (onUpdate && baselineCapture && capture !== baselineCapture) {
+        const delta = captureDelta(baselineCapture, capture);
+        const chunk = delta || capture;
+        try {
+          await onUpdate(formatTmuxUpdateMessage(target, chunk));
+        } catch {
+          // Ignore progress callback failures.
+        }
+      }
+      capture = await streamCaptureUpdates(target, capture, captureLines, socketPath, onUpdate, false);
     }
   }
 
@@ -1975,7 +2093,7 @@ async function handlePassthroughCommand(sessionKey: string, rawCommand: string):
     updateTmuxControlState(sessionKey, state);
     const socketPath = state.socket || undefined;
     const target = state.target.trim();
-    const capture = await captureTmuxTarget(target, state.captureLines, socketPath);
+    const capture = await captureTmuxSnapshot(target, socketPath);
     return (
       "Passthrough enabled.\n"
       + `Commands will be sent literally to tmux target \`${target}\`.\n`
@@ -2090,7 +2208,7 @@ async function handleTmuxCommand(
     state.target = resolved.target!;
     updateTmuxControlState(sessionKey, state);
     const target = state.target.trim();
-    const capture = await captureTmuxTarget(target, state.captureLines, socketPath);
+    const capture = await captureTmuxSnapshot(target, socketPath);
     return `Target set to \`${target}\`.\n\n[tmux ${target}]\n${capture}`;
   }
 

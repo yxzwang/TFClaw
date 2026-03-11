@@ -184,6 +184,9 @@ interface MessageResponder {
   replyFile?(chatId: string, fileName: string, fileData: Buffer, mimeType?: string): Promise<void>;
   replyTextWithMeta?(chatId: string, text: string): Promise<{ messageId?: string }>;
   deleteMessage?(messageId: string): Promise<void>;
+  startStreamingCard?(chatId: string): Promise<void>;
+  updateStreamingCard?(chatId: string, text: string): Promise<void>;
+  finishStreamingCard?(chatId: string, finalText?: string): Promise<void>;
 }
 
 interface InboundTextContext {
@@ -217,6 +220,8 @@ interface TerminalProgressSession {
   startedAt: number;
   busy: boolean;
   lastProgressMessageId?: string;
+  streamingCardEnabled?: boolean;
+  streamingCardStarted?: boolean;
 }
 
 interface CommandProgressSession {
@@ -227,10 +232,15 @@ interface CommandProgressSession {
   queue: Promise<void>;
   lastProgressMessageId?: string;
   lastProgressBody?: string;
+  streamingCardEnabled?: boolean;
   streamMode?: "auto" | "on" | "off";
   streamOffIntroSent?: boolean;
   streamOffFinalSent?: boolean;
   streamOffFinalizeTimer?: NodeJS.Timeout;
+  tmuxTarget?: string;
+  tmuxPinnedSnapshot?: string;
+  tmuxLiveTail?: string;
+  tmuxSawUpdate?: boolean;
 }
 
 interface ChatApp {
@@ -302,6 +312,15 @@ const FILE_TRANSFER_MAX_BYTES = Math.max(
 const FEISHU_MAX_UPLOAD_FILE_BYTES = 30 * 1024 * 1024;
 const FEISHU_ACK_REACTION = toString(process.env.TFCLAW_FEISHU_ACK_REACTION, "OnIt").trim() || "OnIt";
 const FEISHU_ACK_REACTION_ENABLED = toBoolean(process.env.TFCLAW_FEISHU_ACK_REACTION_ENABLED, true);
+const FEISHU_STREAMING_CARD_UPDATE_THROTTLE_MS = Math.max(
+  80,
+  Math.min(1000, toNumber(process.env.TFCLAW_FEISHU_STREAMING_CARD_UPDATE_THROTTLE_MS, 120)),
+);
+const TMUX_CAPTURE_LINES_DEFAULT = 120;
+const TMUX_CAPTURE_LINES_MIN = 20;
+const TMUX_CAPTURE_LINES_MAX = 5000;
+const STREAMING_CARD_FIXED_BEGIN = "[[TFCLAW_FIXED_BEGIN]]";
+const STREAMING_CARD_FIXED_END = "[[TFCLAW_FIXED_END]]";
 
 function toBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") {
@@ -1171,6 +1190,7 @@ class RelayBridge {
 class TfclawCommandRouter {
   private chatTerminalSelection = new Map<string, string>();
   private chatTmuxTarget = new Map<string, string>();
+  private chatTmuxCaptureLines = new Map<string, number>();
   private chatTmuxStreamMode = new Map<string, "auto" | "on" | "off">();
   private chatPassthroughEnabled = new Map<string, boolean>();
   private chatCaptureSelections = new Map<string, ChatCaptureSelection>();
@@ -1259,6 +1279,14 @@ class TfclawCommandRouter {
     return line.trim().toLowerCase().replace(/\s+/g, " ");
   }
 
+  private normalizeTmuxCaptureLines(value: number): number {
+    return Math.max(TMUX_CAPTURE_LINES_MIN, Math.min(value, TMUX_CAPTURE_LINES_MAX));
+  }
+
+  private tmuxCaptureLinesFor(selectionKey: string): number {
+    return this.chatTmuxCaptureLines.get(selectionKey) ?? TMUX_CAPTURE_LINES_DEFAULT;
+  }
+
   private extractTmuxTarget(output: string): string | undefined {
     const source = output.trim();
     if (!source) {
@@ -1305,11 +1333,40 @@ class TfclawCommandRouter {
     return undefined;
   }
 
+  private extractTmuxCaptureLines(output: string): number | undefined {
+    const source = output.trim();
+    if (!source) {
+      return undefined;
+    }
+
+    const patterns = [
+      /- capture_lines:\s*(\d+)\b/i,
+      /capture_lines set to\s*(\d+)\b/i,
+      /current capture_lines:\s*(\d+)\b/i,
+    ];
+    for (const pattern of patterns) {
+      const match = source.match(pattern);
+      if (!match?.[1]) {
+        continue;
+      }
+      const parsed = Number.parseInt(match[1], 10);
+      if (!Number.isInteger(parsed)) {
+        continue;
+      }
+      return this.normalizeTmuxCaptureLines(parsed);
+    }
+    return undefined;
+  }
+
   private updateModeFromResult(selectionKey: string, rawCommand: string, output: string): void {
     const command = this.normalizeCommandLine(rawCommand);
     const target = this.extractTmuxTarget(output);
     if (target) {
       this.chatTmuxTarget.set(selectionKey, target);
+    }
+    const captureLines = this.extractTmuxCaptureLines(output);
+    if (captureLines) {
+      this.chatTmuxCaptureLines.set(selectionKey, captureLines);
     }
     const streamMode = this.extractTmuxStreamMode(output);
     if (streamMode) {
@@ -1379,6 +1436,26 @@ class TfclawCommandRouter {
     return normalized.length > 0 && REALTIME_FOREGROUND_COMMANDS.has(normalized);
   }
 
+  private supportsStreamingCard(
+    responder: MessageResponder,
+  ): responder is MessageResponder & {
+    startStreamingCard: (chatId: string) => Promise<void>;
+    updateStreamingCard: (chatId: string, text: string) => Promise<void>;
+    finishStreamingCard: (chatId: string, finalText?: string) => Promise<void>;
+  } {
+    return (
+      typeof responder.startStreamingCard === "function"
+      && typeof responder.updateStreamingCard === "function"
+      && typeof responder.finishStreamingCard === "function"
+    );
+  }
+
+  private composeModePayload(selectionKey: string, body: string): string {
+    const head = `[mode] ${this.modeTag(selectionKey)}`;
+    const content = body.trim();
+    return content ? `${head}\n${content}` : head;
+  }
+
   private async replyWithMode(
     chatId: string,
     responder: MessageResponder,
@@ -1394,9 +1471,7 @@ class TfclawCommandRouter {
     selectionKey: string,
     body: string,
   ): Promise<{ messageId?: string }> {
-    const head = `[mode] ${this.modeTag(selectionKey)}`;
-    const content = body.trim();
-    const payload = content ? `${head}\n${content}` : head;
+    const payload = this.composeModePayload(selectionKey, body);
     if (typeof responder.replyTextWithMeta === "function") {
       return (await responder.replyTextWithMeta(chatId, payload)) ?? {};
     }
@@ -1409,11 +1484,23 @@ class TfclawCommandRouter {
     if (!session) {
       return;
     }
+    if (
+      session.streamingCardEnabled
+      && session.streamingCardStarted
+      && this.supportsStreamingCard(session.responder)
+    ) {
+      void session.responder
+        .finishStreamingCard(session.chatId)
+        .catch((error) => console.warn(`[gateway] feishu streaming card finish failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
     clearInterval(session.timer);
     this.progressSessions.delete(selectionKey);
   }
 
   private scheduleDeleteMessage(responder: MessageResponder, messageId: string): void {
+    if (this.supportsStreamingCard(responder)) {
+      return;
+    }
     if (!messageId || typeof responder.deleteMessage !== "function") {
       return;
     }
@@ -1425,6 +1512,17 @@ class TfclawCommandRouter {
   }
 
   private async sendProgressUpdate(session: TerminalProgressSession, body: string): Promise<void> {
+    if (session.streamingCardEnabled && this.supportsStreamingCard(session.responder)) {
+      if (!session.streamingCardStarted) {
+        await session.responder.startStreamingCard(session.chatId);
+        session.streamingCardStarted = true;
+      }
+      await session.responder.updateStreamingCard(
+        session.chatId,
+        this.composeModePayload(session.selectionKey, body),
+      );
+      return;
+    }
     const previousMessageId = session.lastProgressMessageId;
     const meta = await this.replyWithModeMeta(session.chatId, session.responder, session.selectionKey, body);
     const currentMessageId = meta.messageId;
@@ -1447,6 +1545,7 @@ class TfclawCommandRouter {
       this.stopCommandProgressSession(previousRequestId, true);
     }
 
+    const streamingCardEnabled = this.supportsStreamingCard(responder);
     this.activeCommandRequestBySelection.set(selectionKey, requestId);
     this.commandProgressSessions.set(requestId, {
       requestId,
@@ -1454,6 +1553,7 @@ class TfclawCommandRouter {
       chatId,
       responder,
       queue: Promise.resolve(),
+      streamingCardEnabled,
       streamMode: this.chatTmuxStreamMode.get(selectionKey),
       streamOffIntroSent: false,
       streamOffFinalSent: false,
@@ -1495,6 +1595,14 @@ class TfclawCommandRouter {
           if (effectiveStreamMode !== "off" || !active.streamOffIntroSent || !active.lastProgressBody) {
             return;
           }
+          if (active.streamingCardEnabled && this.supportsStreamingCard(active.responder)) {
+            await active.responder.finishStreamingCard(
+              active.chatId,
+              this.composeModePayload(active.selectionKey, active.lastProgressBody),
+            );
+            active.streamOffFinalSent = true;
+            return;
+          }
           await this.replyWithModeMeta(active.chatId, active.responder, active.selectionKey, active.lastProgressBody);
           active.streamOffFinalSent = true;
         })
@@ -1514,6 +1622,13 @@ class TfclawCommandRouter {
       this.activeCommandRequestBySelection.delete(session.selectionKey);
     }
 
+    if (session.streamingCardEnabled && this.supportsStreamingCard(session.responder)) {
+      void session.responder
+        .finishStreamingCard(session.chatId)
+        .catch((error) => console.warn(`[gateway] feishu streaming card finish failed: ${error instanceof Error ? error.message : String(error)}`));
+      return;
+    }
+
     if (recallLastMessage && session.lastProgressMessageId && typeof session.responder.deleteMessage === "function") {
       void session.responder
         .deleteMessage(session.lastProgressMessageId)
@@ -1521,7 +1636,69 @@ class TfclawCommandRouter {
     }
   }
 
-  private queueCommandProgressUpdate(requestId: string, body: string): void {
+  private parseTmuxProgressPayload(body: string): { target: string; isUpdate: boolean; content: string } | undefined {
+    const source = body.trim();
+    if (!source) {
+      return undefined;
+    }
+    const matched = source.match(/^\[tmux ([^\]\r\n]+?)(\s+update)?\][ \t]*\n?([\s\S]*)$/i);
+    if (!matched?.[1]) {
+      return undefined;
+    }
+    return {
+      target: matched[1].trim(),
+      isUpdate: Boolean(matched[2]),
+      content: (matched[3] ?? "").trim(),
+    };
+  }
+
+  private buildTmuxStreamingCardBody(session: CommandProgressSession, body: string): string | undefined {
+    const parsed = this.parseTmuxProgressPayload(body);
+    if (!parsed) {
+      return undefined;
+    }
+    session.tmuxTarget = parsed.target;
+    const content = parsed.content;
+    const captureLines = this.tmuxCaptureLinesFor(session.selectionKey);
+
+    if (!parsed.isUpdate) {
+      const snapshotLines = content
+        .split("\n")
+        .slice(-captureLines);
+      const snapshotText = snapshotLines.join("\n").trimEnd();
+      session.tmuxPinnedSnapshot = snapshotText;
+      if (session.tmuxSawUpdate) {
+        // Final snapshot: collapse live output into fixed area and hide live section.
+        session.tmuxLiveTail = "";
+        session.tmuxSawUpdate = false;
+      } else if (!session.tmuxLiveTail) {
+        // Baseline snapshot at stream start: keep live section empty.
+        session.tmuxLiveTail = "";
+      }
+    } else if (content) {
+      // Keep only the latest dynamic frame so streaming area replaces previous content.
+      session.tmuxLiveTail = content.trim();
+      session.tmuxSawUpdate = true;
+    }
+
+    const fixedBlock = (session.tmuxPinnedSnapshot ?? "").trim();
+    const liveBlock = (session.tmuxLiveTail ?? (parsed.isUpdate ? content : "")).trim();
+    const title = session.tmuxTarget || parsed.target || "target";
+    const lines = [`# tmux ${title}`];
+    if (fixedBlock) {
+      lines.push(STREAMING_CARD_FIXED_BEGIN);
+      lines.push(fixedBlock);
+      lines.push(STREAMING_CARD_FIXED_END);
+    }
+    if (liveBlock) {
+      lines.push("");
+      lines.push("[live]");
+      lines.push(liveBlock);
+    }
+    return lines.join("\n").trim();
+  }
+
+  private queueCommandProgressUpdate(requestId: string, body: string, progressSource?: string): void {
     const session = this.commandProgressSessions.get(requestId);
     if (!session) {
       return;
@@ -1542,10 +1719,44 @@ class TfclawCommandRouter {
           return;
         }
         const effectiveStreamMode = active.streamMode ?? this.chatTmuxStreamMode.get(active.selectionKey);
-        if (active.lastProgressBody === nextBody) {
+        const source = (progressSource ?? "").trim().toLowerCase();
+        const cardTmuxBody = source === "tmux"
+          ? this.buildTmuxStreamingCardBody(active, nextBody)
+          : undefined;
+        const snapshotView = this.renderSelectionSnapshotView(active.selectionKey, 1800);
+        const nextDisplayBody = cardTmuxBody
+          ?? (snapshotView
+            ? `# ${snapshotView.title}\n${snapshotView.body}`
+            : nextBody);
+        if (active.lastProgressBody === nextDisplayBody) {
           if (effectiveStreamMode === "off" && active.streamOffIntroSent) {
             this.scheduleStreamOffFinalMessage(requestId);
           }
+          return;
+        }
+
+        if (active.streamingCardEnabled && this.supportsStreamingCard(active.responder)) {
+          if (effectiveStreamMode === "off") {
+            active.streamMode = "off";
+            active.lastProgressBody = nextDisplayBody;
+            active.streamOffFinalSent = false;
+            if (!active.streamOffIntroSent) {
+              await active.responder.startStreamingCard(active.chatId);
+              await active.responder.updateStreamingCard(
+                active.chatId,
+                this.composeModePayload(active.selectionKey, "TFClaw is generating..."),
+              );
+              active.streamOffIntroSent = true;
+            }
+            this.scheduleStreamOffFinalMessage(requestId);
+            return;
+          }
+
+          active.lastProgressBody = nextDisplayBody;
+          await active.responder.updateStreamingCard(
+            active.chatId,
+            this.composeModePayload(active.selectionKey, nextDisplayBody),
+          );
           return;
         }
 
@@ -1621,6 +1832,19 @@ class TfclawCommandRouter {
       && progressSession?.lastProgressBody
         ? progressSession.lastProgressBody
         : body;
+    if (progressSession?.streamingCardEnabled && this.supportsStreamingCard(progressSession.responder)) {
+      const tmuxFinalBody = this.buildTmuxStreamingCardBody(progressSession, finalBody);
+      if (tmuxFinalBody) {
+        progressSession.lastProgressBody = tmuxFinalBody;
+      }
+      const cardFinalBody = progressSession.lastProgressBody ?? tmuxFinalBody ?? finalBody;
+      await progressSession.responder.finishStreamingCard(
+        progressSession.chatId,
+        this.composeModePayload(progressSession.selectionKey, cardFinalBody),
+      );
+      progressSession.streamOffFinalSent = true;
+      return;
+    }
     const previousProgressMessageId = progressSession?.lastProgressMessageId;
     const meta = await this.replyWithModeMeta(chatId, responder, selectionKey, finalBody);
     if (previousProgressMessageId && (!meta.messageId || meta.messageId !== previousProgressMessageId)) {
@@ -1657,7 +1881,12 @@ class TfclawCommandRouter {
       return;
     }
 
-    await this.replyWithModeMeta(chatId, responder, selectionKey, "TFClaw is generating...");
+    if (session.streamingCardEnabled && this.supportsStreamingCard(responder)) {
+      await responder.startStreamingCard(chatId);
+      await responder.updateStreamingCard(chatId, this.composeModePayload(selectionKey, "TFClaw is generating..."));
+    } else {
+      await this.replyWithModeMeta(chatId, responder, selectionKey, "TFClaw is generating...");
+    }
     session.streamOffIntroSent = true;
     session.streamOffFinalSent = false;
 
@@ -1693,14 +1922,20 @@ class TfclawCommandRouter {
       return;
     }
 
-    const delta = latest.startsWith(baselineOutput) ? latest.slice(baselineOutput.length) : latest;
-    let finalBody = this.renderOutputForChat(delta, 1800);
+    const snapshotView = this.renderTerminalSnapshotView(terminalId, 1800);
+    let finalBody = snapshotView
+      ? `# ${snapshotView.title}\n${snapshotView.body}`
+      : this.renderOutputForChat(latest, 1800);
     if (!finalBody || finalBody === "(no output yet)") {
       finalBody = fallbackBody;
     }
 
     active.lastProgressBody = finalBody;
-    await this.replyWithModeMeta(chatId, responder, selectionKey, finalBody);
+    if (active.streamingCardEnabled && this.supportsStreamingCard(responder)) {
+      await responder.finishStreamingCard(chatId, this.composeModePayload(selectionKey, finalBody));
+    } else {
+      await this.replyWithModeMeta(chatId, responder, selectionKey, finalBody);
+    }
     active.streamOffFinalSent = true;
   }
 
@@ -1720,6 +1955,10 @@ class TfclawCommandRouter {
       existing.responder = responder;
       existing.lastSnapshot = initialOutput;
       existing.lastChangedAt = now;
+      existing.streamingCardEnabled = this.supportsStreamingCard(responder);
+      if (!existing.streamingCardEnabled) {
+        existing.streamingCardStarted = false;
+      }
       return;
     }
 
@@ -1739,6 +1978,8 @@ class TfclawCommandRouter {
       lastChangedAt: now,
       startedAt: now,
       busy: false,
+      streamingCardEnabled: this.supportsStreamingCard(responder),
+      streamingCardStarted: false,
     };
 
     this.progressSessions.set(selectionKey, session);
@@ -1755,6 +1996,9 @@ class TfclawCommandRouter {
       const now = Date.now();
       if (this.getMode(selectionKey) !== "terminal") {
         this.stopProgressSession(selectionKey);
+        return;
+      }
+      if (this.activeCommandRequestBySelection.has(selectionKey)) {
         return;
       }
       if (now - session.startedAt > this.progressMaxLifetimeMs || now - session.lastChangedAt > this.progressIdleTimeoutMs) {
@@ -1781,11 +2025,10 @@ class TfclawCommandRouter {
         return;
       }
 
-      const delta = current.startsWith(session.lastSnapshot) ? current.slice(session.lastSnapshot.length) : current;
       session.lastSnapshot = current;
       session.lastChangedAt = now;
 
-      const rendered = this.renderOutputForChat(delta, 1800);
+      const rendered = this.renderOutputForChat(current, 1800);
       if (rendered === "(no output yet)") {
         return;
       }
@@ -1834,6 +2077,27 @@ class TfclawCommandRouter {
       }
     }
     return undefined;
+  }
+
+  private renderTerminalSnapshotView(terminalId: string, maxChars = 2200): { title: string; body: string } | undefined {
+    const snapshot = this.relay.cache.snapshots.get(terminalId)?.output;
+    if (typeof snapshot !== "string") {
+      return undefined;
+    }
+    const terminal = this.relay.cache.terminals.get(terminalId);
+    const title = terminal?.title || terminalId;
+    return {
+      title,
+      body: this.renderOutputForChat(snapshot, maxChars),
+    };
+  }
+
+  private renderSelectionSnapshotView(selectionKey: string, maxChars = 2200): { title: string; body: string } | undefined {
+    const selected = this.selectedTerminal(selectionKey, false);
+    if (!selected) {
+      return undefined;
+    }
+    return this.renderTerminalSnapshotView(selected.terminalId, maxChars);
   }
 
   private snapshotToLiveFrame(raw: string): string {
@@ -1925,11 +2189,6 @@ class TfclawCommandRouter {
 
     const after = this.relay.cache.snapshots.get(terminalId)?.output ?? "";
     pushLiveFrame(after);
-    const delta = after.startsWith(before) ? after.slice(before.length) : after;
-    const renderedDelta = renderTerminalStream(delta);
-    if (renderedDelta.text || renderedDelta.dynamicFrames.length > 0) {
-      return this.renderOutputForChat(delta, 2200, liveFrames);
-    }
     return this.renderOutputForChat(after, 2200, liveFrames);
   }
 
@@ -2688,7 +2947,7 @@ class TfclawCommandRouter {
       if (!reply) {
         return;
       }
-      this.queueCommandProgressUpdate(requestId, reply);
+      this.queueCommandProgressUpdate(requestId, reply, source);
     };
 
     try {
@@ -2704,7 +2963,17 @@ class TfclawCommandRouter {
       this.updateModeFromResult(selectionKey, outboundText, output);
       const effectiveStreamModeAfter = progressSession?.streamMode ?? this.chatTmuxStreamMode.get(selectionKey);
       const reply = this.normalizeLegacyErrorMessage(output);
-      const finalReply = reply || "(no output)";
+      let finalReply = reply || "(no output)";
+      const isTmuxReply = /^\[tmux [^\]\r\n]+\]/i.test(finalReply);
+      const shouldPreferSnapshotView =
+        streamOffFollowEnabled
+        && !(progressSession?.streamingCardEnabled && isTmuxReply);
+      if (shouldPreferSnapshotView) {
+        const snapshotView = this.renderSelectionSnapshotView(selectionKey, 1800);
+        if (snapshotView) {
+          finalReply = `# ${snapshotView.title}\n${snapshotView.body}`;
+        }
+      }
       if (
         effectiveStreamModeAfter === "off"
         && streamOffFollowEnabled
@@ -2754,6 +3023,19 @@ class TfclawCommandRouter {
   }
 }
 // SECTION: chat apps
+interface FeishuStreamingCardState {
+  chatId: string;
+  messageId: string;
+  currentText: string;
+  pendingText: string | null;
+  pinnedTopText: string;
+  currentPinnedTopText: string;
+  pendingPinnedTopText: string | null;
+  queue: Promise<void>;
+  lastUpdateAt: number;
+  closed: boolean;
+}
+
 class FeishuChatApp implements ChatApp, MessageResponder {
   readonly name = "feishu";
   readonly enabled: boolean;
@@ -2761,6 +3043,8 @@ class FeishuChatApp implements ChatApp, MessageResponder {
   private larkClient: Lark.Client | undefined;
   private readonly recentInboundKeys = new Map<string, number>();
   private readonly inboundDedupTtlMs = 5 * 60 * 1000;
+  private readonly streamingCards = new Map<string, FeishuStreamingCardState>();
+  private readonly streamingCardStartPromises = new Map<string, Promise<FeishuStreamingCardState>>();
 
   constructor(
     private readonly config: FeishuChannelConfig,
@@ -2821,6 +3105,8 @@ class FeishuChatApp implements ChatApp, MessageResponder {
       // no-op
     }
     this.wsClient = undefined;
+    this.streamingCards.clear();
+    this.streamingCardStartPromises.clear();
   }
 
   private isDuplicateInbound(key: string): boolean {
@@ -2837,7 +3123,7 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     return false;
   }
 
-  private async sendTextMessage(chatId: string, text: string): Promise<{ messageId?: string }> {
+  private async sendPlainTextMessage(chatId: string, text: string): Promise<{ messageId?: string }> {
     if (!this.larkClient) {
       throw new Error("feishu client not initialized");
     }
@@ -2860,12 +3146,389 @@ class FeishuChatApp implements ChatApp, MessageResponder {
     };
   }
 
+  private extractFeishuMessageId(response: unknown): string | undefined {
+    const obj = toObject(response);
+    const dataObj = toObject(obj.data);
+    const messageId = toString(dataObj.message_id).trim() || toString(obj.message_id).trim();
+    return messageId || undefined;
+  }
+
+  private assertFeishuMessageApiSuccess(response: unknown, errorPrefix: string): void {
+    const obj = toObject(response);
+    const code = obj.code;
+    if (typeof code === "number" && code !== 0) {
+      const msg = toString(obj.msg) || `code ${code}`;
+      throw new Error(`${errorPrefix}: ${msg}`);
+    }
+  }
+
+  private splitStreamingCardSections(text: string): { pinnedTopText: string; streamText: string } {
+    const normalized = text.replace(/\r/g, "").trim();
+    if (!normalized) {
+      return {
+        pinnedTopText: "",
+        streamText: "",
+      };
+    }
+
+    const lines = normalized.split("\n");
+    const firstLine = (lines[0] ?? "").trim();
+    if (!firstLine.startsWith("[mode]")) {
+      return {
+        pinnedTopText: "",
+        streamText: normalized,
+      };
+    }
+
+    const fixedBeginIndex = lines.findIndex((line, idx) => idx > 0 && line.trim() === STREAMING_CARD_FIXED_BEGIN);
+    if (fixedBeginIndex > 0) {
+      const fixedEndIndex = lines.findIndex((line, idx) => idx > fixedBeginIndex && line.trim() === STREAMING_CARD_FIXED_END);
+      if (fixedEndIndex > fixedBeginIndex) {
+        const preFixed = lines
+          .slice(1, fixedBeginIndex)
+          .filter((line) => line.trim().length > 0);
+        const fixedBlock = lines.slice(fixedBeginIndex + 1, fixedEndIndex);
+        const streamText = lines.slice(fixedEndIndex + 1).join("\n").trim();
+        return {
+          pinnedTopText: [
+            lines[0],
+            ...preFixed,
+            ...fixedBlock,
+          ].join("\n").trim(),
+          streamText,
+        };
+      }
+    }
+
+    const pinnedLines: string[] = [lines[0] ?? ""];
+    let idx = 1;
+    while (idx < lines.length) {
+      const rawLine = lines[idx] ?? "";
+      const trimmed = rawLine.trim();
+      if (!trimmed) {
+        idx += 1;
+        continue;
+      }
+      if (
+        trimmed.startsWith("# ")
+        || /^special:/i.test(trimmed)
+        || /^selected:/i.test(trimmed)
+        || /^terminal:/i.test(trimmed)
+        || /^target:/i.test(trimmed)
+        || /^stream_mode:/i.test(trimmed)
+      ) {
+        pinnedLines.push(rawLine);
+        idx += 1;
+        continue;
+      }
+      break;
+    }
+
+    const streamText = lines.slice(idx).join("\n").trim() || normalized;
+    return {
+      pinnedTopText: pinnedLines.join("\n").trim(),
+      streamText,
+    };
+  }
+
+  private buildFeishuMarkdownCardContent(text: string, pinnedTopText?: string): string {
+    const streamText = text.replace(/\r/g, "").trim();
+    const pinnedTop = toString(pinnedTopText).replace(/\r/g, "").trim();
+    const elements: Array<{ tag: string; content: string }> = [];
+    if (pinnedTop) {
+      elements.push({
+        tag: "markdown",
+        content: pinnedTop,
+      });
+    }
+    if (streamText || !pinnedTop) {
+      elements.push({
+        tag: "markdown",
+        content: streamText || "⏳ Thinking...",
+      });
+    }
+    return JSON.stringify({
+      schema: "2.0",
+      config: {
+        wide_screen_mode: true,
+      },
+      body: {
+        elements,
+      },
+    });
+  }
+
+  private async sendFeishuStreamingCardMessage(
+    chatId: string,
+    text: string,
+    pinnedTopText?: string,
+  ): Promise<{ messageId?: string }> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+    const result = await this.larkClient.im.v1.message.create({
+      params: {
+        receive_id_type: "chat_id",
+      },
+      data: {
+        receive_id: chatId,
+        msg_type: "interactive",
+        content: this.buildFeishuMarkdownCardContent(text, pinnedTopText),
+      },
+    });
+    this.assertFeishuMessageApiSuccess(result, "feishu streaming card send failed");
+    return {
+      messageId: this.extractFeishuMessageId(result),
+    };
+  }
+
+  private async patchFeishuCardMessage(messageId: string, text: string, pinnedTopText?: string): Promise<void> {
+    if (!this.larkClient) {
+      throw new Error("feishu client not initialized");
+    }
+    const response = await this.larkClient.im.v1.message.patch({
+      path: {
+        message_id: messageId,
+      },
+      data: {
+        content: this.buildFeishuMarkdownCardContent(text, pinnedTopText),
+      },
+    });
+    this.assertFeishuMessageApiSuccess(response, "feishu streaming card update failed");
+  }
+
+  private isFeishuCardMarkdownParseError(error: unknown): boolean {
+    const baseMessage = (error instanceof Error ? error.message : String(error)).toLowerCase();
+    if (
+      baseMessage.includes("markdown content parse error")
+      || baseMessage.includes("failed to create card content")
+      || baseMessage.includes("230099")
+    ) {
+      return true;
+    }
+    const errObj = toObject(error);
+    if (toNumber(errObj.code, 0) === 230099) {
+      return true;
+    }
+    const responseObj = toObject(errObj.response);
+    const dataObj = toObject(responseObj.data);
+    if (toNumber(dataObj.code, 0) === 230099) {
+      return true;
+    }
+    const nestedMessage = toString(dataObj.msg).toLowerCase();
+    return (
+      nestedMessage.includes("markdown content parse error")
+      || nestedMessage.includes("failed to create card content")
+    );
+  }
+
+  private async fallbackStreamingCardToText(
+    chatId: string,
+    state: FeishuStreamingCardState,
+    text: string,
+    error: unknown,
+  ): Promise<void> {
+    state.closed = true;
+    this.streamingCards.delete(chatId);
+    const detail = describeSdkError(error);
+    console.warn(`[gateway] feishu streaming card failed, fallback to text: ${detail}`);
+    try {
+      await this.deleteMessage(state.messageId);
+    } catch (cleanupError) {
+      const msg = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      console.warn(`[gateway] feishu streaming card cleanup failed: ${msg}`);
+    }
+    const safeCardText = text
+      .replace(/\r/g, "")
+      .replace(/```/g, "``\\`")
+      .trim();
+    if (safeCardText) {
+      try {
+        const pinnedTopText = state.currentPinnedTopText || state.pinnedTopText;
+        await this.sendFeishuStreamingCardMessage(chatId, safeCardText, pinnedTopText || undefined);
+        return;
+      } catch (fallbackError) {
+        const msg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        console.warn(`[gateway] feishu streaming card fallback send failed: ${msg}`);
+      }
+    }
+    const fallbackText = [
+      state.currentPinnedTopText || state.pinnedTopText,
+      text,
+    ]
+      .filter((item) => toString(item).trim().length > 0)
+      .join("\n");
+    await this.sendPlainTextMessage(chatId, fallbackText || text);
+  }
+
+  private async ensureStreamingCardState(chatId: string): Promise<FeishuStreamingCardState> {
+    const existing = this.streamingCards.get(chatId);
+    if (existing && !existing.closed) {
+      return existing;
+    }
+    const pendingStart = this.streamingCardStartPromises.get(chatId);
+    if (pendingStart) {
+      return await pendingStart;
+    }
+    const startPromise = (async (): Promise<FeishuStreamingCardState> => {
+      const started = await this.sendFeishuStreamingCardMessage(chatId, "⏳ Thinking...");
+      const messageId = toString(started.messageId).trim();
+      if (!messageId) {
+        throw new Error("feishu streaming card start failed: missing message id");
+      }
+      const state: FeishuStreamingCardState = {
+        chatId,
+        messageId,
+        currentText: "",
+        pendingText: null,
+        pinnedTopText: "",
+        currentPinnedTopText: "",
+        pendingPinnedTopText: null,
+        queue: Promise.resolve(),
+        lastUpdateAt: 0,
+        closed: false,
+      };
+      this.streamingCards.set(chatId, state);
+      return state;
+    })();
+    this.streamingCardStartPromises.set(chatId, startPromise);
+    try {
+      return await startPromise;
+    } finally {
+      this.streamingCardStartPromises.delete(chatId);
+    }
+  }
+
+  async startStreamingCard(chatId: string): Promise<void> {
+    await this.ensureStreamingCardState(chatId);
+  }
+
+  async updateStreamingCard(chatId: string, text: string): Promise<void> {
+    const normalized = text.replace(/\r/g, "").trim();
+    if (!normalized) {
+      return;
+    }
+    const sections = this.splitStreamingCardSections(normalized);
+    const streamText = sections.streamText.trim();
+    const state = await this.ensureStreamingCardState(chatId);
+    if (state.closed) {
+      return;
+    }
+    if (sections.pinnedTopText) {
+      state.pinnedTopText = sections.pinnedTopText;
+    }
+    const nextPinnedTopText = sections.pinnedTopText || state.pinnedTopText;
+    state.pendingText = streamText;
+    state.pendingPinnedTopText = nextPinnedTopText || null;
+    state.queue = state.queue.then(async () => {
+      if (state.closed) {
+        return;
+      }
+      let targetText = state.pendingText ?? "";
+      let targetPinnedTopText = state.pendingPinnedTopText ?? state.currentPinnedTopText;
+      state.pendingText = null;
+      state.pendingPinnedTopText = null;
+      if (
+        targetText === state.currentText && targetPinnedTopText === state.currentPinnedTopText
+      ) {
+        return;
+      }
+      const sinceLast = Date.now() - state.lastUpdateAt;
+      if (sinceLast < FEISHU_STREAMING_CARD_UPDATE_THROTTLE_MS) {
+        await delay(FEISHU_STREAMING_CARD_UPDATE_THROTTLE_MS - sinceLast);
+        targetText = state.pendingText ?? targetText;
+        targetPinnedTopText = state.pendingPinnedTopText ?? targetPinnedTopText;
+        state.pendingText = null;
+        state.pendingPinnedTopText = null;
+      }
+      if (
+        targetText === state.currentText && targetPinnedTopText === state.currentPinnedTopText
+      ) {
+        return;
+      }
+      try {
+        await this.patchFeishuCardMessage(state.messageId, targetText, targetPinnedTopText || undefined);
+        state.currentText = targetText;
+        state.currentPinnedTopText = targetPinnedTopText;
+        state.lastUpdateAt = Date.now();
+      } catch (error) {
+        if (!this.isFeishuCardMarkdownParseError(error)) {
+          throw error;
+        }
+        await this.fallbackStreamingCardToText(chatId, state, targetText, error);
+      }
+    });
+    await state.queue;
+  }
+
+  async finishStreamingCard(chatId: string, finalText?: string): Promise<void> {
+    const normalizedFinal = toString(finalText).replace(/\r/g, "").trim();
+    let state = this.streamingCards.get(chatId);
+    if ((!state || state.closed) && normalizedFinal) {
+      state = await this.ensureStreamingCardState(chatId);
+    }
+    if (!state || state.closed) {
+      return;
+    }
+    if (normalizedFinal) {
+      const sections = this.splitStreamingCardSections(normalizedFinal);
+      if (sections.pinnedTopText) {
+        state.pinnedTopText = sections.pinnedTopText;
+      }
+      const hasFixedMarkers =
+        normalizedFinal.includes(STREAMING_CARD_FIXED_BEGIN) && normalizedFinal.includes(STREAMING_CARD_FIXED_END);
+      const nextStreamText = sections.streamText.trim();
+      state.pendingText = nextStreamText || (hasFixedMarkers ? "" : normalizedFinal);
+      state.pendingPinnedTopText = (sections.pinnedTopText || state.pinnedTopText || null);
+    }
+    state.queue = state.queue.then(async () => {
+      if (state.closed) {
+        return;
+      }
+      const targetText = state.pendingText ?? "";
+      const targetPinnedTopText = state.pendingPinnedTopText ?? state.currentPinnedTopText;
+      state.pendingText = null;
+      state.pendingPinnedTopText = null;
+      if (
+        targetText === state.currentText && targetPinnedTopText === state.currentPinnedTopText
+      ) {
+        return;
+      }
+      try {
+        await this.patchFeishuCardMessage(state.messageId, targetText, targetPinnedTopText || undefined);
+        state.currentText = targetText;
+        state.currentPinnedTopText = targetPinnedTopText;
+      } catch (error) {
+        if (!this.isFeishuCardMarkdownParseError(error)) {
+          throw error;
+        }
+        await this.fallbackStreamingCardToText(chatId, state, targetText, error);
+      }
+    });
+    await state.queue;
+    state.closed = true;
+    this.streamingCards.delete(chatId);
+  }
+
+  private async sendStreamingTextMessage(chatId: string, text: string): Promise<{ messageId?: string }> {
+    const normalized = text.replace(/\r/g, "").trim();
+    if (!normalized) {
+      return {};
+    }
+    await this.startStreamingCard(chatId);
+    const state = this.streamingCards.get(chatId);
+    await this.finishStreamingCard(chatId, normalized);
+    return {
+      messageId: state?.messageId,
+    };
+  }
+
   async replyText(chatId: string, text: string): Promise<void> {
-    await this.sendTextMessage(chatId, text);
+    await this.sendStreamingTextMessage(chatId, text);
   }
 
   async replyTextWithMeta(chatId: string, text: string): Promise<{ messageId?: string }> {
-    return this.sendTextMessage(chatId, text);
+    return this.sendStreamingTextMessage(chatId, text);
   }
 
   async deleteMessage(messageId: string): Promise<void> {
